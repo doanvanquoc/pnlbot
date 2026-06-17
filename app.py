@@ -347,7 +347,7 @@ async def auto_pos_sender_loop(app):
     try:
         while True:
             # Lưu ý: người dùng đang đặt là 30 giây để test nhanh
-            await asyncio.sleep(30)  
+            await asyncio.sleep(300)  
             if auto_chats and positions:
                 session = app['session']
                 
