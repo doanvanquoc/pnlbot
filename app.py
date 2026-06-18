@@ -351,7 +351,7 @@ async def auto_pos_sender_loop(app):
             if auto_chats and positions:
                 session = app['session']
                 
-                text_lines = ["🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (5P)*\n----------------------------------"]
+                text_lines = []
                 for key, pos in positions.items():
                     symbol = pos['symbol']
                     side = pos['positionSide']
