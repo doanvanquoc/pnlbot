@@ -511,6 +511,12 @@ async def handle_pos_command(session, chat_id):
     message = "\n\n".join(text_lines)
     await send_telegram_message(session, chat_id, message)
 
+
+# API test cho cronjob call tới
+async def test_handler(request):
+    return web.Response(text="Hello world")
+
+
 # Webhook Handler nhận POST từ Telegram
 async def telegram_webhook_handler(request):
     try:
@@ -608,6 +614,7 @@ def main():
         return
         
     app = web.Application()
+    app.router.add_get('/test', test_handler)
     app.router.add_post('/webhook', telegram_webhook_handler)
     
     app.on_startup.append(on_startup)
