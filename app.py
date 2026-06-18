@@ -347,7 +347,7 @@ async def auto_pos_sender_loop(app):
     try:
         while True:
             # Lưu ý: người dùng đang đặt là 30 giây để test nhanh
-            await asyncio.sleep(300)  
+            await asyncio.sleep(60)  
             if auto_chats and positions:
                 session = app['session']
                 
@@ -399,14 +399,14 @@ async def handle_auto_command(session, chat_id):
         if old_msg_id:
             await delete_telegram_message(session, chat_id, old_msg_id)
             
-        await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật vị thế mỗi 5 phút.")
+        await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật vị thế mỗi 1 phút.")
     else:
         auto_chats.add(chat_id)
-        await send_telegram_message(session, chat_id, "✅ Đã bật tự động cập nhật vị thế mỗi 5 phút.")
+        await send_telegram_message(session, chat_id, "✅ Đã bật tự động cập nhật vị thế mỗi 1 phút.")
         
         # Gửi luôn vị thế hiện tại ngay lập tức và lưu message_id làm tin nhắn auto đầu tiên
         if positions:
-            text_lines = ["🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (5P)*\n----------------------------------"]
+            text_lines = ["🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (1P)*\n----------------------------------"]
             for key, pos in positions.items():
                 symbol = pos['symbol']
                 side = pos['positionSide']
