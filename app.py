@@ -764,7 +764,7 @@ async def get_single_price(session, symbol):
     return 0.0
 
 
-async def handle_order_command(session, chat_id, side_type, coin_name, volume_str):
+async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     
@@ -780,6 +780,18 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
         await send_telegram_message(session, chat_id, "❌ Số tiền volume không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
         return
 
+    # Xác định giá đặt lệnh (nếu có price_str thì là LIMIT, ngược lại là MARKET)
+    is_limit = price_str is not None
+    limit_price = 0.0
+    if is_limit:
+        try:
+            limit_price = float(price_str)
+            if limit_price <= 0:
+                raise ValueError()
+        except ValueError:
+            await send_telegram_message(session, chat_id, "❌ Giá đặt lệnh limit không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+            return
+
     # 1. Lấy đòn bẩy tối đa (Max Leverage) và tự động thiết lập cho symbol đó
     max_leverage = await get_max_leverage(session, api_key, api_secret, symbol)
     logger.info(f"Đòn bẩy tối đa của {symbol} là {max_leverage}x. Tiến hành cài đặt...")
@@ -788,14 +800,18 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
     if not set_lev_ok:
         logger.warning(f"Không thể set đòn bẩy {max_leverage}x cho {symbol} trên Binance. Tiếp tục với đòn bẩy mặc định của tài khoản.")
     
-    # 2. Lấy giá hiện tại của coin để quy đổi
-    current_price = await get_single_price(session, symbol)
-    if current_price <= 0:
-        await send_telegram_message(session, chat_id, f"❌ Không thể lấy giá hiện tại của {symbol} để quy đổi số lượng coin.")
-        return
+    # 2. Xác định giá quy đổi số lượng coin
+    if is_limit:
+        exchange_price = limit_price
+    else:
+        current_price = await get_single_price(session, symbol)
+        if current_price <= 0:
+            await send_telegram_message(session, chat_id, f"❌ Không thể lấy giá hiện tại của {symbol} để quy đổi số lượng coin.")
+            return
+        exchange_price = current_price
         
-    # 3. Tính toán số lượng coin (quantity = volume / price)
-    raw_qty = volume / current_price
+    # 3. Tính toán số lượng coin (quantity = volume / exchange_price)
+    raw_qty = volume / exchange_price
     
     # Lấy độ chính xác số lượng (quantityPrecision) từ cache exchangeInfo
     precision = symbol_precisions.get(symbol, 3)
@@ -825,10 +841,14 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
     params = [
         f"symbol={symbol}",
         f"side={side}",
-        "type=MARKET",
+        f"type={'LIMIT' if is_limit else 'MARKET'}",
         f"quantity={quantity}",
         f"timestamp={timestamp}"
     ]
+    if is_limit:
+        params.append(f"price={limit_price}")
+        params.append("timeInForce=GTC")
+        
     if hedge_mode:
         params.append(f"positionSide={pos_side}")
         
@@ -843,24 +863,38 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
             data = await resp.json()
             if resp.status == 200:
                 order_id = data.get('orderId')
-                avg_price = float(data.get('avgPrice', 0))
-                execute_qty = float(data.get('executedQty', 0))
-                actual_volume = execute_qty * avg_price
-                actual_margin = actual_volume / max_leverage
-                
                 pnl_emoji = "🟢" if side_type == 'LONG' else "🔴"
-                msg = (
-                    f"✅ *VÀO LỆNH THÀNH CÔNG!*\n"
-                    f"----------------------------------\n"
-                    f"🪙 Cặp: *{symbol}*\n"
-                    f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
-                    f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
-                    f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
-                    f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
-                    f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
-                    f"💵 Giá khớp trung bình: *{avg_price:,.4f} USDT*\n"
-                    f"🆔 Order ID: `{order_id}`"
-                )
+                
+                if is_limit:
+                    msg = (
+                        f"⏳ *TẠO LỆNH LIMIT THÀNH CÔNG!*\n"
+                        f"----------------------------------\n"
+                        f"🪙 Cặp: *{symbol}*\n"
+                        f"⚡ Lệnh: {pnl_emoji} *{side_type} (LIMIT)*\n"
+                        f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
+                        f"💵 Giá đặt Limit: *{limit_price:,.4f} USDT*\n"
+                        f"📊 Volume lệnh: *{volume:,.2f} USDT*\n"
+                        f"🔢 Số lượng: *{quantity} {coin_name}*\n"
+                        f"🆔 Order ID: `{order_id}`"
+                    )
+                else:
+                    avg_price = float(data.get('avgPrice', 0))
+                    execute_qty = float(data.get('executedQty', 0))
+                    actual_volume = execute_qty * avg_price
+                    actual_margin = actual_volume / max_leverage
+                    
+                    msg = (
+                        f"✅ *VÀO LỆNH MARKET THÀNH CÔNG!*\n"
+                        f"----------------------------------\n"
+                        f"🪙 Cặp: *{symbol}*\n"
+                        f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
+                        f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
+                        f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
+                        f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
+                        f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
+                        f"💵 Giá khớp trung bình: *{avg_price:,.4f} USDT*\n"
+                        f"🆔 Order ID: `{order_id}`"
+                    )
                 await send_telegram_message(session, chat_id, msg)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
@@ -972,12 +1006,13 @@ async def telegram_webhook_handler(request):
             "💳 `/balance` (hoặc `/wallet`) - Xem số dư tài khoản & ví Futures.\n"
             "🔥 `/top` (hoặc `/gainers`) - Top 5 tăng/giảm mạnh nhất 24h.\n"
             "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
-            "📈 `/long <coin> <kí_quỹ>` (hoặc `/l`) - Vào lệnh LONG nhanh (Mặc định đòn bẩy MAX).\n"
-            "📉 `/short <coin> <kí_quỹ>` (hoặc `/s`) - Vào lệnh SHORT nhanh (Mặc định đòn bẩy MAX).\n"
+            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
+            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
-            "• Ví dụ đặt lệnh nhanh: `/long btc 10` (vào lệnh LONG btc với 10 USDT kí quỹ, tự động chọn đòn bẩy tối đa)."
+            "• Lệnh Market: `/long btc 1000` (LONG btc với volume 1000 USDT)\n"
+            "• Lệnh Limit: `/long btc 1000 98000` (LONG btc với volume 1000 USDT tại giá 98000)"
         )
         await send_telegram_message(request.app['session'], chat_id, welcome_text)
         
@@ -1012,13 +1047,17 @@ async def telegram_webhook_handler(request):
             await send_telegram_message(
                 request.app['session'], 
                 chat_id, 
-                "❌ Sai cú pháp đặt lệnh!\nSử dụng: `/long <coin> <kí_quỹ>` hoặc `/short <coin> <kí_quỹ>`\nVí dụ: `/long btc 10`"
+                "❌ Sai cú pháp đặt lệnh!\n"
+                "• Lệnh Market: `/long <coin> <volume>`\n"
+                "• Lệnh Limit: `/long <coin> <volume> <giá>`\n"
+                "Ví dụ: `/long btc 1000` hoặc `/long btc 1000 98000`"
             )
         else:
             side_type = 'LONG' if command_base in ('/long', '/l') else 'SHORT'
             coin_name = parts[1]
-            qty_str = parts[2]
-            await handle_order_command(request.app['session'], chat_id, side_type, coin_name, qty_str)
+            volume_str = parts[2]
+            price_str = parts[3] if len(parts) >= 4 else None
+            await handle_order_command(request.app['session'], chat_id, side_type, coin_name, volume_str, price_str)
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
