@@ -1064,9 +1064,29 @@ async def telegram_webhook_handler(request):
         
     return web.Response(status=200)
 
+
+# Lấy và log địa chỉ IP public của server
+async def log_server_ip(session):
+    try:
+        async with session.get("https://api.ipify.org?format=json") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                ip = data.get('ip')
+                logger.info(f"👉👉 ĐỊA CHỈ IP PUBLIC CỦA SERVER RENDER LÀ: {ip} 👈👈")
+                logger.info("Hãy copy IP này nhập vào phần IP access restrictions trên Binance API Key.")
+            else:
+                body = await resp.text()
+                logger.warning(f"Không thể lấy IP public: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy IP public của server: {e}")
+
+
 # Lifecycle hooks của aiohttp
 async def on_startup(app):
     app['session'] = aiohttp.ClientSession()
+    
+    # 0. Tự động lấy và log IP của server để cấu hình Binance
+    await log_server_ip(app['session'])
     
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
