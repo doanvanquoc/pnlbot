@@ -528,25 +528,32 @@ def format_price(price):
         return f"{price:,.8f}".rstrip('0').rstrip('.')
 
 
-async def get_coin_price(session, coin_name):
-    coin_name = coin_name.upper()
-    if coin_name.endswith("USDT"):
-        symbol = coin_name
-    else:
-        symbol = f"{coin_name}USDT"
-    
-    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+async def get_coin_prices(session, coin_names):
+    # Chuẩn hóa tên coin cần tìm
+    targets = {}
+    for coin in coin_names:
+        coin_upper = coin.upper()
+        symbol = coin_upper if coin_upper.endswith("USDT") else f"{coin_upper}USDT"
+        targets[symbol] = coin_upper
+
+    url = "https://api.binance.com/api/v3/ticker/price"
     try:
         async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                price = float(data.get('price', 0))
-                return coin_name, price
+                # Tạo map nhanh các symbol và giá của chúng
+                prices_map = {item['symbol']: float(item['price']) for item in data}
+                
+                results = []
+                for symbol, coin_upper in targets.items():
+                    price = prices_map.get(symbol)
+                    results.append((coin_upper, price))
+                return results
             else:
-                return coin_name, None
+                logger.error(f"Lỗi gọi API Binance: HTTP {resp.status}")
     except Exception as e:
-        logger.error(f"Lỗi lấy giá {symbol}: {e}")
-        return coin_name, None
+        logger.error(f"Lỗi lấy giá coin hàng loạt: {e}")
+    return [(coin.upper(), None) for coin in coin_names]
 
 
 # Webhook Handler nhận POST từ Telegram
@@ -575,8 +582,7 @@ async def telegram_webhook_handler(request):
     if not text.startswith('/'):
         coins = text.split()
         if coins:
-            tasks = [get_coin_price(request.app['session'], coin) for coin in coins]
-            results = await asyncio.gather(*tasks)
+            results = await get_coin_prices(request.app['session'], coins)
             
             response_lines = []
             for coin_name, price in results:
