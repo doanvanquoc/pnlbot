@@ -517,6 +517,38 @@ async def test_handler(request):
     return web.Response(text="Hello world")
 
 
+def format_price(price):
+    if price is None:
+        return "Không tìm thấy"
+    if price >= 1000:
+        return f"{price:,.2f}".rstrip('0').rstrip('.')
+    elif price >= 1:
+        return f"{price:,.4f}".rstrip('0').rstrip('.')
+    else:
+        return f"{price:,.8f}".rstrip('0').rstrip('.')
+
+
+async def get_coin_price(session, coin_name):
+    coin_name = coin_name.upper()
+    if coin_name.endswith("USDT"):
+        symbol = coin_name
+    else:
+        symbol = f"{coin_name}USDT"
+    
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                price = float(data.get('price', 0))
+                return coin_name, price
+            else:
+                return coin_name, None
+    except Exception as e:
+        logger.error(f"Lỗi lấy giá {symbol}: {e}")
+        return coin_name, None
+
+
 # Webhook Handler nhận POST từ Telegram
 async def telegram_webhook_handler(request):
     try:
@@ -537,6 +569,25 @@ async def telegram_webhook_handler(request):
     text = message.get('text', '').strip()
     
     if not text:
+        return web.Response(status=200)
+        
+    # Nếu tin nhắn không bắt đầu bằng '/', coi đó là danh sách các coin cần lấy giá
+    if not text.startswith('/'):
+        coins = text.split()
+        if coins:
+            tasks = [get_coin_price(request.app['session'], coin) for coin in coins]
+            results = await asyncio.gather(*tasks)
+            
+            response_lines = []
+            for coin_name, price in results:
+                if price is not None:
+                    formatted = format_price(price)
+                    response_lines.append(f"{coin_name.upper()}: {formatted}")
+                else:
+                    response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
+            
+            if response_lines:
+                await send_telegram_message(request.app['session'], chat_id, "\n".join(response_lines))
         return web.Response(status=200)
         
     command = text.split()[0].lower()
