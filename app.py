@@ -961,6 +961,17 @@ async def handle_orders_command(session, chat_id):
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
+        # 1. Gọi API lấy toàn bộ giá coin hiện tại để map với danh sách lệnh chờ
+        prices_map = {}
+        try:
+            url_price = "https://fapi.binance.com/fapi/v1/ticker/price"
+            async with session.get(url_price) as resp_price:
+                if resp_price.status == 200:
+                    price_data = await resp_price.json()
+                    prices_map = {item['symbol']: float(item['price']) for item in price_data}
+        except Exception as e:
+            logger.error(f"Lỗi lấy giá hiện tại khi xem orders: {e}")
+
         async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -990,10 +1001,15 @@ async def handle_orders_command(session, chat_id):
                         
                     emoji = "🟢" if display_side == 'LONG' else "🔴"
                     notional = qty * price
+                    current_price = prices_map.get(symbol)
                     
+                    price_line = f"   • Giá đặt: *{price:,.4f} USDT*\n"
+                    if current_price is not None:
+                        price_line += f"   • Giá hiện tại: *{current_price:,.4f} USDT*\n"
+                        
                     lines.append(
                         f"{i}. {display_symbol} ({emoji} *{display_side} - {order_type}*)\n"
-                        f"   • Giá đặt: *{price:,.4f} USDT*\n"
+                        f"{price_line}"
                         f"   • Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
                         f"   • ID: `{order_id}`\n"
                     )
