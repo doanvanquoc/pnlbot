@@ -1025,6 +1025,125 @@ async def handle_orders_command(session, chat_id):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi hệ thống khi lấy danh sách lệnh chờ.")
 
 
+async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl_price_str=None):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    target_positions = [pos for pos in positions.values() if pos['symbol'] == symbol]
+    
+    if not target_positions:
+        await send_telegram_message(
+            session, 
+            chat_id, 
+            f"❌ Không tìm thấy vị thế *{symbol}* nào đang mở để cài đặt TP/SL."
+        )
+        return
+
+    tp_price = None
+    if tp_price_str:
+        try:
+            tp_price = float(tp_price_str)
+            if tp_price <= 0:
+                raise ValueError()
+        except ValueError:
+            await send_telegram_message(session, chat_id, "❌ Giá chốt lời (TP) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+            return
+
+    sl_price = None
+    if sl_price_str:
+        try:
+            sl_price = float(sl_price_str)
+            if sl_price <= 0:
+                raise ValueError()
+        except ValueError:
+            await send_telegram_message(session, chat_id, "❌ Giá cắt lỗ (SL) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+            return
+
+    results = []
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    for pos in target_positions:
+        side = pos['positionSide']
+        amt = pos['positionAmt']
+        
+        is_long = amt > 0
+        if side == 'LONG':
+            is_long = True
+        elif side == 'SHORT':
+            is_long = False
+            
+        order_side = 'SELL' if is_long else 'BUY'
+        pos_display = 'LONG' if is_long else 'SHORT'
+        
+        if tp_price is not None:
+            timestamp = int(time.time() * 1000)
+            params = [
+                f"symbol={symbol}",
+                f"side={order_side}",
+                "type=TAKE_PROFIT_MARKET",
+                f"stopPrice={tp_price}",
+                "closePosition=true",
+                f"timestamp={timestamp}"
+            ]
+            if hedge_mode:
+                params.append(f"positionSide={side}")
+                
+            query_string = "&".join(params)
+            signature = get_binance_signature(query_string, api_secret)
+            url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+            
+            try:
+                async with session.post(url, headers=headers) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        order_id = data.get('orderId')
+                        results.append(f"   • TP (*{pos_display}* tại giá *{tp_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
+                    else:
+                        msg_err = data.get('msg', 'Lỗi không xác định')
+                        results.append(f"   • TP (*{pos_display}* tại giá *{tp_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
+            except Exception as e:
+                results.append(f"   • TP (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
+                
+        if sl_price is not None:
+            timestamp = int(time.time() * 1000)
+            params = [
+                f"symbol={symbol}",
+                f"side={order_side}",
+                "type=STOP_MARKET",
+                f"stopPrice={sl_price}",
+                "closePosition=true",
+                f"timestamp={timestamp}"
+            ]
+            if hedge_mode:
+                params.append(f"positionSide={side}")
+                
+            query_string = "&".join(params)
+            signature = get_binance_signature(query_string, api_secret)
+            url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+            
+            try:
+                async with session.post(url, headers=headers) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        order_id = data.get('orderId')
+                        results.append(f"   • SL (*{pos_display}* tại giá *{sl_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
+                    else:
+                        msg_err = data.get('msg', 'Lỗi không xác định')
+                        results.append(f"   • SL (*{pos_display}* tại giá *{sl_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
+            except Exception as e:
+                results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
+                
+    msg = (
+        f"🎯 *KẾT QUẢ CÀI ĐẶT TP/SL CHO {symbol}*\n"
+        f"----------------------------------\n" +
+        "\n".join(results)
+    )
+    await send_telegram_message(session, chat_id, msg)
+
+
 async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
@@ -1123,6 +1242,9 @@ async def telegram_webhook_handler(request):
             "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
             "⏳ `/orders` - Xem danh sách lệnh đang chờ khớp.\n"
             "❌ `/cancel <coin> <order_id>` - Hủy một lệnh đang chờ.\n"
+            "🎯 `/tp <coin> <giá_tp>` - Cài đặt giá chốt lời (Take Profit).\n"
+            "🛡️ `/sl <coin> <giá_sl>` - Cài đặt giá cắt lỗ (Stop Loss).\n"
+            "🔮 `/tpsl <coin> <giá_tp> <giá_sl>` - Cài đặt đồng thời cả TP và SL.\n"
             "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
@@ -1160,6 +1282,46 @@ async def telegram_webhook_handler(request):
             coin_name = parts[1]
             order_id_str = parts[2]
             await handle_cancel_command(request.app['session'], chat_id, coin_name, order_id_str)
+        
+    elif command_base == '/tp':
+        parts = text.split()
+        if len(parts) < 3:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp chốt lời!\nSử dụng: `/tp <coin> <giá_tp>`\nVí dụ: `/tp btc 68500`"
+            )
+        else:
+            coin_name = parts[1]
+            tp_price = parts[2]
+            await handle_tpsl_command(request.app['session'], chat_id, coin_name, tp_price_str=tp_price)
+            
+    elif command_base == '/sl':
+        parts = text.split()
+        if len(parts) < 3:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp cắt lỗ!\nSử dụng: `/sl <coin> <giá_sl>`\nVí dụ: `/sl btc 64000`"
+            )
+        else:
+            coin_name = parts[1]
+            sl_price = parts[2]
+            await handle_tpsl_command(request.app['session'], chat_id, coin_name, sl_price_str=sl_price)
+            
+    elif command_base == '/tpsl':
+        parts = text.split()
+        if len(parts) < 4:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp cài đặt TP/SL!\nSử dụng: `/tpsl <coin> <giá_tp> <giá_sl>`\nVí dụ: `/tpsl btc 68500 64000`"
+            )
+        else:
+            coin_name = parts[1]
+            tp_price = parts[2]
+            sl_price = parts[3]
+            await handle_tpsl_command(request.app['session'], chat_id, coin_name, tp_price_str=tp_price, sl_price_str=sl_price)
         
     elif command_base in ('/leverage', '/lev'):
         parts = text.split()
