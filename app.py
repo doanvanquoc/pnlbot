@@ -764,38 +764,7 @@ async def get_single_price(session, symbol):
     return 0.0
 
 
-async def place_stop_order(session, api_key, api_secret, symbol, side, order_type, stop_price, pos_side, hedge_mode):
-    timestamp = int(time.time() * 1000)
-    params = [
-        "algoType=CONDITIONAL",
-        f"symbol={symbol}",
-        f"side={side}",
-        f"type={order_type}",
-        "closePosition=true",
-        f"triggerPrice={stop_price}",
-        f"timestamp={timestamp}"
-    ]
-    if hedge_mode:
-        params.append(f"positionSide={pos_side}")
-        
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/algoOrder?{query_string}&signature={signature}"
-    headers = {"X-MBX-APIKEY": api_key}
-    
-    try:
-        async with session.post(url, headers=headers) as resp:
-            data = await resp.json()
-            if resp.status == 200:
-                return True, data.get('algoId')
-            else:
-                return False, data.get('msg', 'Lỗi không xác định')
-    except Exception as e:
-        logger.error(f"Lỗi đặt lệnh dừng {order_type} cho {symbol}: {e}")
-        return False, str(e)
-
-
-async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None, tp=None, sl=None):
+async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     
@@ -821,25 +790,6 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 raise ValueError()
         except ValueError:
             await send_telegram_message(session, chat_id, "❌ Giá đặt lệnh limit không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
-
-    # Xác thực giá trị TP/SL
-    if tp is not None:
-        try:
-            tp = float(tp)
-            if tp <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá chốt lời (TP) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
-
-    if sl is not None:
-        try:
-            sl = float(sl)
-            if sl <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá cắt lỗ (SL) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
             return
 
     # 1. Lấy đòn bẩy tối đa (Max Leverage) và tự động thiết lập cho symbol đó
@@ -915,38 +865,6 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 order_id = data.get('orderId')
                 pnl_emoji = "🟢" if side_type == 'LONG' else "🔴"
                 
-                # Thực hiện đặt các lệnh điều kiện TP/SL đi kèm nếu có cấu hình
-                tp_sl_msg = ""
-                stop_side = 'SELL' if side == 'BUY' else 'BUY'
-                
-                if tp is not None:
-                    tp_ok, tp_res = await place_stop_order(
-                        session, api_key, api_secret, symbol, 
-                        side=stop_side,
-                        order_type='TAKE_PROFIT_MARKET',
-                        stop_price=tp,
-                        pos_side=pos_side,
-                        hedge_mode=hedge_mode
-                    )
-                    if tp_ok:
-                        tp_sl_msg += f"\n🎯 Take Profit: *{tp:,.4f} USDT* (ID: `{tp_res}`)"
-                    else:
-                        tp_sl_msg += f"\n❌ Lỗi đặt TP: `{tp_res}`"
-                        
-                if sl is not None:
-                    sl_ok, sl_res = await place_stop_order(
-                        session, api_key, api_secret, symbol, 
-                        side=stop_side,
-                        order_type='STOP_MARKET',
-                        stop_price=sl,
-                        pos_side=pos_side,
-                        hedge_mode=hedge_mode
-                    )
-                    if sl_ok:
-                        tp_sl_msg += f"\n🛑 Stop Loss: *{sl:,.4f} USDT* (ID: `{sl_res}`)"
-                    else:
-                        tp_sl_msg += f"\n❌ Lỗi đặt SL: `{sl_res}`"
-                
                 if is_limit:
                     msg = (
                         f"⏳ *TẠO LỆNH LIMIT THÀNH CÔNG!*\n"
@@ -977,10 +895,6 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"💵 Giá khớp trung bình: *{avg_price:,.4f} USDT*\n"
                         f"🆔 Order ID: `{order_id}`"
                     )
-                
-                if tp_sl_msg:
-                    msg += f"\n\n⚙️ *LỆNH ĐIỀU KIỆN ĐI KÈM:*{tp_sl_msg}"
-                    
                 await send_telegram_message(session, chat_id, msg)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
@@ -1209,14 +1123,13 @@ async def telegram_webhook_handler(request):
             "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
             "⏳ `/orders` - Xem danh sách lệnh đang chờ khớp.\n"
             "❌ `/cancel <coin> <order_id>` - Hủy một lệnh đang chờ.\n"
-            "📈 `/long <coin> <volume> [giá] [tp=giá] [sl=giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
-            "📉 `/short <coin> <volume> [giá] [tp=giá] [sl=giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
+            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
+            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
             "• Lệnh Market: `/long btc 1000` (LONG btc với volume 1000 USDT)\n"
-            "• Lệnh Market + TP/SL: `/long btc 1000 tp=98000 sl=94000`\n"
-            "• Lệnh Limit + TP/SL: `/long btc 1000 95000 tp=98000 sl=94000`"
+            "• Lệnh Limit: `/long btc 1000 98000` (LONG btc với volume 1000 USDT tại giá 98000)"
         )
         await send_telegram_message(request.app['session'], chat_id, welcome_text)
         
@@ -1263,49 +1176,21 @@ async def telegram_webhook_handler(request):
         
     elif command_base in ('/long', '/l', '/short', '/s'):
         parts = text.split()
-        # Parse tp=... và sl=...
-        tp_val = None
-        sl_val = None
-        clean_parts = []
-        for part in parts:
-            part_lower = part.lower()
-            if part_lower.startswith('tp='):
-                try:
-                    tp_val = float(part.split('=', 1)[1])
-                except ValueError:
-                    pass
-            elif part_lower.startswith('sl='):
-                try:
-                    sl_val = float(part.split('=', 1)[1])
-                except ValueError:
-                    pass
-            else:
-                clean_parts.append(part)
-
-        if len(clean_parts) < 3:
+        if len(parts) < 3:
             await send_telegram_message(
                 request.app['session'], 
                 chat_id, 
                 "❌ Sai cú pháp đặt lệnh!\n"
-                "• Lệnh Market: `/long <coin> <volume> [tp=giá] [sl=giá]`\n"
-                "• Lệnh Limit: `/long <coin> <volume> <giá> [tp=giá] [sl=giá]`\n"
-                "Ví dụ: `/long btc 1000 tp=98000 sl=94000` hoặc `/long btc 1000 95000 tp=98000 sl=94000`"
+                "• Lệnh Market: `/long <coin> <volume>`\n"
+                "• Lệnh Limit: `/long <coin> <volume> <giá>`\n"
+                "Ví dụ: `/long btc 1000` hoặc `/long btc 1000 98000`"
             )
         else:
             side_type = 'LONG' if command_base in ('/long', '/l') else 'SHORT'
-            coin_name = clean_parts[1]
-            volume_str = clean_parts[2]
-            price_str = clean_parts[3] if len(clean_parts) >= 4 else None
-            await handle_order_command(
-                session=request.app['session'], 
-                chat_id=chat_id, 
-                side_type=side_type, 
-                coin_name=coin_name, 
-                volume_str=volume_str, 
-                price_str=price_str,
-                tp=tp_val,
-                sl=sl_val
-            )
+            coin_name = parts[1]
+            volume_str = parts[2]
+            price_str = parts[3] if len(parts) >= 4 else None
+            await handle_order_command(request.app['session'], chat_id, side_type, coin_name, volume_str, price_str)
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
