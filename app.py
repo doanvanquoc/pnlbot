@@ -1,4 +1,5 @@
 import asyncio
+import math
 import hmac
 import hashlib
 import time
@@ -21,6 +22,8 @@ subscribed_symbols = set() # Các symbol (viết thường) đã subscribe Mark 
 mark_price_ws = None    # WS connection cho Mark Price stream
 auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động mỗi 5 phút
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
+hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
+symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 
 # Hàm tạo chữ ký HMAC-SHA256 cho Binance API
 def get_binance_signature(query_string, secret_key):
@@ -664,6 +667,255 @@ async def handle_top_command(session, chat_id):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi xử lý dữ liệu biến động.")
 
 
+# Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
+async def check_position_mode(session, api_key, api_secret):
+    global hedge_mode
+    timestamp = int(time.time() * 1000)
+    query_string = f"timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/positionSide/dual?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                hedge_mode = data.get('dualSidePosition', False)
+                logger.info(f"Chế độ Position Mode của tài khoản: {'Hedge Mode (Dual)' if hedge_mode else 'One-way Mode'}")
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi kiểm tra Position Mode: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Không thể kiểm tra Position Mode: {e}. Mặc định là One-way Mode.")
+
+
+def round_down(value, decimals):
+    factor = 10 ** decimals
+    return math.floor(value * factor) / factor
+
+
+# Nạp thông tin độ chính xác số lượng từ Binance
+async def init_exchange_info(session):
+    global symbol_precisions
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for s in data.get('symbols', []):
+                    symbol = s['symbol']
+                    precision = int(s.get('quantityPrecision', 0))
+                    symbol_precisions[symbol] = precision
+                logger.info(f"Đã nạp độ chính xác số lượng cho {len(symbol_precisions)} symbol.")
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi nạp exchangeInfo: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi khi gọi exchangeInfo: {e}")
+
+
+# Lấy đòn bẩy tối đa của symbol
+async def get_max_leverage(session, api_key, api_secret, symbol):
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/leverageBracket?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    brackets = data[0].get('brackets', [])
+                    if brackets:
+                        return int(brackets[0].get('initialLeverage', 20))
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy max leverage cho {symbol}: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Không thể lấy max leverage cho {symbol}: {e}")
+    return 20 # Mặc định trả về 20 nếu lỗi
+
+
+# Cài đặt đòn bẩy
+async def set_leverage(session, api_key, api_secret, symbol, leverage):
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        async with session.post(url, headers=headers) as resp:
+            return resp.status == 200
+    except Exception as e:
+        logger.error(f"Lỗi set leverage {leverage} cho {symbol}: {e}")
+    return False
+
+
+# Lấy giá đơn lẻ của symbol
+async def get_single_price(session, symbol):
+    url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data.get('price', 0))
+    except Exception as e:
+        logger.error(f"Lỗi lấy giá single {symbol}: {e}")
+    return 0.0
+
+
+async def handle_order_command(session, chat_id, side_type, coin_name, volume_str):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    # Chuẩn hóa coin
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    try:
+        volume = float(volume_str)
+        if volume <= 0:
+            raise ValueError()
+    except ValueError:
+        await send_telegram_message(session, chat_id, "❌ Số tiền volume không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+        return
+
+    # 1. Lấy đòn bẩy tối đa (Max Leverage) và tự động thiết lập cho symbol đó
+    max_leverage = await get_max_leverage(session, api_key, api_secret, symbol)
+    logger.info(f"Đòn bẩy tối đa của {symbol} là {max_leverage}x. Tiến hành cài đặt...")
+    
+    set_lev_ok = await set_leverage(session, api_key, api_secret, symbol, max_leverage)
+    if not set_lev_ok:
+        logger.warning(f"Không thể set đòn bẩy {max_leverage}x cho {symbol} trên Binance. Tiếp tục với đòn bẩy mặc định của tài khoản.")
+    
+    # 2. Lấy giá hiện tại của coin để quy đổi
+    current_price = await get_single_price(session, symbol)
+    if current_price <= 0:
+        await send_telegram_message(session, chat_id, f"❌ Không thể lấy giá hiện tại của {symbol} để quy đổi số lượng coin.")
+        return
+        
+    # 3. Tính toán số lượng coin (quantity = volume / price)
+    raw_qty = volume / current_price
+    
+    # Lấy độ chính xác số lượng (quantityPrecision) từ cache exchangeInfo
+    precision = symbol_precisions.get(symbol, 3)
+    quantity = round_down(raw_qty, precision)
+    
+    if quantity <= 0:
+        await send_telegram_message(
+            session, 
+            chat_id, 
+            f"❌ Số lượng coin tính toán quá nhỏ ({raw_qty:.8f} {coin_name}).\n"
+            f"Vui lòng tăng Volume đặt lệnh hoặc chọn coin có giá thấp hơn.\n"
+            f"(Độ chính xác yêu cầu: {precision} số thập phân)"
+        )
+        return
+
+    # Xác định side và positionSide dựa trên hedge_mode
+    if side_type == 'LONG':
+        side = 'BUY'
+        pos_side = 'LONG' if hedge_mode else 'BOTH'
+    else:
+        side = 'SELL'
+        pos_side = 'SHORT' if hedge_mode else 'BOTH'
+        
+    timestamp = int(time.time() * 1000)
+    
+    # Các tham số cho API đặt lệnh
+    params = [
+        f"symbol={symbol}",
+        f"side={side}",
+        "type=MARKET",
+        f"quantity={quantity}",
+        f"timestamp={timestamp}"
+    ]
+    if hedge_mode:
+        params.append(f"positionSide={pos_side}")
+        
+    query_string = "&".join(params)
+    signature = get_binance_signature(query_string, api_secret)
+    
+    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                order_id = data.get('orderId')
+                avg_price = float(data.get('avgPrice', 0))
+                execute_qty = float(data.get('executedQty', 0))
+                actual_volume = execute_qty * avg_price
+                actual_margin = actual_volume / max_leverage
+                
+                pnl_emoji = "🟢" if side_type == 'LONG' else "🔴"
+                msg = (
+                    f"✅ *VÀO LỆNH THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
+                    f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
+                    f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
+                    f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
+                    f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
+                    f"💵 Giá khớp trung bình: *{avg_price:,.4f} USDT*\n"
+                    f"🆔 Order ID: `{order_id}`"
+                )
+                await send_telegram_message(session, chat_id, msg)
+            else:
+                msg_err = data.get('msg', 'Lỗi không xác định')
+                code_err = data.get('code', -1)
+                await send_telegram_message(session, chat_id, f"❌ *Đặt lệnh thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})")
+    except Exception as e:
+        logger.error(f"Lỗi khi đặt lệnh {side_type} {symbol}: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi đặt lệnh: {e}")
+
+
+async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    # Chuẩn hóa coin
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    try:
+        leverage = int(leverage_str)
+        if leverage < 1 or leverage > 125:
+            raise ValueError()
+    except ValueError:
+        await send_telegram_message(session, chat_id, "❌ Hệ số đòn bẩy không hợp lệ. Vui lòng nhập số nguyên từ 1 đến 125.")
+        return
+        
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    
+    url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                ret_leverage = data.get('leverage')
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    f"✅ *CÀI ĐẶT ĐỒN BẨY THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"⚙️ Đòn bẩy mới: *{ret_leverage}x*"
+                )
+            else:
+                msg_err = data.get('msg', 'Lỗi không xác định')
+                code_err = data.get('code', -1)
+                await send_telegram_message(session, chat_id, f"❌ *Cài đặt đòn bẩy thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})")
+    except Exception as e:
+        logger.error(f"Lỗi khi cài đặt đòn bẩy cho {symbol}: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi cài đặt đòn bẩy: {e}")
+
+
 # Webhook Handler nhận POST từ Telegram
 async def telegram_webhook_handler(request):
     try:
@@ -719,8 +971,13 @@ async def telegram_webhook_handler(request):
             "🔍 `/pos` - Xem chi tiết các vị thế đang mở.\n"
             "💳 `/balance` (hoặc `/wallet`) - Xem số dư tài khoản & ví Futures.\n"
             "🔥 `/top` (hoặc `/gainers`) - Top 5 tăng/giảm mạnh nhất 24h.\n"
+            "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
+            "📈 `/long <coin> <kí_quỹ>` (hoặc `/l`) - Vào lệnh LONG nhanh (Mặc định đòn bẩy MAX).\n"
+            "📉 `/short <coin> <kí_quỹ>` (hoặc `/s`) - Vào lệnh SHORT nhanh (Mặc định đòn bẩy MAX).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
-            "💡 *Mẹo*: Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h."
+            "💡 *Mẹo*:\n"
+            "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
+            "• Ví dụ đặt lệnh nhanh: `/long btc 10` (vào lệnh LONG btc với 10 USDT kí quỹ, tự động chọn đòn bẩy tối đa)."
         )
         await send_telegram_message(request.app['session'], chat_id, welcome_text)
         
@@ -735,6 +992,33 @@ async def telegram_webhook_handler(request):
         
     elif command_base in ('/top', '/gainers'):
         await handle_top_command(request.app['session'], chat_id)
+        
+    elif command_base in ('/leverage', '/lev'):
+        parts = text.split()
+        if len(parts) < 3:
+            await send_telegram_message(
+                request.app['session'], 
+                chat_id, 
+                "❌ Sai cú pháp cài đặt đòn bẩy!\nSử dụng: `/leverage <coin> <hệ_số>`\nVí dụ: `/leverage btc 20`"
+            )
+        else:
+            coin_name = parts[1]
+            leverage_str = parts[2]
+            await handle_leverage_command(request.app['session'], chat_id, coin_name, leverage_str)
+        
+    elif command_base in ('/long', '/l', '/short', '/s'):
+        parts = text.split()
+        if len(parts) < 3:
+            await send_telegram_message(
+                request.app['session'], 
+                chat_id, 
+                "❌ Sai cú pháp đặt lệnh!\nSử dụng: `/long <coin> <kí_quỹ>` hoặc `/short <coin> <kí_quỹ>`\nVí dụ: `/long btc 10`"
+            )
+        else:
+            side_type = 'LONG' if command_base in ('/long', '/l') else 'SHORT'
+            coin_name = parts[1]
+            qty_str = parts[2]
+            await handle_order_command(request.app['session'], chat_id, side_type, coin_name, qty_str)
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
@@ -751,11 +1035,13 @@ async def on_startup(app):
     # 1. Tự động setWebhook Telegram
     await setup_telegram_webhook(app['session'])
     
-    # 2. Lấy snapshot vị thế ban đầu từ Binance REST API
+    # 2. Kiểm tra Position Mode (Hedge hay One-way) và lấy snapshot vị thế ban đầu từ Binance REST API
     try:
+        await init_exchange_info(app['session'])
+        await check_position_mode(app['session'], api_key, api_secret)
         await init_positions(app['session'], api_key, api_secret)
     except Exception as e:
-        logger.error(f"Lỗi nạp vị thế snapshot ban đầu: {e}. Sẽ cập nhật lại khi có update từ WebSocket.")
+        logger.error(f"Lỗi khởi tạo chế độ/vị thế ban đầu: {e}. Sẽ cập nhật lại khi có update từ WebSocket.")
         
     # 3. Chạy background tasks
     app['user_data_task'] = asyncio.create_task(
