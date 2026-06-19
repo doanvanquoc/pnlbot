@@ -536,7 +536,7 @@ async def get_coin_prices(session, coin_names):
         symbol = coin_upper if coin_upper.endswith("USDT") else f"{coin_upper}USDT"
         targets[symbol] = coin_upper
 
-    url = "https://fapi.binance.com/fapi/v1/ticker/price"
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -548,20 +548,120 @@ async def get_coin_prices(session, coin_names):
         async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Tạo map nhanh các symbol và giá của chúng
-                prices_map = {item['symbol']: float(item['price']) for item in data}
+                # Tạo map nhanh các symbol với giá và % thay đổi
+                prices_map = {}
+                for item in data:
+                    symbol = item['symbol']
+                    prices_map[symbol] = {
+                        'price': float(item['lastPrice']),
+                        'change': float(item['priceChangePercent'])
+                    }
                 
                 results = []
                 for symbol, coin_upper in targets.items():
-                    price = prices_map.get(symbol)
-                    results.append((coin_upper, price))
+                    info = prices_map.get(symbol)
+                    results.append((coin_upper, info))
                 return results
             else:
                 body = await resp.text()
-                logger.error(f"Lỗi gọi API Binance: HTTP {resp.status} - {body}")
+                logger.error(f"Lỗi gọi API Binance 24h: HTTP {resp.status} - {body}")
     except Exception as e:
         logger.error(f"Lỗi lấy giá coin hàng loạt: {e}")
     return [(coin.upper(), None) for coin in coin_names]
+
+
+async def handle_balance_command(session, chat_id):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    timestamp = int(time.time() * 1000)
+    query_string = f"timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v2/account?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                
+                wallet_bal = float(data.get('totalWalletBalance', 0))
+                pnl = float(data.get('totalUnrealizedProfit', 0))
+                margin_bal = float(data.get('totalMarginBalance', 0))
+                avail_bal = float(data.get('availableBalance', 0))
+                
+                pnl_emoji = "🟩" if pnl >= 0 else "🟥"
+                pnl_sign = "+" if pnl >= 0 else ""
+                
+                message = (
+                    f"💳 *THÔNG TIN TÀI KHOẢN FUTURES*\n"
+                    f"----------------------------------\n"
+                    f"💰 Số dư ví: *{wallet_bal:,.2f} USDT*\n"
+                    f"📊 PnL chưa thực hiện: {pnl_emoji} *{pnl_sign}{pnl:,.2f} USDT*\n"
+                    f"🛡️ Số dư ký quỹ (Margin Balance): *{margin_bal:,.2f} USDT*\n"
+                    f"🟢 Khả dụng vào lệnh: *{avail_bal:,.2f} USDT*"
+                )
+                await send_telegram_message(session, chat_id, message)
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy số dư tài khoản: HTTP {resp.status} - {body}")
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi truy vấn số dư từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi trong handle_balance_command: {e}")
+        await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi lấy số dư tài khoản.")
+
+
+async def handle_top_command(session, chat_id):
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    api_key = os.getenv("BINANCE_API_KEY")
+    if api_key:
+        headers["X-MBX-APIKEY"] = api_key
+
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                
+                usdt_tickers = []
+                for item in data:
+                    symbol = item['symbol']
+                    if symbol.endswith("USDT"):
+                        usdt_tickers.append({
+                            'symbol': symbol[:-4],
+                            'price': float(item['lastPrice']),
+                            'change': float(item['priceChangePercent'])
+                        })
+                
+                usdt_tickers.sort(key=lambda x: x['change'], reverse=True)
+                
+                top_gainers = usdt_tickers[:5]
+                top_losers = usdt_tickers[-5:]
+                top_losers.reverse()
+                
+                lines = ["🔥 *TOP BIẾN ĐỘNG TRONG 24H (FUTURES)*\n----------------------------------"]
+                
+                lines.append("🚀 *Top 5 Tăng Mạnh Nhất:*")
+                for i, item in enumerate(top_gainers, 1):
+                    formatted_p = format_price(item['price'])
+                    lines.append(f"{i}. {item['symbol']} ➜ *{formatted_p}* (🟢 +{item['change']:.2f}%)")
+                    
+                lines.append("\n📉 *Top 5 Giảm Mạnh Nhất:*")
+                for i, item in enumerate(top_losers, 1):
+                    formatted_p = format_price(item['price'])
+                    lines.append(f"{i}. {item['symbol']} ➜ *{formatted_p}* (🔴 {item['change']:.2f}%)")
+                
+                message = "\n".join(lines)
+                await send_telegram_message(session, chat_id, message)
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy top biến động: HTTP {resp.status} - {body}")
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi lấy dữ liệu biến động từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi trong handle_top_command: {e}")
+        await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi xử lý dữ liệu biến động.")
 
 
 # Webhook Handler nhận POST từ Telegram
@@ -593,10 +693,14 @@ async def telegram_webhook_handler(request):
             results = await get_coin_prices(request.app['session'], coins)
             
             response_lines = []
-            for coin_name, price in results:
-                if price is not None:
+            for coin_name, info in results:
+                if info is not None:
+                    price = info['price']
+                    change = info['change']
                     formatted = format_price(price)
-                    response_lines.append(f"{coin_name.upper()}: {formatted}")
+                    emoji = "🟢" if change >= 0 else "🔴"
+                    sign = "+" if change >= 0 else ""
+                    response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%)")
                 else:
                     response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
             
@@ -613,7 +717,10 @@ async def telegram_webhook_handler(request):
             "Các câu lệnh hỗ trợ:\n"
             "📊 `/pnl` - Xem tổng PnL hiện tại.\n"
             "🔍 `/pos` - Xem chi tiết các vị thế đang mở.\n"
-            "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 5 phút."
+            "💳 `/balance` (hoặc `/wallet`) - Xem số dư tài khoản & ví Futures.\n"
+            "🔥 `/top` (hoặc `/gainers`) - Top 5 tăng/giảm mạnh nhất 24h.\n"
+            "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
+            "💡 *Mẹo*: Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h."
         )
         await send_telegram_message(request.app['session'], chat_id, welcome_text)
         
@@ -622,6 +729,12 @@ async def telegram_webhook_handler(request):
         
     elif command_base == '/pos':
         await handle_pos_command(request.app['session'], chat_id)
+        
+    elif command_base in ('/balance', '/wallet'):
+        await handle_balance_command(request.app['session'], chat_id)
+        
+    elif command_base in ('/top', '/gainers'):
+        await handle_top_command(request.app['session'], chat_id)
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
