@@ -950,6 +950,105 @@ async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi cài đặt đòn bẩy: {e}")
 
 
+async def handle_orders_command(session, chat_id):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    timestamp = int(time.time() * 1000)
+    query_string = f"timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/openOrders?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                
+                if not data:
+                    await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có lệnh chờ (Open Orders) nào trên tài khoản Futures.")
+                    return
+                
+                lines = ["⏳ *DANH SÁCH LỆNH ĐANG CHỜ KHỚP*\n----------------------------------"]
+                for i, order in enumerate(data, 1):
+                    symbol = order.get('symbol')
+                    order_id = order.get('orderId')
+                    price = float(order.get('price', 0))
+                    qty = float(order.get('origQty', 0))
+                    side = order.get('side')
+                    pos_side = order.get('positionSide', 'BOTH')
+                    order_type = order.get('type')
+                    
+                    display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
+                    
+                    if pos_side == 'LONG':
+                        display_side = "LONG"
+                    elif pos_side == 'SHORT':
+                        display_side = "SHORT"
+                    else:
+                        display_side = "LONG" if side == 'BUY' else "SHORT"
+                        
+                    emoji = "🟢" if display_side == 'LONG' else "🔴"
+                    notional = qty * price
+                    
+                    lines.append(
+                        f"{i}. {display_symbol} ({emoji} *{display_side} - {order_type}*)\n"
+                        f"   • Giá đặt: *{price:,.4f} USDT*\n"
+                        f"   • Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
+                        f"   • ID: `{order_id}`\n"
+                    )
+                
+                message = "\n".join(lines)
+                await send_telegram_message(session, chat_id, message)
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy danh sách lệnh chờ: HTTP {resp.status} - {body}")
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi truy vấn danh sách lệnh từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi trong handle_orders_command: {e}")
+        await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi hệ thống khi lấy danh sách lệnh chờ.")
+
+
+async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    try:
+        order_id = int(order_id_str)
+    except ValueError:
+        await send_telegram_message(session, chat_id, "❌ Order ID không hợp lệ. Vui lòng nhập số nguyên.")
+        return
+        
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&orderId={order_id}&timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.delete(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    f"✅ *HỦY LỆNH THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"🆔 Order ID đã hủy: `{order_id}`"
+                )
+            else:
+                msg_err = data.get('msg', 'Lỗi không xác định')
+                code_err = data.get('code', -1)
+                await send_telegram_message(session, chat_id, f"❌ *Hủy lệnh thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})")
+    except Exception as e:
+        logger.error(f"Lỗi khi hủy lệnh {order_id} của {symbol}: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi hủy lệnh: {e}")
+
+
 # Webhook Handler nhận POST từ Telegram
 async def telegram_webhook_handler(request):
     try:
@@ -1006,6 +1105,8 @@ async def telegram_webhook_handler(request):
             "💳 `/balance` (hoặc `/wallet`) - Xem số dư tài khoản & ví Futures.\n"
             "🔥 `/top` (hoặc `/gainers`) - Top 5 tăng/giảm mạnh nhất 24h.\n"
             "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
+            "⏳ `/orders` - Xem danh sách lệnh đang chờ khớp.\n"
+            "❌ `/cancel <coin> <order_id>` - Hủy một lệnh đang chờ.\n"
             "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
@@ -1027,6 +1128,22 @@ async def telegram_webhook_handler(request):
         
     elif command_base in ('/top', '/gainers'):
         await handle_top_command(request.app['session'], chat_id)
+        
+    elif command_base == '/orders':
+        await handle_orders_command(request.app['session'], chat_id)
+        
+    elif command_base == '/cancel':
+        parts = text.split()
+        if len(parts) < 3:
+            await send_telegram_message(
+                request.app['session'], 
+                chat_id, 
+                "❌ Sai cú pháp hủy lệnh!\nSử dụng: `/cancel <coin> <order_id>`\nVí dụ: `/cancel btc 1234567`"
+            )
+        else:
+            coin_name = parts[1]
+            order_id_str = parts[2]
+            await handle_cancel_command(request.app['session'], chat_id, coin_name, order_id_str)
         
     elif command_base in ('/leverage', '/lev'):
         parts = text.split()
