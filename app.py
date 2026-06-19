@@ -536,9 +536,16 @@ async def get_coin_prices(session, coin_names):
         symbol = coin_upper if coin_upper.endswith("USDT") else f"{coin_upper}USDT"
         targets[symbol] = coin_upper
 
-    url = "https://api.binance.com/api/v3/ticker/price"
+    url = "https://fapi.binance.com/fapi/v1/ticker/price"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    api_key = os.getenv("BINANCE_API_KEY")
+    if api_key:
+        headers["X-MBX-APIKEY"] = api_key
+
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 # Tạo map nhanh các symbol và giá của chúng
@@ -550,7 +557,8 @@ async def get_coin_prices(session, coin_names):
                     results.append((coin_upper, price))
                 return results
             else:
-                logger.error(f"Lỗi gọi API Binance: HTTP {resp.status}")
+                body = await resp.text()
+                logger.error(f"Lỗi gọi API Binance: HTTP {resp.status} - {body}")
     except Exception as e:
         logger.error(f"Lỗi lấy giá coin hàng loạt: {e}")
     return [(coin.upper(), None) for coin in coin_names]
