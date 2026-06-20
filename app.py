@@ -31,6 +31,7 @@ last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (ke
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
+symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 
 # Hàm tạo chữ ký HMAC-SHA256 cho Binance API
 def get_binance_signature(query_string, secret_key):
@@ -702,7 +703,7 @@ def round_down(value, decimals):
 
 # Nạp thông tin độ chính xác từ Binance
 async def init_exchange_info(session):
-    global symbol_precisions, symbol_price_precisions
+    global symbol_precisions, symbol_price_precisions, symbol_tick_sizes
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     try:
         headers = {
@@ -715,7 +716,17 @@ async def init_exchange_info(session):
                     sym = s['symbol']
                     symbol_precisions[sym] = int(s.get('quantityPrecision', 0))
                     symbol_price_precisions[sym] = int(s.get('pricePrecision', 0))
-                logger.info(f"Đã nạp độ chính xác số lượng ({len(symbol_precisions)}) và giá ({len(symbol_price_precisions)}) từ Binance.")
+                    
+                    # Tìm tickSize trong PRICE_FILTER
+                    tick_size = 0.0
+                    for f in s.get('filters', []):
+                        if f.get('filterType') == 'PRICE_FILTER':
+                            tick_size = float(f.get('tickSize', 0))
+                            break
+                    if tick_size <= 0:
+                        tick_size = 10 ** (-int(s.get('pricePrecision', 0)))
+                    symbol_tick_sizes[sym] = tick_size
+                logger.info(f"Đã nạp độ chính xác số lượng ({len(symbol_precisions)}), giá ({len(symbol_price_precisions)}) và tickSize ({len(symbol_tick_sizes)}) từ Binance.")
             else:
                 body = await resp.text()
                 logger.error(f"Lỗi nạp exchangeInfo: HTTP {resp.status} - {body}")
@@ -723,20 +734,32 @@ async def init_exchange_info(session):
         logger.error(f"Lỗi khi gọi exchangeInfo: {e}")
 
 
+def round_price_step(price, tick_size, price_precision):
+    """
+    Làm tròn giá về bội số gần nhất của tick_size để không bị lỗi -4014.
+    """
+    if tick_size <= 0:
+        return round(price, price_precision)
+    rounded = round(round(price / tick_size) * tick_size, price_precision)
+    return rounded
+
+
 async def get_symbol_precisions(session, symbol):
     """
-    Trả về (quantityPrecision, pricePrecision) của symbol.
+    Trả về (quantityPrecision, pricePrecision, tickSize) của symbol.
     Nếu chưa có trong cache, sẽ gọi API exchangeInfo để nạp lại.
     """
     qty_p = symbol_precisions.get(symbol)
     price_p = symbol_price_precisions.get(symbol)
+    tick_size = symbol_tick_sizes.get(symbol)
     
-    if qty_p is None or price_p is None:
+    if qty_p is None or price_p is None or tick_size is None:
         await init_exchange_info(session)
         qty_p = symbol_precisions.get(symbol, 3)
         price_p = symbol_price_precisions.get(symbol, 4)
+        tick_size = symbol_tick_sizes.get(symbol, 10 ** (-price_p))
         
-    return qty_p, price_p
+    return qty_p, price_p, tick_size
 
 
 # Lấy đòn bẩy tối đa của symbol
@@ -1104,7 +1127,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
         return
 
     # Lấy độ chính xác số lượng và giá của symbol
-    qty_p, price_p = await get_symbol_precisions(session, symbol)
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
 
     # Xác định giá đặt lệnh (nếu có price_str thì là LIMIT, ngược lại là MARKET)
     is_limit = price_str is not None
@@ -1114,7 +1137,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
             limit_price = float(price_str)
             if limit_price <= 0:
                 raise ValueError()
-            limit_price = round(limit_price, price_p)
+            limit_price = round_price_step(limit_price, tick_size, price_p)
         except ValueError:
             await send_telegram_message(session, chat_id, "❌ Giá đặt lệnh limit không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
             return
@@ -1244,7 +1267,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             is_long=(side_type == 'LONG'),
                             is_tp=True
                         )
-                        final_tp_price = round(final_tp_price, price_p)
+                        final_tp_price = round_price_step(final_tp_price, tick_size, price_p)
                     except Exception as e:
                         tp_sl_msg_parts.append(f"❌ *Lỗi tính toán TP '{tp_price_str}':* `{e}`")
 
@@ -1261,7 +1284,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             is_long=(side_type == 'LONG'),
                             is_tp=False
                         )
-                        final_sl_price = round(final_sl_price, price_p)
+                        final_sl_price = round_price_step(final_sl_price, tick_size, price_p)
                     except Exception as e:
                         tp_sl_msg_parts.append(f"❌ *Lỗi tính toán SL '{sl_price_str}':* `{e}`")
 
@@ -1518,7 +1541,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         )
         return
 
-    qty_p, price_p = await get_symbol_precisions(session, symbol)
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
 
     # Không ép kiểu float ngay lập tức vì hỗ trợ định dạng % (phần trăm) và u (USDT PnL)
     if tp_price_str:
@@ -1557,7 +1580,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     is_long=is_long,
                     is_tp=True
                 )
-                final_tp_price = round(final_tp_price, price_p)
+                final_tp_price = round_price_step(final_tp_price, tick_size, price_p)
             except Exception as e:
                 results.append(f"   • TP (*{pos_display}*): 🔴 Lỗi tính toán '{tp_price_str}': {e}")
 
@@ -1572,7 +1595,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     is_long=is_long,
                     is_tp=False
                 )
-                final_sl_price = round(final_sl_price, price_p)
+                final_sl_price = round_price_step(final_sl_price, tick_size, price_p)
             except Exception as e:
                 results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi tính toán '{sl_price_str}': {e}")
         
@@ -1708,7 +1731,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
         pos_display = 'LONG' if is_long else 'SHORT'
         
         # 1. Tính toán giá Limit DCA tương ứng với khoảng cách (loss)
-        qty_p, price_p = await get_symbol_precisions(session, symbol)
+        qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
         try:
             dca_price = calculate_tpsl_price(
                 diff_str,
@@ -1718,7 +1741,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
                 is_long=is_long,
                 is_tp=False # DCA đặt ở vùng lỗ
             )
-            dca_price = round(dca_price, price_p)
+            dca_price = round_price_step(dca_price, tick_size, price_p)
             
         except Exception as e:
             await send_telegram_message(
