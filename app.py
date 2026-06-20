@@ -4,6 +4,8 @@ import hmac
 import hashlib
 import time
 import os
+import random
+import json
 import logging
 import aiohttp
 from aiohttp import web
@@ -32,6 +34,28 @@ hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: On
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
 symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
+
+ACTIVE_CHATS_FILE = "active_chats.json"
+active_chats = set()
+
+def load_active_chats():
+    global active_chats
+    try:
+        if os.path.exists(ACTIVE_CHATS_FILE):
+            with open(ACTIVE_CHATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                active_chats = set(int(cid) for cid in data)
+                logger.info(f"Đã tải {len(active_chats)} chat_id hoạt động từ file.")
+    except Exception as e:
+        logger.error(f"Lỗi khi tải active_chats: {e}")
+
+def save_active_chats():
+    try:
+        with open(ACTIVE_CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(active_chats), f)
+    except Exception as e:
+        logger.error(f"Lỗi khi lưu active_chats: {e}")
+
 
 # Hàm tạo chữ ký HMAC-SHA256 cho Binance API
 def get_binance_signature(query_string, secret_key):
@@ -280,6 +304,48 @@ async def binance_user_data_stream(session, api_key):
                                     if pos['symbol'] == symbol:
                                         pos['leverage'] = leverage
                                         logger.info(f"Đã cập nhật đòn bẩy {key} thành {leverage}x")
+                                        
+                        elif event_type == 'ORDER_TRADE_UPDATE':
+                            order_data = data.get('o', {})
+                            exec_type = order_data.get('x') # Execution Type: 'TRADE' khi khớp
+                            status = order_data.get('X')    # Trạng thái: 'FILLED'
+                            client_order_id = order_data.get('c', '')
+                            
+                            # Chỉ thông báo khi lệnh được khớp hoàn toàn (FILLED) và được đặt qua Bot
+                            if exec_type == 'TRADE' and status == 'FILLED' and client_order_id.startswith('pnlbot_'):
+                                symbol = order_data.get('s')
+                                side = order_data.get('S')        # BUY, SELL
+                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
+                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
+                                qty = float(order_data.get('z', 0))
+                                notional = qty * price
+                                
+                                # Xác định tên loại lệnh để thông báo cho trực quan
+                                order_type_display = "Limit"
+                                if "dca" in client_order_id:
+                                    order_type_display = "DCA Limit"
+                                
+                                # Định dạng Side hiển thị kèm theo chiều vị thế (LONG/SHORT)
+                                side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
+                                
+                                message = (
+                                    f"🔔 *THÔNG BÁO LỆNH KHỚP THÀNH CÔNG*\n"
+                                    f"----------------------------------\n"
+                                    f"🪙 Cặp: *{symbol}*\n"
+                                    f"⚡ Loại lệnh: *{order_type_display} ({side_display})*\n"
+                                    f"📊 Trạng thái: 🟢 *Đã khớp hoàn toàn (FILLED)*\n"
+                                    f"💵 Giá khớp: *{format_price(price)} USDT*\n"
+                                    f"🔢 Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
+                                    f"🆔 Order ID: `{order_data.get('i')}`"
+                                )
+                                
+                                # Gửi thông báo cho tất cả active_chats
+                                if active_chats:
+                                    for chat_id in list(active_chats):
+                                        try:
+                                            await send_telegram_message(session, chat_id, message)
+                                        except Exception as send_err:
+                                            logger.error(f"Không thể gửi thông báo lệnh khớp đến {chat_id}: {send_err}")
                                         
                         elif event_type == 'listenKeyExpired':
                             logger.warning("listenKey đã bị hết hạn trên Binance Server.")
@@ -1203,6 +1269,8 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
     if is_limit:
         params.append(f"price={limit_price}")
         params.append("timeInForce=GTC")
+        client_order_id = f"pnlbot_limit_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+        params.append(f"newClientOrderId={client_order_id}")
         
     if hedge_mode:
         params.append(f"positionSide={pos_side}")
@@ -1770,6 +1838,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
         pos_side = side # LONG, SHORT, BOTH
         
         timestamp = int(time.time() * 1000)
+        client_order_id = f"pnlbot_dca_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
         params = [
             f"symbol={symbol}",
             f"side={order_side}",
@@ -1777,6 +1846,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
             f"quantity={quantity_dca}",
             f"price={dca_price}",
             "timeInForce=GTC",
+            f"newClientOrderId={client_order_id}",
             f"timestamp={timestamp}"
         ]
         
@@ -1875,6 +1945,10 @@ async def telegram_webhook_handler(request):
         return web.Response(status=200)
         
     chat_id = chat.get('id')
+    if chat_id not in active_chats:
+        active_chats.add(chat_id)
+        save_active_chats()
+        
     text = message.get('text', '').strip()
     
     if not text:
@@ -2152,6 +2226,7 @@ async def log_server_ip(session):
 
 # Lifecycle hooks của aiohttp
 async def on_startup(app):
+    load_active_chats()
     app['session'] = aiohttp.ClientSession()
     
     # 0. Tự động lấy và log IP của server để cấu hình Binance
