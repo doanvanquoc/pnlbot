@@ -926,7 +926,8 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"symbol={symbol}",
                         f"side={tpsl_side}",
                         "type=TAKE_PROFIT_MARKET",
-                        f"stopPrice={tp_price}",
+                        f"triggerPrice={tp_price}",
+                        "algoType=CONDITIONAL",
                         f"timestamp={timestamp_tp}"
                     ]
                     if is_limit:
@@ -940,13 +941,13 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         
                     tp_query = "&".join(tp_params)
                     tp_sig = get_binance_signature(tp_query, api_secret)
-                    tp_url = f"https://fapi.binance.com/fapi/v1/order?{tp_query}&signature={tp_sig}"
+                    tp_url = f"https://fapi.binance.com/fapi/v1/algoOrder?{tp_query}&signature={tp_sig}"
                     
                     try:
                         async with session.post(tp_url, headers=headers) as tp_resp:
                             tp_data = await tp_resp.json()
                             if tp_resp.status == 200:
-                                tp_id = tp_data.get('orderId')
+                                tp_id = tp_data.get('orderId') or tp_data.get('algoId')
                                 tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời ở giá *{tp_price:,.4f}* (Thành công, ID: `{tp_id}`)")
                             else:
                                 tp_err = tp_data.get('msg', 'Lỗi không xác định')
@@ -961,7 +962,8 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"symbol={symbol}",
                         f"side={tpsl_side}",
                         "type=STOP_MARKET",
-                        f"stopPrice={sl_price}",
+                        f"triggerPrice={sl_price}",
+                        "algoType=CONDITIONAL",
                         f"timestamp={timestamp_sl}"
                     ]
                     if is_limit:
@@ -975,13 +977,13 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         
                     sl_query = "&".join(sl_params)
                     sl_sig = get_binance_signature(sl_query, api_secret)
-                    sl_url = f"https://fapi.binance.com/fapi/v1/order?{sl_query}&signature={sl_sig}"
+                    sl_url = f"https://fapi.binance.com/fapi/v1/algoOrder?{sl_query}&signature={sl_sig}"
                     
                     try:
                         async with session.post(sl_url, headers=headers) as sl_resp:
                             sl_data = await sl_resp.json()
                             if sl_resp.status == 200:
-                                sl_id = sl_data.get('orderId')
+                                sl_id = sl_data.get('orderId') or sl_data.get('algoId')
                                 tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ ở giá *{sl_price:,.4f}* (Thành công, ID: `{sl_id}`)")
                             else:
                                 sl_err = sl_data.get('msg', 'Lỗi không xác định')
@@ -1181,7 +1183,8 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 f"symbol={symbol}",
                 f"side={order_side}",
                 "type=TAKE_PROFIT_MARKET",
-                f"stopPrice={tp_price}",
+                f"triggerPrice={tp_price}",
+                "algoType=CONDITIONAL",
                 "closePosition=true",
                 f"timestamp={timestamp}"
             ]
@@ -1190,13 +1193,13 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 
             query_string = "&".join(params)
             signature = get_binance_signature(query_string, api_secret)
-            url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+            url = f"https://fapi.binance.com/fapi/v1/algoOrder?{query_string}&signature={signature}"
             
             try:
                 async with session.post(url, headers=headers) as resp:
                     data = await resp.json()
                     if resp.status == 200:
-                        order_id = data.get('orderId')
+                        order_id = data.get('orderId') or data.get('algoId')
                         results.append(f"   • TP (*{pos_display}* tại giá *{tp_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
@@ -1210,7 +1213,8 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 f"symbol={symbol}",
                 f"side={order_side}",
                 "type=STOP_MARKET",
-                f"stopPrice={sl_price}",
+                f"triggerPrice={sl_price}",
+                "algoType=CONDITIONAL",
                 "closePosition=true",
                 f"timestamp={timestamp}"
             ]
@@ -1219,13 +1223,13 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 
             query_string = "&".join(params)
             signature = get_binance_signature(query_string, api_secret)
-            url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+            url = f"https://fapi.binance.com/fapi/v1/algoOrder?{query_string}&signature={signature}"
             
             try:
                 async with session.post(url, headers=headers) as resp:
                     data = await resp.json()
                     if resp.status == 200:
-                        order_id = data.get('orderId')
+                        order_id = data.get('orderId') or data.get('algoId')
                         results.append(f"   • SL (*{pos_display}* tại giá *{sl_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
