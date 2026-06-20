@@ -850,7 +850,7 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                 orders = await resp.json()
                 if isinstance(orders, list):
                     for order in orders:
-                        order_type = order.get('type')
+                        order_type = order.get('orderType') or order.get('type')
                         order_pos_side = order.get('positionSide', 'BOTH')
                         
                         if position_side and order_pos_side != position_side:
