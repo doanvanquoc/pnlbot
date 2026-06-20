@@ -1353,6 +1353,14 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
 
                 if tp_sl_msg_parts:
                     msg += "\n\n" + "\n".join(tp_sl_msg_parts)
+                    
+                    if any("GTE" in r or "closePosition" in r for r in tp_sl_msg_parts):
+                        msg += (
+                            f"\n\n⚠️ *Lưu ý lỗi GTE/closePosition từ Binance:*\n"
+                            f"Binance quy định chỉ được phép tồn tại *1 lệnh đóng vị thế (closePosition)* có cùng điều kiện kích hoạt GTE (hoặc LTE).\n"
+                            f"Khi bạn đặt TP/SL mà cả TP và SL đều nằm cùng một phía so với giá hiện tại (cả hai đều cao hơn hoặc đều thấp hơn giá thị trường), chúng sẽ trùng điều kiện kích hoạt (GTE/LTE) dẫn đến lệnh thứ hai bị từ chối.\n"
+                            f"👉 *Giải pháp:* Cài đặt TP/SL khi giá hiện tại nằm giữa khoảng TP và SL, hoặc hủy bớt lệnh cũ trên app Binance rồi thử lại."
+                        )
 
                 await send_telegram_message(session, chat_id, msg)
             else:
@@ -1645,6 +1653,14 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         f"----------------------------------\n" +
         "\n".join(results)
     )
+    
+    if any("GTE" in r or "closePosition" in r for r in results):
+        msg += (
+            f"\n\n⚠️ *Lưu ý lỗi GTE/closePosition từ Binance:*\n"
+            f"Binance quy định chỉ được phép tồn tại *1 lệnh đóng vị thế (closePosition)* có cùng điều kiện kích hoạt GTE (hoặc LTE).\n"
+            f"Khi bạn đặt TP/SL mà cả TP và SL đều nằm cùng một phía so với giá hiện tại (cả hai đều cao hơn hoặc đều thấp hơn giá thị trường), chúng sẽ trùng điều kiện kích hoạt (GTE/LTE) dẫn đến lệnh thứ hai bị từ chối.\n"
+            f"👉 *Giải pháp:* Cài đặt TP/SL khi giá hiện tại nằm giữa khoảng TP và SL, hoặc hủy bớt lệnh cũ trên app Binance rồi thử lại."
+        )
     await send_telegram_message(session, chat_id, msg)
 
 
