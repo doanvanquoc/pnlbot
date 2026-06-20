@@ -971,9 +971,12 @@ async def send_telegram_photo(session, chat_id, photo_bytes, caption=None):
 
 async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_side=None, cancel_tp=True, cancel_sl=True):
     """
-    Tìm và hủy các lệnh TP/SL đang mở để tránh lỗi trùng lặp/GTE của Binance.
+    Tìm và hủy các lệnh TP/SL đang mở (bao gồm cả Algo Orders và Regular Orders) để tránh lỗi trùng lặp/GTE của Binance.
     """
     timestamp = int(time.time() * 1000)
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    # 1. Hủy các lệnh điều kiện của Algo Service
     params = [
         f"symbol={symbol}",
         "algoType=CONDITIONAL",
@@ -982,7 +985,6 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
     query_string = "&".join(params)
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/openAlgoOrders?{query_string}&signature={signature}"
-    headers = {"X-MBX-APIKEY": api_key}
     
     try:
         async with session.get(url, headers=headers) as resp:
@@ -1010,14 +1012,59 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                                 async with session.delete(del_url, headers=headers) as del_resp:
                                     del_data = await del_resp.json()
                                     if del_resp.status == 200:
-                                        logger.info(f"Đã tự động hủy lệnh TP/SL cũ: algoId={algo_id} của {symbol}")
+                                        logger.info(f"Đã tự động hủy lệnh Algo TP/SL cũ: algoId={algo_id} của {symbol}")
                                     else:
-                                        logger.warning(f"Không thể hủy lệnh TP/SL cũ: {del_data.get('msg')}")
+                                        logger.warning(f"Không thể hủy lệnh Algo TP/SL cũ: {del_data.get('msg')}")
             else:
                 body = await resp.text()
                 logger.error(f"Lỗi lấy openAlgoOrders: HTTP {resp.status} - {body}")
     except Exception as e:
-        logger.error(f"Lỗi trong cancel_existing_tpsl: {e}")
+        logger.error(f"Lỗi trong cancel_existing_tpsl (Algo): {e}")
+
+    # 2. Hủy các lệnh dừng/chốt lời thông thường (Regular Orders)
+    try:
+        timestamp_reg = int(time.time() * 1000)
+        params_reg = [
+            f"symbol={symbol}",
+            f"timestamp={timestamp_reg}"
+        ]
+        query_reg = "&".join(params_reg)
+        sig_reg = get_binance_signature(query_reg, api_secret)
+        url_reg = f"https://fapi.binance.com/fapi/v1/openOrders?{query_reg}&signature={sig_reg}"
+        
+        async with session.get(url_reg, headers=headers) as resp_reg:
+            if resp_reg.status == 200:
+                orders_reg = await resp_reg.json()
+                if isinstance(orders_reg, list):
+                    for order in orders_reg:
+                        order_type = (order.get('type') or order.get('origType') or '').upper()
+                        order_pos_side = order.get('positionSide', 'BOTH')
+                        
+                        if position_side and order_pos_side != position_side:
+                            continue
+                            
+                        is_tp = 'TAKE_PROFIT' in order_type
+                        is_sl = 'STOP' in order_type
+                        
+                        if (is_tp and cancel_tp) or (is_sl and cancel_sl):
+                            order_id = order.get('orderId')
+                            if order_id:
+                                del_timestamp = int(time.time() * 1000)
+                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
+                                del_sig = get_binance_signature(del_query, api_secret)
+                                del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
+                                
+                                async with session.delete(del_url, headers=headers) as del_resp:
+                                    del_data = await del_resp.json()
+                                    if del_resp.status == 200:
+                                        logger.info(f"Đã tự động hủy lệnh Regular TP/SL cũ: orderId={order_id} của {symbol}")
+                                    else:
+                                        logger.warning(f"Không thể hủy lệnh Regular TP/SL cũ: {del_data.get('msg')}")
+            else:
+                body = await resp_reg.text()
+                logger.error(f"Lỗi lấy openOrders: HTTP {resp_reg.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi trong cancel_existing_tpsl (Regular): {e}")
 
 
 async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None, tp_price_str=None, sl_price_str=None):
