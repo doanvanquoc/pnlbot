@@ -764,6 +764,71 @@ async def get_single_price(session, symbol):
     return 0.0
 
 
+def calculate_tpsl_price(input_str, entry_price, quantity, leverage, is_long, is_tp):
+    """
+    Tính toán giá TP/SL tuyệt đối dựa trên giá trị nhập vào:
+    - Suffix '%': phần trăm biến động giá (vd: '5%')
+    - Suffix 'r' hoặc 'roe': phần trăm ROE (vd: '100r', '50roe')
+    - Suffix 'u' hoặc 'usdt': số tiền USDT PnL tuyệt đối (vd: '20u', '50usdt')
+    - Raw number: Giá tuyệt đối (vd: '68500')
+    """
+    input_str = input_str.strip().lower()
+    
+    # 1. ROE %: vd "100r", "50roe"
+    if input_str.endswith('roe') or input_str.endswith('r'):
+        clean_str = input_str.replace('roe', '').replace('r', '').replace('%', '').strip()
+        roe_val = float(clean_str)
+        # Price Change % = ROE / Leverage
+        price_change_pct = (roe_val / leverage) / 100.0
+        if is_tp:
+            if is_long:
+                return entry_price * (1 + price_change_pct)
+            else:
+                return entry_price * (1 - price_change_pct)
+        else:
+            if is_long:
+                return entry_price * (1 - price_change_pct)
+            else:
+                return entry_price * (1 + price_change_pct)
+                
+    # 2. % Biến động giá: vd "5%"
+    elif input_str.endswith('%') or input_str.endswith('pct'):
+        clean_str = input_str.replace('%', '').replace('pct', '').strip()
+        pct_val = float(clean_str) / 100.0
+        if is_tp:
+            if is_long:
+                return entry_price * (1 + pct_val)
+            else:
+                return entry_price * (1 - pct_val)
+        else:
+            if is_long:
+                return entry_price * (1 - pct_val)
+            else:
+                return entry_price * (1 + pct_val)
+                
+    # 3. USDT PnL: vd "50u", "10u"
+    elif input_str.endswith('u') or input_str.endswith('usdt'):
+        clean_str = input_str.replace('usdt', '').replace('u', '').strip()
+        pnl_val = float(clean_str)
+        if quantity <= 0:
+            raise ValueError("Số lượng phải lớn hơn 0 để tính theo USDT PnL.")
+        price_diff = pnl_val / quantity
+        if is_tp:
+            if is_long:
+                return entry_price + price_diff
+            else:
+                return entry_price - price_diff
+        else:
+            if is_long:
+                return entry_price - price_diff
+            else:
+                return entry_price + price_diff
+                
+    # 4. Giá tuyệt đối
+    else:
+        return float(input_str)
+
+
 async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_side=None, cancel_tp=True, cancel_sl=True):
     """
     Tìm và hủy các lệnh TP/SL đang mở để tránh lỗi trùng lặp/GTE của Binance.
@@ -843,25 +908,11 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
             await send_telegram_message(session, chat_id, "❌ Giá đặt lệnh limit không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
             return
 
-    tp_price = None
+    # Không ép kiểu float ngay lập tức vì hỗ trợ định dạng % (phần trăm) và u (USDT PnL)
     if tp_price_str:
-        try:
-            tp_price = float(tp_price_str)
-            if tp_price <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá chốt lời (TP) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
-
-    sl_price = None
+        tp_price_str = tp_price_str.strip()
     if sl_price_str:
-        try:
-            sl_price = float(sl_price_str)
-            if sl_price <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá cắt lỗ (SL) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
+        sl_price_str = sl_price_str.strip()
 
     # 1. Lấy đòn bẩy tối đa (Max Leverage) và tự động thiết lập cho symbol đó
     max_leverage = await get_max_leverage(session, api_key, api_secret, symbol)
@@ -967,29 +1018,63 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"🆔 Order ID: `{order_id}`"
                     )
                 
+                # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
+                final_tp_price = None
+                if tp_price_str:
+                    try:
+                        ref_price = limit_price if is_limit else avg_price
+                        ref_qty = quantity if is_limit else execute_qty
+                        final_tp_price = calculate_tpsl_price(
+                            tp_price_str,
+                            entry_price=ref_price,
+                            quantity=ref_qty,
+                            leverage=max_leverage,
+                            is_long=(side_type == 'LONG'),
+                            is_tp=True
+                        )
+                        final_tp_price = round(final_tp_price, 4)
+                    except Exception as e:
+                        tp_sl_msg_parts.append(f"❌ *Lỗi tính toán TP '{tp_price_str}':* `{e}`")
+
+                final_sl_price = None
+                if sl_price_str:
+                    try:
+                        ref_price = limit_price if is_limit else avg_price
+                        ref_qty = quantity if is_limit else execute_qty
+                        final_sl_price = calculate_tpsl_price(
+                            sl_price_str,
+                            entry_price=ref_price,
+                            quantity=ref_qty,
+                            leverage=max_leverage,
+                            is_long=(side_type == 'LONG'),
+                            is_tp=False
+                        )
+                        final_sl_price = round(final_sl_price, 4)
+                    except Exception as e:
+                        tp_sl_msg_parts.append(f"❌ *Lỗi tính toán SL '{sl_price_str}':* `{e}`")
+
                 # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
-                if tp_price is not None or sl_price is not None:
+                if final_tp_price is not None or final_sl_price is not None:
                     await cancel_existing_tpsl(
                         session, 
                         api_key, 
                         api_secret, 
                         symbol, 
                         position_side=pos_side, 
-                        cancel_tp=(tp_price is not None), 
-                        cancel_sl=(sl_price is not None)
+                        cancel_tp=(final_tp_price is not None), 
+                        cancel_sl=(final_sl_price is not None)
                     )
 
                 tpsl_side = 'SELL' if side_type == 'LONG' else 'BUY'
-                tp_sl_msg_parts = []
                 
                 # Cài đặt TP nếu có
-                if tp_price is not None:
+                if final_tp_price is not None:
                     timestamp_tp = int(time.time() * 1000)
                     tp_params = [
                         f"symbol={symbol}",
                         f"side={tpsl_side}",
                         "type=TAKE_PROFIT_MARKET",
-                        f"triggerPrice={tp_price}",
+                        f"triggerPrice={final_tp_price}",
                         "algoType=CONDITIONAL",
                         f"timestamp={timestamp_tp}"
                     ]
@@ -1011,7 +1096,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             tp_data = await tp_resp.json()
                             if tp_resp.status == 200:
                                 tp_id = tp_data.get('orderId') or tp_data.get('algoId')
-                                tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời ở giá *{tp_price:,.4f}* (Thành công, ID: `{tp_id}`)")
+                                tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời ở giá *{final_tp_price:,.4f}* (Thành công, ID: `{tp_id}`)")
                             else:
                                 tp_err = tp_data.get('msg', 'Lỗi không xác định')
                                 tp_sl_msg_parts.append(f"❌ *Lỗi đặt TP:* `{tp_err}`")
@@ -1019,13 +1104,13 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         tp_sl_msg_parts.append(f"❌ *Lỗi đặt TP:* `{e}`")
 
                 # Cài đặt SL nếu có
-                if sl_price is not None:
+                if final_sl_price is not None:
                     timestamp_sl = int(time.time() * 1000)
                     sl_params = [
                         f"symbol={symbol}",
                         f"side={tpsl_side}",
                         "type=STOP_MARKET",
-                        f"triggerPrice={sl_price}",
+                        f"triggerPrice={final_sl_price}",
                         "algoType=CONDITIONAL",
                         f"timestamp={timestamp_sl}"
                     ]
@@ -1047,7 +1132,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             sl_data = await sl_resp.json()
                             if sl_resp.status == 200:
                                 sl_id = sl_data.get('orderId') or sl_data.get('algoId')
-                                tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ ở giá *{sl_price:,.4f}* (Thành công, ID: `{sl_id}`)")
+                                tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ ở giá *{final_sl_price:,.4f}* (Thành công, ID: `{sl_id}`)")
                             else:
                                 sl_err = sl_data.get('msg', 'Lỗi không xác định')
                                 tp_sl_msg_parts.append(f"❌ *Lỗi đặt SL:* `{sl_err}`")
@@ -1204,25 +1289,11 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         )
         return
 
-    tp_price = None
+    # Không ép kiểu float ngay lập tức vì hỗ trợ định dạng % (phần trăm) và u (USDT PnL)
     if tp_price_str:
-        try:
-            tp_price = float(tp_price_str)
-            if tp_price <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá chốt lời (TP) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
-
-    sl_price = None
+        tp_price_str = tp_price_str.strip()
     if sl_price_str:
-        try:
-            sl_price = float(sl_price_str)
-            if sl_price <= 0:
-                raise ValueError()
-        except ValueError:
-            await send_telegram_message(session, chat_id, "❌ Giá cắt lỗ (SL) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
-            return
+        sl_price_str = sl_price_str.strip()
 
     results = []
     headers = {"X-MBX-APIKEY": api_key}
@@ -1230,6 +1301,9 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
     for pos in target_positions:
         side = pos['positionSide']
         amt = pos['positionAmt']
+        entry_price = pos['entryPrice']
+        leverage = pos.get('leverage', 1)
+        quantity = abs(amt)
         
         is_long = amt > 0
         if side == 'LONG':
@@ -1240,25 +1314,56 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         order_side = 'SELL' if is_long else 'BUY'
         pos_display = 'LONG' if is_long else 'SHORT'
         
+        # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
+        final_tp_price = None
+        if tp_price_str:
+            try:
+                final_tp_price = calculate_tpsl_price(
+                    tp_price_str,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    leverage=leverage,
+                    is_long=is_long,
+                    is_tp=True
+                )
+                final_tp_price = round(final_tp_price, 4)
+            except Exception as e:
+                results.append(f"   • TP (*{pos_display}*): 🔴 Lỗi tính toán '{tp_price_str}': {e}")
+
+        final_sl_price = None
+        if sl_price_str:
+            try:
+                final_sl_price = calculate_tpsl_price(
+                    sl_price_str,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    leverage=leverage,
+                    is_long=is_long,
+                    is_tp=False
+                )
+                final_sl_price = round(final_sl_price, 4)
+            except Exception as e:
+                results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi tính toán '{sl_price_str}': {e}")
+        
         # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
-        if tp_price is not None or sl_price is not None:
+        if final_tp_price is not None or final_sl_price is not None:
             await cancel_existing_tpsl(
                 session, 
                 api_key, 
                 api_secret, 
                 symbol, 
                 position_side=side, 
-                cancel_tp=(tp_price is not None), 
-                cancel_sl=(sl_price is not None)
+                cancel_tp=(final_tp_price is not None), 
+                cancel_sl=(final_sl_price is not None)
             )
             
-        if tp_price is not None:
+        if final_tp_price is not None:
             timestamp = int(time.time() * 1000)
             params = [
                 f"symbol={symbol}",
                 f"side={order_side}",
                 "type=TAKE_PROFIT_MARKET",
-                f"triggerPrice={tp_price}",
+                f"triggerPrice={final_tp_price}",
                 "algoType=CONDITIONAL",
                 "closePosition=true",
                 f"timestamp={timestamp}"
@@ -1275,20 +1380,20 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     data = await resp.json()
                     if resp.status == 200:
                         order_id = data.get('orderId') or data.get('algoId')
-                        results.append(f"   • TP (*{pos_display}* tại giá *{tp_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
+                        results.append(f"   • TP (*{pos_display}* tại giá *{final_tp_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
-                        results.append(f"   • TP (*{pos_display}* tại giá *{tp_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
+                        results.append(f"   • TP (*{pos_display}* tại giá *{final_tp_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
             except Exception as e:
                 results.append(f"   • TP (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
                 
-        if sl_price is not None:
+        if final_sl_price is not None:
             timestamp = int(time.time() * 1000)
             params = [
                 f"symbol={symbol}",
                 f"side={order_side}",
                 "type=STOP_MARKET",
-                f"triggerPrice={sl_price}",
+                f"triggerPrice={final_sl_price}",
                 "algoType=CONDITIONAL",
                 "closePosition=true",
                 f"timestamp={timestamp}"
@@ -1305,10 +1410,10 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     data = await resp.json()
                     if resp.status == 200:
                         order_id = data.get('orderId') or data.get('algoId')
-                        results.append(f"   • SL (*{pos_display}* tại giá *{sl_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
+                        results.append(f"   • SL (*{pos_display}* tại giá *{final_sl_price:,.4f}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
-                        results.append(f"   • SL (*{pos_display}* tại giá *{sl_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
+                        results.append(f"   • SL (*{pos_display}* tại giá *{final_sl_price:,.4f}*): 🔴 Thất bại: `{msg_err}`")
             except Exception as e:
                 results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
                 
