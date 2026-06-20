@@ -1158,6 +1158,8 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"🆔 Order ID: `{order_id}`"
                     )
                 
+                tp_sl_msg_parts = []
+
                 # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
                 final_tp_price = None
                 if tp_price_str:
