@@ -527,7 +527,7 @@ async def binance_mark_price_stream(session):
                                                                 f"📈📈 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📈📈\n"
                                                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                                                 f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
-                                                                f"🟢 Vị thế đã tăng *+{pct_change:.1f}%* so với Entry\n"
+                                                                f"🟢 Vị thế đã dương *+{pct_change:.1f}%* so với Entry\n"
                                                                 f"💵 Entry: `{format_price(entry)} USDT`\n"
                                                                 f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
                                                                 f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
@@ -537,7 +537,7 @@ async def binance_mark_price_stream(session):
                                                                 f"📉📉 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📉📉\n"
                                                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                                                                 f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
-                                                                f"🔴 Vị thế đã giảm *{pct_change:.1f}%* so với Entry\n"
+                                                                f"🔴 Vị thế đã âm *{abs(pct_change):.1f}%* so với Entry\n"
                                                                 f"💵 Entry: `{format_price(entry)} USDT`\n"
                                                                 f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
                                                                 f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
@@ -2098,6 +2098,142 @@ async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi hủy lệnh: {e}")
 
 
+async def handle_close_command(session, chat_id, coin_name, side_str=None):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    # 1. Tìm các vị thế đang mở khớp với symbol
+    matched_positions = []
+    for key, pos in positions.items():
+        if pos['symbol'] == symbol:
+            matched_positions.append(pos)
+            
+    if not matched_positions:
+        await send_telegram_message(
+            session,
+            chat_id,
+            f"❌ Không tìm thấy vị thế nào đang mở cho coin *{symbol}*."
+        )
+        return
+        
+    # 2. Lọc vị thế theo side nếu người dùng có nhập thêm side (long/short)
+    target_pos = None
+    if len(matched_positions) > 1:
+        if not side_str:
+            await send_telegram_message(
+                session,
+                chat_id,
+                f"⚠️ Phát hiện cả vị thế LONG và SHORT cho *{symbol}* đang mở.\n"
+                f"Vui lòng ghi rõ chiều muốn đóng.\n"
+                f"Cú pháp: `/close <coin> <long|short>`\n"
+                f"Ví dụ: `/close {coin_name.lower()} long`"
+            )
+            return
+        side_upper = side_str.upper()
+        for pos in matched_positions:
+            pos_side = pos['positionSide']
+            amt = pos['positionAmt']
+            actual_side = "LONG" if (pos_side == 'LONG' or (pos_side == 'BOTH' and amt > 0)) else "SHORT"
+            if actual_side == side_upper:
+                target_pos = pos
+                break
+        if not target_pos:
+            await send_telegram_message(
+                session,
+                chat_id,
+                f"❌ Không tìm thấy vị thế *{side_upper}* nào đang mở cho *{symbol}*."
+            )
+            return
+    else:
+        # Chỉ có 1 vị thế
+        if side_str:
+            side_upper = side_str.upper()
+            pos = matched_positions[0]
+            pos_side = pos['positionSide']
+            amt = pos['positionAmt']
+            actual_side = "LONG" if (pos_side == 'LONG' or (pos_side == 'BOTH' and amt > 0)) else "SHORT"
+            if actual_side != side_upper:
+                await send_telegram_message(
+                    session,
+                    chat_id,
+                    f"❌ Vị thế đang mở của *{symbol}* là *{actual_side}*, không phải *{side_upper}*."
+                )
+                return
+        target_pos = matched_positions[0]
+        
+    # 3. Tiến hành đóng vị thế bằng lệnh MARKET ngược chiều
+    pos_side = target_pos['positionSide']
+    amt = target_pos['positionAmt']
+    abs_amt = abs(amt)
+    
+    if abs_amt <= 0:
+        await send_telegram_message(
+            session,
+            chat_id,
+            f"❌ Kích thước vị thế của *{symbol}* bằng 0 hoặc không hợp lệ."
+        )
+        return
+        
+    is_long = (pos_side == 'LONG' or (pos_side == 'BOTH' and amt > 0))
+    side = 'SELL' if is_long else 'BUY'
+    
+    timestamp = int(time.time() * 1000)
+    params = [
+        f"symbol={symbol}",
+        f"side={side}",
+        "type=MARKET",
+        f"quantity={abs_amt}",
+        f"timestamp={timestamp}"
+    ]
+    
+    if pos_side != 'BOTH':
+        params.append(f"positionSide={pos_side}")
+    else:
+        params.append("reduceOnly=true")
+        
+    query_string = "&".join(params)
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        await send_telegram_message(
+            session,
+            chat_id,
+            f"🔄 Đang gửi lệnh đóng vị thế MARKET cho *{symbol}*..."
+        )
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                avg_price = float(data.get('avgPrice', 0))
+                pnl_emoji = "🟢" if is_long else "🔴"
+                display_side = "LONG" if is_long else "SHORT"
+                await send_telegram_message(
+                    session,
+                    chat_id,
+                    f"✅ *ĐÓNG VỊ THẾ THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"⚡ Đã đóng vị thế: {pnl_emoji} *{display_side} (MARKET)*\n"
+                    f"🔢 Số lượng đã đóng: *{abs_amt}*\n"
+                    f"💵 Giá khớp trung bình: *{format_price(avg_price)} USDT*"
+                )
+            else:
+                msg_err = data.get('msg', 'Lỗi không xác định')
+                code_err = data.get('code', -1)
+                await send_telegram_message(
+                    session,
+                    chat_id,
+                    f"❌ *Đóng vị thế thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})"
+                )
+    except Exception as e:
+        logger.error(f"Lỗi khi gửi lệnh đóng vị thế cho {symbol}: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi đóng vị thế: {e}")
+
+
 # Webhook Handler nhận POST từ Telegram
 async def telegram_webhook_handler(request):
     try:
@@ -2203,6 +2339,19 @@ async def telegram_webhook_handler(request):
             coin_name = parts[1]
             order_id_str = parts[2]
             await handle_cancel_command(request.app['session'], chat_id, coin_name, order_id_str)
+            
+    elif command_base in ('/close', '/c'):
+        parts = text.split()
+        if len(parts) < 2:
+            await send_telegram_message(
+                request.app['session'], 
+                chat_id, 
+                "❌ Sai cú pháp đóng vị thế!\nSử dụng: `/close <coin> [long|short]`\nVí dụ: `/close btc` hoặc `/close btc long`"
+            )
+        else:
+            coin_name = parts[1]
+            side_str = parts[2] if len(parts) > 2 else None
+            await handle_close_command(request.app['session'], chat_id, coin_name, side_str)
         
     elif command_base == '/tp':
         parts = text.split()
