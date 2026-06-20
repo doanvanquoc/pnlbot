@@ -31,6 +31,7 @@ subscribed_symbols = set() # Các symbol (viết thường) đã subscribe Mark 
 mark_price_ws = None    # WS connection cho Mark Price stream
 auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động mỗi 5 phút
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
+has_new_activity = {}   # Đánh dấu có hoạt động mới trong chat (key: chat_id, value: bool)
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
@@ -67,7 +68,9 @@ def get_binance_signature(query_string, secret_key):
     ).hexdigest()
 
 # Gửi tin nhắn Telegram
-async def send_telegram_message(session, chat_id, text):
+async def send_telegram_message(session, chat_id, text, is_auto=False):
+    if not is_auto:
+        has_new_activity[chat_id] = True
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -547,19 +550,32 @@ async def auto_pos_sender_loop(app):
                 # Gửi hoặc sửa tin nhắn cho tất cả các chat_id đã đăng ký
                 for chat_id in list(auto_chats):
                     old_msg_id = last_auto_messages.get(chat_id)
-                    if old_msg_id:
-                        edited_msg_id = await edit_telegram_message(session, chat_id, old_msg_id, message)
-                        if edited_msg_id:
-                            last_auto_messages[chat_id] = edited_msg_id
-                        else:
-                            # Nếu sửa thất bại (ví dụ bị xóa), gửi tin nhắn mới
-                            new_msg_id = await send_telegram_message(session, chat_id, message)
-                            if new_msg_id:
-                                last_auto_messages[chat_id] = new_msg_id
-                    else:
-                        new_msg_id = await send_telegram_message(session, chat_id, message)
+                    
+                    # Nếu có hoạt động mới trong chat, xóa tin nhắn PnL cũ và gửi tin mới xuống dưới cùng
+                    if has_new_activity.get(chat_id, True):
+                        if old_msg_id:
+                            await delete_telegram_message(session, chat_id, old_msg_id)
+                        
+                        new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
                         if new_msg_id:
                             last_auto_messages[chat_id] = new_msg_id
+                            has_new_activity[chat_id] = False
+                    else:
+                        # Nếu không có hoạt động mới, chỉnh sửa trực tiếp tin nhắn cũ
+                        if old_msg_id:
+                            edited_msg_id = await edit_telegram_message(session, chat_id, old_msg_id, message)
+                            if edited_msg_id:
+                                last_auto_messages[chat_id] = edited_msg_id
+                            else:
+                                new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+                                if new_msg_id:
+                                    last_auto_messages[chat_id] = new_msg_id
+                                    has_new_activity[chat_id] = False
+                        else:
+                            new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+                            if new_msg_id:
+                                last_auto_messages[chat_id] = new_msg_id
+                                has_new_activity[chat_id] = False
     except asyncio.CancelledError:
         logger.info("Task tự động gửi vị thế đã bị hủy.")
     except Exception as e:
@@ -605,9 +621,10 @@ async def handle_auto_command(session, chat_id):
             
             message = "\n\n".join(text_lines)
             
-            new_msg_id = await send_telegram_message(session, chat_id, message)
+            new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
             if new_msg_id:
                 last_auto_messages[chat_id] = new_msg_id
+                has_new_activity[chat_id] = False
         else:
             await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
 
@@ -2044,6 +2061,7 @@ async def telegram_webhook_handler(request):
         return web.Response(status=200)
         
     chat_id = chat.get('id')
+    has_new_activity[chat_id] = True
     if chat_id not in active_chats:
         active_chats.add(chat_id)
         save_active_chats()
