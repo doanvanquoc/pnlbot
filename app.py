@@ -764,6 +764,57 @@ async def get_single_price(session, symbol):
     return 0.0
 
 
+async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_side=None, cancel_tp=True, cancel_sl=True):
+    """
+    Tìm và hủy các lệnh TP/SL đang mở để tránh lỗi trùng lặp/GTE của Binance.
+    """
+    timestamp = int(time.time() * 1000)
+    params = [
+        f"symbol={symbol}",
+        "algoType=CONDITIONAL",
+        f"timestamp={timestamp}"
+    ]
+    query_string = "&".join(params)
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/openAlgoOrders?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                orders = await resp.json()
+                if isinstance(orders, list):
+                    for order in orders:
+                        order_type = order.get('type')
+                        order_pos_side = order.get('positionSide', 'BOTH')
+                        
+                        if position_side and order_pos_side != position_side:
+                            continue
+                            
+                        is_tp = order_type == 'TAKE_PROFIT_MARKET'
+                        is_sl = order_type == 'STOP_MARKET'
+                        
+                        if (is_tp and cancel_tp) or (is_sl and cancel_sl):
+                            algo_id = order.get('algoId')
+                            if algo_id:
+                                del_timestamp = int(time.time() * 1000)
+                                del_query = f"symbol={symbol}&algoId={algo_id}&timestamp={del_timestamp}"
+                                del_sig = get_binance_signature(del_query, api_secret)
+                                del_url = f"https://fapi.binance.com/fapi/v1/algoOrder?{del_query}&signature={del_sig}"
+                                
+                                async with session.delete(del_url, headers=headers) as del_resp:
+                                    del_data = await del_resp.json()
+                                    if del_resp.status == 200:
+                                        logger.info(f"Đã tự động hủy lệnh TP/SL cũ: algoId={algo_id} của {symbol}")
+                                    else:
+                                        logger.warning(f"Không thể hủy lệnh TP/SL cũ: {del_data.get('msg')}")
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy openAlgoOrders: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi trong cancel_existing_tpsl: {e}")
+
+
 async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None, tp_price_str=None, sl_price_str=None):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
@@ -916,6 +967,18 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"🆔 Order ID: `{order_id}`"
                     )
                 
+                # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
+                if tp_price is not None or sl_price is not None:
+                    await cancel_existing_tpsl(
+                        session, 
+                        api_key, 
+                        api_secret, 
+                        symbol, 
+                        position_side=pos_side, 
+                        cancel_tp=(tp_price is not None), 
+                        cancel_sl=(sl_price is not None)
+                    )
+
                 tpsl_side = 'SELL' if side_type == 'LONG' else 'BUY'
                 tp_sl_msg_parts = []
                 
@@ -1177,6 +1240,18 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         order_side = 'SELL' if is_long else 'BUY'
         pos_display = 'LONG' if is_long else 'SHORT'
         
+        # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
+        if tp_price is not None or sl_price is not None:
+            await cancel_existing_tpsl(
+                session, 
+                api_key, 
+                api_secret, 
+                symbol, 
+                position_side=side, 
+                cancel_tp=(tp_price is not None), 
+                cancel_sl=(sl_price is not None)
+            )
+            
         if tp_price is not None:
             timestamp = int(time.time() * 1000)
             params = [
