@@ -32,6 +32,8 @@ mark_price_ws = None    # WS connection cho Mark Price stream
 auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động mỗi 5 phút
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
 has_new_activity = {}   # Đánh dấu có hoạt động mới trong chat (key: chat_id, value: bool)
+notified_thresholds = {} # Các ngưỡng % đã thông báo cho từng vị thế (key: pos_key, value: set)
+PRICE_ALERT_THRESHOLDS = [10, 20, 30] # Ngưỡng % biến động giá cần cảnh báo
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
@@ -180,6 +182,7 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
         # Vị thế bị đóng hoàn toàn
         if key in positions:
             del positions[key]
+            notified_thresholds.pop(key, None)
             logger.info(f"Đã đóng vị thế: {key}")
         
         # Kiểm tra xem symbol này còn vị thế nào khác đang mở hay không
@@ -500,6 +503,50 @@ async def binance_mark_price_stream(session):
                                     
                                     side_sign = -1 if (side == 'SHORT' or amt < 0) else 1
                                     pos['unrealizedPnL'] = (mark_price - entry) * abs(amt) * side_sign
+                                    
+                                    # Kiểm tra ngưỡng biến động giá % so với entry
+                                    if entry > 0:
+                                        pct_change = ((mark_price - entry) / entry) * 100 * side_sign
+                                        if key not in notified_thresholds:
+                                            notified_thresholds[key] = set()
+                                        
+                                        for threshold in PRICE_ALERT_THRESHOLDS:
+                                            # Kiểm tra cả chiều lời (+) và lỗ (-)
+                                            for direction in [threshold, -threshold]:
+                                                if direction not in notified_thresholds[key]:
+                                                    if (direction > 0 and pct_change >= direction) or (direction < 0 and pct_change <= direction):
+                                                        notified_thresholds[key].add(direction)
+                                                        
+                                                        display_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
+                                                        display_side = 'LONG' if side_sign > 0 else 'SHORT'
+                                                        
+                                                        if direction > 0:
+                                                            alert_msg = (
+                                                                f"📈📈 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📈📈\n"
+                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                                f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
+                                                                f"🟢 Giá đã tăng *+{pct_change:.1f}%* so với Entry\n"
+                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
+                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
+                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
+                                                            )
+                                                        else:
+                                                            alert_msg = (
+                                                                f"📉📉 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📉📉\n"
+                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                                f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
+                                                                f"🔴 Giá đã giảm *{pct_change:.1f}%* so với Entry\n"
+                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
+                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
+                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
+                                                            )
+                                                        
+                                                        if active_chats:
+                                                            for chat_id in list(active_chats):
+                                                                try:
+                                                                    await send_telegram_message(session, chat_id, alert_msg)
+                                                                except Exception:
+                                                                    pass
                                     
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("Mark Price WS bị đóng hoặc lỗi.")
