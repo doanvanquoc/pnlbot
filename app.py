@@ -6,6 +6,7 @@ import time
 import os
 import random
 import json
+from datetime import datetime, timezone, timedelta
 import logging
 import aiohttp
 from aiohttp import web
@@ -104,6 +105,30 @@ async def delete_telegram_message(session, chat_id, message_id):
     except Exception as e:
         logger.error(f"Lỗi khi xóa tin nhắn Telegram: {e}")
     return False
+
+# Sửa tin nhắn Telegram
+async def edit_telegram_message(session, chat_id, message_id, text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        async with session.post(url, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get('result', {}).get('message_id')
+            else:
+                body = await resp.text()
+                # Không log cảnh báo nếu nội dung không đổi
+                if "message is not modified" not in body:
+                    logger.warning(f"Không thể sửa tin nhắn Telegram {message_id}: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi khi sửa tin nhắn Telegram: {e}")
+    return None
 
 # Subscribe Mark Price của một symbol qua WebSocket
 async def subscribe_mark_price(symbol):
@@ -307,11 +332,14 @@ async def binance_user_data_stream(session, api_key):
                                         
                         elif event_type == 'ORDER_TRADE_UPDATE':
                             order_data = data.get('o', {})
-                            exec_type = order_data.get('x') # Execution Type: 'TRADE' khi khớp
+                            exec_type = order_data.get('x') # Execution Type: 'TRADE', 'CALCULATED', etc.
                             status = order_data.get('X')    # Trạng thái: 'FILLED'
                             client_order_id = order_data.get('c', '')
+                            orig_type = order_data.get('ot', '')
                             
-                            # Chỉ thông báo khi lệnh được khớp hoàn toàn (FILLED) và được đặt qua Bot
+                            message = None
+                            
+                            # 1. Lệnh Limit/DCA Limit đặt qua Bot khớp hoàn toàn
                             if exec_type == 'TRADE' and status == 'FILLED' and client_order_id.startswith('pnlbot_'):
                                 symbol = order_data.get('s')
                                 side = order_data.get('S')        # BUY, SELL
@@ -319,33 +347,95 @@ async def binance_user_data_stream(session, api_key):
                                 price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
                                 qty = float(order_data.get('z', 0))
                                 notional = qty * price
+                                order_id = order_data.get('i')
                                 
-                                # Xác định tên loại lệnh để thông báo cho trực quan
                                 order_type_display = "Limit"
                                 if "dca" in client_order_id:
                                     order_type_display = "DCA Limit"
                                 
-                                # Định dạng Side hiển thị kèm theo chiều vị thế (LONG/SHORT)
                                 side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
                                 
                                 message = (
-                                    f"🔔 *THÔNG BÁO LỆNH KHỚP THÀNH CÔNG*\n"
-                                    f"----------------------------------\n"
-                                    f"🪙 Cặp: *{symbol}*\n"
-                                    f"⚡ Loại lệnh: *{order_type_display} ({side_display})*\n"
-                                    f"📊 Trạng thái: 🟢 *Đã khớp hoàn toàn (FILLED)*\n"
-                                    f"💵 Giá khớp: *{format_price(price)} USDT*\n"
-                                    f"🔢 Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
-                                    f"🆔 Order ID: `{order_data.get('i')}`"
+                                    f"┌──────────────────────────────┐\n"
+                                    f"   🔔 *LỆNH KHỚP THÀNH CÔNG*\n"
+                                    f"└──────────────────────────────┘\n"
+                                    f"🪙 Cặp: `{symbol}`\n"
+                                    f"⚡ Loại: `{order_type_display} ({side_display})`\n"
+                                    f"📊 Trạng thái: 🟢 `FILLED`\n"
+                                    f"💵 Giá khớp: `{format_price(price)} USDT`\n"
+                                    f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                    f"🆔 Order ID: `{order_id}`"
                                 )
                                 
-                                # Gửi thông báo cho tất cả active_chats
-                                if active_chats:
-                                    for chat_id in list(active_chats):
-                                        try:
-                                            await send_telegram_message(session, chat_id, message)
-                                        except Exception as send_err:
-                                            logger.error(f"Không thể gửi thông báo lệnh khớp đến {chat_id}: {send_err}")
+                            # 2. Lệnh TP/SL kích hoạt khớp hoàn toàn
+                            elif exec_type == 'TRADE' and status == 'FILLED' and orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'):
+                                symbol = order_data.get('s')
+                                side = order_data.get('S')        # BUY, SELL
+                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
+                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
+                                qty = float(order_data.get('z', 0))
+                                notional = qty * price
+                                order_id = order_data.get('i')
+                                
+                                is_tp = 'TAKE_PROFIT' in orig_type
+                                pos_display = "SHORT" if side == 'BUY' else "LONG"
+                                if pos_side != 'BOTH':
+                                    pos_display = pos_side
+                                    
+                                if is_tp:
+                                    message = (
+                                        f"🎯🎯 *【CHỐT LỜI - TAKE PROFIT】* 🎯🎯\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🪙 Cặp: `{symbol}`\n"
+                                        f"⚡ Vị thế đóng: `{pos_display}`\n"
+                                        f"📊 Trạng thái: 🟢 `FILLED`\n"
+                                        f"💵 Giá khớp: `{format_price(price)} USDT`\n"
+                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                        f"🆔 Order ID: `{order_id}`"
+                                    )
+                                else:
+                                    message = (
+                                        f"🛡️🛡️ *【CẮT LỖ - STOP LOSS】* 🛡️🛡️\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🪙 Cặp: `{symbol}`\n"
+                                        f"⚡ Vị thế đóng: `{pos_display}`\n"
+                                        f"📊 Trạng thái: 🔴 `FILLED`\n"
+                                        f"💵 Giá khớp: `{format_price(price)} USDT`\n"
+                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                        f"🆔 Order ID: `{order_id}`"
+                                    )
+                                    
+                            # 3. Sự kiện thanh lý vị thế
+                            elif exec_type == 'CALCULATED' and status == 'FILLED':
+                                symbol = order_data.get('s')
+                                side = order_data.get('S')        # BUY, SELL
+                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
+                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
+                                qty = float(order_data.get('z', 0))
+                                notional = qty * price
+                                order_id = order_data.get('i')
+                                
+                                pos_display = "SHORT" if side == 'BUY' else "LONG"
+                                if pos_side != 'BOTH':
+                                    pos_display = pos_side
+                                    
+                                message = (
+                                    f"🚨🚨 *【CẢNH BÁO THANH LÝ】* 🚨🚨\n"
+                                    f"💀💀💀💀💀💀💀💀💀💀💀💀💀💀\n"
+                                    f"🪙 Cặp: `{symbol}`\n"
+                                    f"💥 Vị thế cháy: 🔴 `{pos_display}`\n"
+                                    f"💵 Giá thanh lý: `{format_price(price)} USDT`\n"
+                                    f"🔢 Số lượng thanh lý: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                    f"🆔 Order ID: `{order_id}`"
+                                )
+                                
+                            # Gửi thông báo cho tất cả active_chats
+                            if message and active_chats:
+                                for chat_id in list(active_chats):
+                                    try:
+                                        await send_telegram_message(session, chat_id, message)
+                                    except Exception as send_err:
+                                        logger.error(f"Không thể gửi thông báo sự kiện đến {chat_id}: {send_err}")
                                         
                         elif event_type == 'listenKeyExpired':
                             logger.warning("listenKey đã bị hết hạn trên Binance Server.")
@@ -428,7 +518,10 @@ async def auto_pos_sender_loop(app):
             if auto_chats and positions:
                 session = app['session']
                 
-                text_lines = []
+                tz_vn = timezone(timedelta(hours=7))
+                now_str = datetime.now(tz_vn).strftime("%d/%m/%Y %H:%M:%S")
+                
+                text_lines = [f"🕒 *Cập nhật lúc:* `{now_str}`\n"]
                 for key, pos in positions.items():
                     symbol = pos['symbol']
                     side = pos['positionSide']
@@ -451,16 +544,22 @@ async def auto_pos_sender_loop(app):
                 
                 message = "\n\n".join(text_lines)
                 
-                # Gửi cho tất cả các chat_id đã đăng ký
+                # Gửi hoặc sửa tin nhắn cho tất cả các chat_id đã đăng ký
                 for chat_id in list(auto_chats):
-                    # Xóa tin nhắn auto cũ trước đó nếu có
                     old_msg_id = last_auto_messages.get(chat_id)
                     if old_msg_id:
-                        await delete_telegram_message(session, chat_id, old_msg_id)
-                        
-                    new_msg_id = await send_telegram_message(session, chat_id, message)
-                    if new_msg_id:
-                        last_auto_messages[chat_id] = new_msg_id
+                        edited_msg_id = await edit_telegram_message(session, chat_id, old_msg_id, message)
+                        if edited_msg_id:
+                            last_auto_messages[chat_id] = edited_msg_id
+                        else:
+                            # Nếu sửa thất bại (ví dụ bị xóa), gửi tin nhắn mới
+                            new_msg_id = await send_telegram_message(session, chat_id, message)
+                            if new_msg_id:
+                                last_auto_messages[chat_id] = new_msg_id
+                    else:
+                        new_msg_id = await send_telegram_message(session, chat_id, message)
+                        if new_msg_id:
+                            last_auto_messages[chat_id] = new_msg_id
     except asyncio.CancelledError:
         logger.info("Task tự động gửi vị thế đã bị hủy.")
     except Exception as e:
