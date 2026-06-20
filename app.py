@@ -990,14 +990,14 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                 orders = await resp.json()
                 if isinstance(orders, list):
                     for order in orders:
-                        order_type = order.get('orderType') or order.get('type')
+                        order_type = (order.get('orderType') or order.get('type') or '').upper()
                         order_pos_side = order.get('positionSide', 'BOTH')
                         
                         if position_side and order_pos_side != position_side:
                             continue
                             
-                        is_tp = order_type == 'TAKE_PROFIT_MARKET'
-                        is_sl = order_type == 'STOP_MARKET'
+                        is_tp = 'TAKE_PROFIT' in order_type
+                        is_sl = 'STOP' in order_type
                         
                         if (is_tp and cancel_tp) or (is_sl and cancel_sl):
                             algo_id = order.get('algoId')
