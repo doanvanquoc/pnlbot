@@ -764,7 +764,7 @@ async def get_single_price(session, symbol):
     return 0.0
 
 
-async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None):
+async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None, tp_price_str=None, sl_price_str=None):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     
@@ -790,6 +790,26 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 raise ValueError()
         except ValueError:
             await send_telegram_message(session, chat_id, "❌ Giá đặt lệnh limit không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+            return
+
+    tp_price = None
+    if tp_price_str:
+        try:
+            tp_price = float(tp_price_str)
+            if tp_price <= 0:
+                raise ValueError()
+        except ValueError:
+            await send_telegram_message(session, chat_id, "❌ Giá chốt lời (TP) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+            return
+
+    sl_price = None
+    if sl_price_str:
+        try:
+            sl_price = float(sl_price_str)
+            if sl_price <= 0:
+                raise ValueError()
+        except ValueError:
+            await send_telegram_message(session, chat_id, "❌ Giá cắt lỗ (SL) không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
             return
 
     # 1. Lấy đòn bẩy tối đa (Max Leverage) và tự động thiết lập cho symbol đó
@@ -895,6 +915,83 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"💵 Giá khớp trung bình: *{avg_price:,.4f} USDT*\n"
                         f"🆔 Order ID: `{order_id}`"
                     )
+                
+                tpsl_side = 'SELL' if side_type == 'LONG' else 'BUY'
+                tp_sl_msg_parts = []
+                
+                # Cài đặt TP nếu có
+                if tp_price is not None:
+                    timestamp_tp = int(time.time() * 1000)
+                    tp_params = [
+                        f"symbol={symbol}",
+                        f"side={tpsl_side}",
+                        "type=TAKE_PROFIT_MARKET",
+                        f"stopPrice={tp_price}",
+                        f"timestamp={timestamp_tp}"
+                    ]
+                    if is_limit:
+                        tp_params.append(f"quantity={quantity}")
+                        tp_params.append("reduceOnly=true")
+                    else:
+                        tp_params.append("closePosition=true")
+                        
+                    if hedge_mode:
+                        tp_params.append(f"positionSide={pos_side}")
+                        
+                    tp_query = "&".join(tp_params)
+                    tp_sig = get_binance_signature(tp_query, api_secret)
+                    tp_url = f"https://fapi.binance.com/fapi/v1/order?{tp_query}&signature={tp_sig}"
+                    
+                    try:
+                        async with session.post(tp_url, headers=headers) as tp_resp:
+                            tp_data = await tp_resp.json()
+                            if tp_resp.status == 200:
+                                tp_id = tp_data.get('orderId')
+                                tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời ở giá *{tp_price:,.4f}* (Thành công, ID: `{tp_id}`)")
+                            else:
+                                tp_err = tp_data.get('msg', 'Lỗi không xác định')
+                                tp_sl_msg_parts.append(f"❌ *Lỗi đặt TP:* `{tp_err}`")
+                    except Exception as e:
+                        tp_sl_msg_parts.append(f"❌ *Lỗi đặt TP:* `{e}`")
+
+                # Cài đặt SL nếu có
+                if sl_price is not None:
+                    timestamp_sl = int(time.time() * 1000)
+                    sl_params = [
+                        f"symbol={symbol}",
+                        f"side={tpsl_side}",
+                        "type=STOP_MARKET",
+                        f"stopPrice={sl_price}",
+                        f"timestamp={timestamp_sl}"
+                    ]
+                    if is_limit:
+                        sl_params.append(f"quantity={quantity}")
+                        sl_params.append("reduceOnly=true")
+                    else:
+                        sl_params.append("closePosition=true")
+                        
+                    if hedge_mode:
+                        sl_params.append(f"positionSide={pos_side}")
+                        
+                    sl_query = "&".join(sl_params)
+                    sl_sig = get_binance_signature(sl_query, api_secret)
+                    sl_url = f"https://fapi.binance.com/fapi/v1/order?{sl_query}&signature={sl_sig}"
+                    
+                    try:
+                        async with session.post(sl_url, headers=headers) as sl_resp:
+                            sl_data = await sl_resp.json()
+                            if sl_resp.status == 200:
+                                sl_id = sl_data.get('orderId')
+                                tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ ở giá *{sl_price:,.4f}* (Thành công, ID: `{sl_id}`)")
+                            else:
+                                sl_err = sl_data.get('msg', 'Lỗi không xác định')
+                                tp_sl_msg_parts.append(f"❌ *Lỗi đặt SL:* `{sl_err}`")
+                    except Exception as e:
+                        tp_sl_msg_parts.append(f"❌ *Lỗi đặt SL:* `{e}`")
+
+                if tp_sl_msg_parts:
+                    msg += "\n\n" + "\n".join(tp_sl_msg_parts)
+
                 await send_telegram_message(session, chat_id, msg)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
@@ -1337,7 +1434,9 @@ async def telegram_webhook_handler(request):
             await handle_leverage_command(request.app['session'], chat_id, coin_name, leverage_str)
         
     elif command_base in ('/long', '/l', '/short', '/s'):
-        parts = text.split()
+        import re
+        text_clean = re.sub(r'\b(tp|sl)\s*=\s*([0-9.]+)', r'\1=\2', text, flags=re.IGNORECASE)
+        parts = text_clean.split()
         if len(parts) < 3:
             await send_telegram_message(
                 request.app['session'], 
@@ -1345,14 +1444,37 @@ async def telegram_webhook_handler(request):
                 "❌ Sai cú pháp đặt lệnh!\n"
                 "• Lệnh Market: `/long <coin> <volume>`\n"
                 "• Lệnh Limit: `/long <coin> <volume> <giá>`\n"
+                "• Đi kèm TP/SL: `/long btc 400 60000 tp=65000 sl=58000` (hoặc `/long btc 400 tp=65000 sl=58000`)\n"
                 "Ví dụ: `/long btc 1000` hoặc `/long btc 1000 98000`"
             )
         else:
             side_type = 'LONG' if command_base in ('/long', '/l') else 'SHORT'
             coin_name = parts[1]
             volume_str = parts[2]
-            price_str = parts[3] if len(parts) >= 4 else None
-            await handle_order_command(request.app['session'], chat_id, side_type, coin_name, volume_str, price_str)
+            
+            price_str = None
+            tp_price_str = None
+            sl_price_str = None
+            
+            for part in parts[3:]:
+                part_lower = part.lower()
+                if part_lower.startswith('tp='):
+                    tp_price_str = part.split('=', 1)[1]
+                elif part_lower.startswith('sl='):
+                    sl_price_str = part.split('=', 1)[1]
+                else:
+                    price_str = part
+                    
+            await handle_order_command(
+                request.app['session'], 
+                chat_id, 
+                side_type, 
+                coin_name, 
+                volume_str, 
+                price_str, 
+                tp_price_str, 
+                sl_price_str
+            )
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
