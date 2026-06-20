@@ -1354,7 +1354,10 @@ async def handle_orders_command(session, chat_id):
         prices_map = {}
         try:
             url_price = "https://fapi.binance.com/fapi/v1/ticker/price"
-            async with session.get(url_price) as resp_price:
+            headers_public = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            async with session.get(url_price, headers=headers_public) as resp_price:
                 if resp_price.status == 200:
                     price_data = await resp_price.json()
                     prices_map = {item['symbol']: float(item['price']) for item in price_data}
@@ -1391,6 +1394,12 @@ async def handle_orders_command(session, chat_id):
                     emoji = "🟢" if display_side == 'LONG' else "🔴"
                     notional = qty * price
                     current_price = prices_map.get(symbol)
+                    if current_price is None or current_price == 0:
+                        current_price = await get_single_price(session, symbol)
+                        if current_price > 0:
+                            prices_map[symbol] = current_price
+                        else:
+                            current_price = None
                     
                     price_line = f"   • Giá đặt: *{price:,.4f} USDT*\n"
                     if current_price is not None:
