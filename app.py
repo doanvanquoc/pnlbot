@@ -8,6 +8,12 @@ import logging
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
+import io
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # Setup logging
 logging.basicConfig(
@@ -829,6 +835,140 @@ def calculate_tpsl_price(input_str, entry_price, quantity, leverage, is_long, is
         return float(input_str)
 
 
+async def draw_candlestick_chart(session, symbol, interval):
+    """
+    Lấy dữ liệu nến từ Binance Futures và vẽ biểu đồ candlestick lưu vào BytesIO.
+    """
+    # 1. Gọi API lấy dữ liệu klines (mặc định lấy 80 nến để hiển thị đẹp nhất)
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=80"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise Exception(f"Binance API trả về lỗi HTTP {resp.status}: {body}")
+            
+            klines_data = await resp.json()
+            if not isinstance(klines_data, list) or len(klines_data) == 0:
+                raise Exception("Dữ liệu nến trống hoặc không hợp lệ từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi lấy klines cho {symbol}: {e}")
+        raise e
+
+    # 2. Xử lý dữ liệu nến bằng pandas
+    df = pd.DataFrame(klines_data, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
+    ])
+    
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    
+    up_color = '#0ecb81'   # Binance Green
+    down_color = '#f6465d' # Binance Red
+    df['color'] = df.apply(lambda row: up_color if row['close'] >= row['open'] else down_color, axis=1)
+
+    # Tính độ rộng của cột (width) dựa trên khoảng cách giữa các nến (đơn vị ngày trong matplotlib)
+    if len(df) > 1:
+        diff_sec = (df['open_time'].iloc[1] - df['open_time'].iloc[0]).total_seconds()
+        width = (diff_sec / 86400.0) * 0.7
+    else:
+        width = 0.0005
+
+    # 3. Vẽ biểu đồ bằng matplotlib
+    plt.style.use('dark_background')
+    fig, (ax, ax_vol) = plt.subplots(
+        2, 1, figsize=(10, 6), sharex=True,
+        gridspec_kw={'height_ratios': [3, 1]}
+    )
+    fig.subplots_adjust(hspace=0.05)
+
+    # Vẽ râu nến (shadows)
+    ax.vlines(df['open_time'], df['low'], df['high'], color=df['color'], linewidth=1)
+    
+    # Vẽ thân nến (bodies)
+    bottoms = df[['open', 'close']].min(axis=1)
+    heights = (df['close'] - df['open']).abs()
+    
+    # Xử lý nến doji hoặc nến có open == close
+    zero_height_mask = heights == 0
+    if zero_height_mask.any():
+        mini_height = (df['high'] - df['low']) * 0.03
+        mini_height = mini_height.where(mini_height > 0, 0.0001)
+        heights = heights.where(~zero_height_mask, mini_height)
+        
+    ax.bar(df['open_time'], heights, bottom=bottoms, width=width, color=df['color'], edgecolor=df['color'], linewidth=0.5)
+    
+    # Vẽ volume
+    ax_vol.bar(df['open_time'], df['volume'], width=width, color=df['color'])
+
+    # 4. Định dạng biểu đồ
+    ax.set_title(f"📊 {symbol} ({interval.upper()}) - Binance Futures", fontsize=14, color='white', fontweight='bold', pad=15)
+    ax.grid(True, color='#2F3336', linestyle='--', linewidth=0.5)
+    ax_vol.grid(True, color='#2F3336', linestyle='--', linewidth=0.5)
+    
+    for s in ['top', 'right', 'left', 'bottom']:
+        ax.spines[s].set_color('#2f3336')
+        ax_vol.spines[s].set_color('#2f3336')
+        
+    ax.tick_params(colors='white', labelsize=10)
+    ax_vol.tick_params(colors='white', labelsize=10)
+    
+    # Đưa nhãn trục Y của giá sang bên phải
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax_vol.yaxis.tick_right()
+    
+    # Tự động định dạng thời gian trên trục X
+    if 'm' in interval.lower() or 'h' in interval.lower():
+        date_format = mdates.DateFormatter('%m-%d %H:%M')
+    else:
+        date_format = mdates.DateFormatter('%Y-%m-%d')
+    ax_vol.xaxis.set_major_formatter(date_format)
+    fig.autofmt_xdate()
+
+    # 5. Xuất hình ảnh ra BytesIO
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=120)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+async def send_telegram_photo(session, chat_id, photo_bytes, caption=None):
+    """
+    Gửi ảnh đến Telegram chat bằng API sendPhoto.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    
+    data = aiohttp.FormData()
+    data.add_field('chat_id', str(chat_id))
+    data.add_field('photo', photo_bytes, filename='chart.png', content_type='image/png')
+    if caption:
+        data.add_field('caption', caption)
+        data.add_field('parse_mode', 'Markdown')
+        
+    try:
+        async with session.post(url, data=data) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error(f"Lỗi gửi ảnh Telegram: HTTP {resp.status} - {body}")
+                return False
+            return True
+    except Exception as e:
+        logger.error(f"Lỗi kết nối khi gửi ảnh: {e}")
+        return False
+
+
 async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_side=None, cancel_tp=True, cancel_sl=True):
     """
     Tìm và hủy các lệnh TP/SL đang mở để tránh lỗi trùng lặp/GTE của Binance.
@@ -1528,6 +1668,7 @@ async def telegram_webhook_handler(request):
             "🔮 `/tpsl <coin> <giá_tp> <giá_sl>` - Cài đặt đồng thời cả TP và SL.\n"
             "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
+            "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
@@ -1659,6 +1800,66 @@ async def telegram_webhook_handler(request):
                 tp_price_str, 
                 sl_price_str
             )
+        
+    elif command_base == '/chart':
+        parts = text.split()
+        if len(parts) < 2:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp!\nSử dụng: `/chart [khung_thời_gian] <coin>` hoặc `/chart <coin> [khung_thời_gian]`\n"
+                "Khung thời gian hỗ trợ: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`\n"
+                "Ví dụ: `/chart btc` hoặc `/chart 1d btc` hoặc `/chart sol 15m`"
+            )
+        else:
+            import re
+            timeframe_pattern = r'^(1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d|3d|1w|1M)$'
+            
+            interval = '1h'
+            coin_name = None
+            
+            for part in parts[1:]:
+                part_clean = part.strip()
+                if re.match(timeframe_pattern, part_clean, re.IGNORECASE):
+                    if part_clean.lower() == '1m':
+                        interval = '1M' if part_clean == '1M' else '1m'
+                    else:
+                        interval = part_clean.lower() if part_clean != '1M' else '1M'
+                else:
+                    coin_name = part_clean.upper()
+            
+            if not coin_name:
+                await send_telegram_message(
+                    request.app['session'],
+                    chat_id,
+                    "❌ Vui lòng nhập tên coin (ví dụ: btc, eth, sol)."
+                )
+            else:
+                symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+                
+                loading_msg_id = await send_telegram_message(
+                    request.app['session'],
+                    chat_id,
+                    f"⏳ Đang tải và vẽ biểu đồ *{symbol}* ({interval.upper()})..."
+                )
+                
+                try:
+                    photo_buf = await draw_candlestick_chart(request.app['session'], symbol, interval)
+                    
+                    caption = f"📊 Biểu đồ nến *{symbol}* ({interval.upper()})\n⚡ Sàn: Binance Futures"
+                    success = await send_telegram_photo(request.app['session'], chat_id, photo_buf, caption=caption)
+                    
+                    if loading_msg_id:
+                        await delete_telegram_message(request.app['session'], chat_id, loading_msg_id)
+                except Exception as e:
+                    logger.error(f"Lỗi vẽ hoặc gửi biểu đồ cho {symbol}: {e}")
+                    if loading_msg_id:
+                        await delete_telegram_message(request.app['session'], chat_id, loading_msg_id)
+                    await send_telegram_message(
+                        request.app['session'],
+                        chat_id,
+                        f"❌ Không thể vẽ biểu đồ cho *{symbol}*.\nLý do: `{e}`"
+                    )
         
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
