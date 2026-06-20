@@ -783,7 +783,7 @@ def calculate_tpsl_price(input_str, entry_price, quantity, leverage, is_long, is
     # 1. ROE %: vd "100r", "50roe"
     if input_str.endswith('roe') or input_str.endswith('r'):
         clean_str = input_str.replace('roe', '').replace('r', '').replace('%', '').strip()
-        roe_val = float(clean_str)
+        roe_val = abs(float(clean_str))
         # Price Change % = ROE / Leverage
         price_change_pct = (roe_val / leverage) / 100.0
         if is_tp:
@@ -800,7 +800,7 @@ def calculate_tpsl_price(input_str, entry_price, quantity, leverage, is_long, is
     # 2. % Biến động giá: vd "5%"
     elif input_str.endswith('%') or input_str.endswith('pct'):
         clean_str = input_str.replace('%', '').replace('pct', '').strip()
-        pct_val = float(clean_str) / 100.0
+        pct_val = abs(float(clean_str)) / 100.0
         if is_tp:
             if is_long:
                 return entry_price * (1 + pct_val)
@@ -815,7 +815,7 @@ def calculate_tpsl_price(input_str, entry_price, quantity, leverage, is_long, is
     # 3. USDT PnL: vd "50u", "10u"
     elif input_str.endswith('u') or input_str.endswith('usdt'):
         clean_str = input_str.replace('usdt', '').replace('u', '').strip()
-        pnl_val = float(clean_str)
+        pnl_val = abs(float(clean_str))
         if quantity <= 0:
             raise ValueError("Số lượng phải lớn hơn 0 để tính theo USDT PnL.")
         price_diff = pnl_val / quantity
@@ -1567,6 +1567,143 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
     await send_telegram_message(session, chat_id, msg)
 
 
+async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    try:
+        volume = float(volume_str)
+        if volume <= 0:
+            raise ValueError()
+    except ValueError:
+        await send_telegram_message(session, chat_id, "❌ Số tiền volume không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
+        return
+
+    # Lọc các vị thế đang mở (Amt khác 0)
+    target_positions = [pos for pos in positions.values() if pos['symbol'] == symbol and float(pos.get('positionAmt', 0)) != 0]
+    
+    if not target_positions:
+        await send_telegram_message(
+            session, 
+            chat_id, 
+            f"❌ Không tìm thấy vị thế *{symbol}* nào đang mở để thực hiện DCA."
+        )
+        return
+
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    for pos in target_positions:
+        side = pos['positionSide']
+        amt = float(pos['positionAmt'])
+        entry_price = float(pos['entryPrice'])
+        leverage = int(pos.get('leverage', 1))
+        quantity_current = abs(amt)
+        
+        is_long = amt > 0
+        if side == 'LONG':
+            is_long = True
+        elif side == 'SHORT':
+            is_long = False
+            
+        pos_display = 'LONG' if is_long else 'SHORT'
+        
+        # 1. Tính toán giá Limit DCA tương ứng với khoảng cách (loss)
+        try:
+            dca_price = calculate_tpsl_price(
+                diff_str,
+                entry_price=entry_price,
+                quantity=quantity_current,
+                leverage=leverage,
+                is_long=is_long,
+                is_tp=False # DCA đặt ở vùng lỗ
+            )
+            
+            # Tự động lấy độ chính xác của giá dựa trên giá Entry
+            entry_price_str = f"{entry_price:.8f}".rstrip('0').rstrip('.')
+            if '.' in entry_price_str:
+                price_decimals = len(entry_price_str.split('.')[1])
+            else:
+                price_decimals = 4
+            dca_price = round(dca_price, min(max(price_decimals, 2), 6))
+            
+        except Exception as e:
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                f"❌ *Lỗi tính toán giá DCA '{diff_str}':* `{e}`"
+            )
+            continue
+            
+        # 2. Quy đổi volume ra quantity của lệnh DCA mới
+        raw_qty = volume / dca_price
+        precision = symbol_precisions.get(symbol, 3)
+        quantity_dca = round_down(raw_qty, precision)
+        
+        if quantity_dca <= 0:
+            await send_telegram_message(
+                session, 
+                chat_id, 
+                f"❌ Số lượng coin tính toán cho lệnh DCA quá nhỏ ({raw_qty:.8f} {coin_name}).\n"
+                f"Vui lòng tăng Volume đặt DCA hoặc chọn coin có giá thấp hơn."
+            )
+            continue
+            
+        # 3. Đặt lệnh LIMIT cùng chiều với vị thế hiện tại để DCA tăng vị thế
+        order_side = 'BUY' if is_long else 'SELL'
+        pos_side = side # LONG, SHORT, BOTH
+        
+        timestamp = int(time.time() * 1000)
+        params = [
+            f"symbol={symbol}",
+            f"side={order_side}",
+            "type=LIMIT",
+            f"quantity={quantity_dca}",
+            f"price={dca_price}",
+            "timeInForce=GTC",
+            f"timestamp={timestamp}"
+        ]
+        
+        if hedge_mode:
+            params.append(f"positionSide={pos_side}")
+            
+        query_string = "&".join(params)
+        signature = get_binance_signature(query_string, api_secret)
+        url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+        
+        try:
+            async with session.post(url, headers=headers) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    order_id = data.get('orderId')
+                    pnl_emoji = "🟢" if is_long else "🔴"
+                    await send_telegram_message(
+                        session, 
+                        chat_id, 
+                        f"✅ *ĐẶT LỆNH LIMIT DCA THÀNH CÔNG!*\n"
+                        f"----------------------------------\n"
+                        f"🪙 Cặp: *{symbol}*\n"
+                        f"⚡ DCA vị thế: {pnl_emoji} *{pos_display}*\n"
+                        f"💵 Giá đặt DCA Limit: *{dca_price:,.4f} USDT*\n"
+                        f"📊 Volume DCA: *{volume:,.2f} USDT*\n"
+                        f"🔢 Số lượng DCA thêm: *{quantity_dca} {coin_name}*\n"
+                        f"🆔 Order ID: `{order_id}`"
+                    )
+                else:
+                    msg_err = data.get('msg', 'Lỗi không xác định')
+                    code_err = data.get('code', -1)
+                    await send_telegram_message(
+                        session, 
+                        chat_id, 
+                        f"❌ *Đặt lệnh DCA Limit thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})"
+                    )
+        except Exception as e:
+            logger.error(f"Lỗi khi gửi lệnh DCA cho {symbol}: {e}")
+            await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi đặt lệnh DCA: {e}")
+
+
 async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
@@ -1671,6 +1808,7 @@ async def telegram_webhook_handler(request):
             "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
+            "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
@@ -1862,7 +2000,20 @@ async def telegram_webhook_handler(request):
                         chat_id,
                         f"❌ Không thể vẽ biểu đồ cho *{symbol}*.\nLý do: `{e}`"
                     )
-        
+    elif command_base == '/dca':
+        parts = text.split()
+        if len(parts) < 4:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp đặt DCA!\nSử dụng: `/dca <coin> <volume> <khoảng_cách>`\nVí dụ: `/dca btc 200 40u` hoặc `/dca eth 100 2%`"
+            )
+        else:
+            coin_name = parts[1]
+            volume_str = parts[2]
+            diff_str = parts[3]
+            await handle_dca_command(request.app['session'], chat_id, coin_name, volume_str, diff_str)
+            
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
         
