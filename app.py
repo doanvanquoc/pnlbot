@@ -515,7 +515,9 @@ async def binance_mark_price_stream(session):
                                             for direction in [threshold, -threshold]:
                                                 if direction not in notified_thresholds[key]:
                                                     if (direction > 0 and pct_change >= direction) or (direction < 0 and pct_change <= direction):
-                                                        notified_thresholds[key].add(direction)
+                                                        # Chỉ đánh dấu đã thông báo khi có active_chats để gửi
+                                                        if not active_chats:
+                                                            continue
                                                         
                                                         display_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
                                                         display_side = 'LONG' if side_sign > 0 else 'SHORT'
@@ -541,12 +543,17 @@ async def binance_mark_price_stream(session):
                                                                 f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
                                                             )
                                                         
-                                                        if active_chats:
-                                                            for chat_id in list(active_chats):
-                                                                try:
-                                                                    await send_telegram_message(session, chat_id, alert_msg)
-                                                                except Exception:
-                                                                    pass
+                                                        sent_ok = False
+                                                        for chat_id in list(active_chats):
+                                                            try:
+                                                                await send_telegram_message(session, chat_id, alert_msg)
+                                                                sent_ok = True
+                                                            except Exception:
+                                                                pass
+                                                        
+                                                        # Chỉ đánh dấu đã thông báo nếu gửi thành công ít nhất 1 chat
+                                                        if sent_ok:
+                                                            notified_thresholds[key].add(direction)
                                     
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("Mark Price WS bị đóng hoặc lỗi.")
