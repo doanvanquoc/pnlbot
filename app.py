@@ -342,81 +342,16 @@ async def binance_user_data_stream(session, api_key):
                             status = order_data.get('X')    # Trạng thái: 'FILLED'
                             client_order_id = order_data.get('c', '')
                             orig_type = order_data.get('ot', '')
+                            order_type = order_data.get('o', '') # LIMIT, MARKET, etc.
                             
                             message = None
                             
-                            # 1. Lệnh Limit/DCA Limit đặt qua Bot khớp hoàn toàn
-                            if exec_type == 'TRADE' and status == 'FILLED' and client_order_id.startswith('pnlbot_'):
+                            # 1. Sự kiện thanh lý vị thế
+                            if exec_type == 'CALCULATED' and status == 'FILLED':
                                 symbol = order_data.get('s')
                                 side = order_data.get('S')        # BUY, SELL
                                 pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
-                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
-                                qty = float(order_data.get('z', 0))
-                                notional = qty * price
-                                order_id = order_data.get('i')
-                                
-                                order_type_display = "Limit"
-                                if "dca" in client_order_id:
-                                    order_type_display = "DCA Limit"
-                                
-                                side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
-                                
-                                message = (
-                                    f"┌──────────────────────────────┐\n"
-                                    f"   🔔 *LỆNH KHỚP THÀNH CÔNG*\n"
-                                    f"└──────────────────────────────┘\n"
-                                    f"🪙 Cặp: `{symbol}`\n"
-                                    f"⚡ Loại: `{order_type_display} ({side_display})`\n"
-                                    f"📊 Trạng thái: 🟢 `FILLED`\n"
-                                    f"💵 Giá khớp: `{format_price(price)} USDT`\n"
-                                    f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
-                                    f"🆔 Order ID: `{order_id}`"
-                                )
-                                
-                            # 2. Lệnh TP/SL kích hoạt khớp hoàn toàn
-                            elif exec_type == 'TRADE' and status == 'FILLED' and orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'):
-                                symbol = order_data.get('s')
-                                side = order_data.get('S')        # BUY, SELL
-                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
-                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
-                                qty = float(order_data.get('z', 0))
-                                notional = qty * price
-                                order_id = order_data.get('i')
-                                
-                                is_tp = 'TAKE_PROFIT' in orig_type
-                                pos_display = "SHORT" if side == 'BUY' else "LONG"
-                                if pos_side != 'BOTH':
-                                    pos_display = pos_side
-                                    
-                                if is_tp:
-                                    message = (
-                                        f"🎯🎯 *【CHỐT LỜI - TAKE PROFIT】* 🎯🎯\n"
-                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"🪙 Cặp: `{symbol}`\n"
-                                        f"⚡ Vị thế đóng: `{pos_display}`\n"
-                                        f"📊 Trạng thái: 🟢 `FILLED`\n"
-                                        f"💵 Giá khớp: `{format_price(price)} USDT`\n"
-                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
-                                        f"🆔 Order ID: `{order_id}`"
-                                    )
-                                else:
-                                    message = (
-                                        f"🛡️🛡️ *【CẮT LỖ - STOP LOSS】* 🛡️🛡️\n"
-                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"🪙 Cặp: `{symbol}`\n"
-                                        f"⚡ Vị thế đóng: `{pos_display}`\n"
-                                        f"📊 Trạng thái: 🔴 `FILLED`\n"
-                                        f"💵 Giá khớp: `{format_price(price)} USDT`\n"
-                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)\n"
-                                        f"🆔 Order ID: `{order_id}`"
-                                    )
-                                    
-                            # 3. Sự kiện thanh lý vị thế
-                            elif exec_type == 'CALCULATED' and status == 'FILLED':
-                                symbol = order_data.get('s')
-                                side = order_data.get('S')        # BUY, SELL
-                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
-                                price = float(order_data.get('ap', 0)) or float(order_data.get('p', 0))
+                                price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
                                 qty = float(order_data.get('z', 0))
                                 notional = qty * price
                                 order_id = order_data.get('i')
@@ -434,6 +369,52 @@ async def binance_user_data_stream(session, api_key):
                                     f"🔢 Số lượng thanh lý: `{qty}` (~`{notional:,.2f} USDT`)\n"
                                     f"🆔 Order ID: `{order_id}`"
                                 )
+                                
+                            # 2. Tất cả các lệnh giao dịch khớp hoàn toàn (TRADE FILLED)
+                            elif exec_type == 'TRADE' and status == 'FILLED':
+                                symbol = order_data.get('s')
+                                side = order_data.get('S')        # BUY, SELL
+                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
+                                price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
+                                qty = float(order_data.get('z', 0))
+                                notional = qty * price
+                                order_id = order_data.get('i')
+                                realized_pnl = float(order_data.get('rp', 0))
+                                
+                                # Xác định loại lệnh hiển thị
+                                if orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
+                                    order_type_display = "🎯 CHỐT LỜI (Take Profit)"
+                                elif orig_type in ('STOP', 'STOP_MARKET'):
+                                    order_type_display = "🛡️ CẮT LỖ (Stop Loss)"
+                                elif "dca" in client_order_id.lower():
+                                    order_type_display = "⚖️ DCA Limit"
+                                elif client_order_id.startswith('pnlbot_limit'):
+                                    order_type_display = "⏳ Limit"
+                                else:
+                                    order_type_display = f"{order_type}"
+                                
+                                side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
+                                
+                                msg_lines = [
+                                    f"┌──────────────────────────────┐",
+                                    f"   🔔 *THÔNG BÁO KHỚP LỆNH*",
+                                    f"└──────────────────────────────┘",
+                                    f"🪙 Cặp: `{symbol}`",
+                                    f"⚡ Loại: `{order_type_display} ({side_display})`",
+                                    f"📊 Trạng thái: 🟢 `FILLED`",
+                                    f"💵 Giá khớp: `{format_price(price)} USDT`",
+                                    f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)"
+                                ]
+                                
+                                # Thêm PNL đóng nếu có realized_pnl hoặc là lệnh TP/SL/đóng
+                                is_close_or_reduce = (realized_pnl != 0.0) or (orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'))
+                                if is_close_or_reduce:
+                                    pnl_emoji = "🟩" if realized_pnl >= 0 else "🟥"
+                                    pnl_sign = "+" if realized_pnl >= 0 else ""
+                                    msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{realized_pnl:,.2f} USDT*`")
+                                    
+                                msg_lines.append(f"🆔 Order ID: `{order_id}`")
+                                message = "\n".join(msg_lines)
                                 
                             # Gửi thông báo cho tất cả active_chats
                             if message and active_chats:
@@ -1472,6 +1453,11 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                     )
                 else:
                     avg_price = float(data.get('avgPrice', 0))
+                    if avg_price == 0:
+                        cum_quote = float(data.get('cumQuote', 0))
+                        executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
+                        if executed_qty > 0:
+                            avg_price = cum_quote / executed_qty
                     execute_qty = float(data.get('executedQty', 0))
                     actual_volume = execute_qty * avg_price
                     actual_margin = actual_volume / max_leverage
@@ -2209,6 +2195,11 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
             data = await resp.json()
             if resp.status == 200:
                 avg_price = float(data.get('avgPrice', 0))
+                if avg_price == 0:
+                    cum_quote = float(data.get('cumQuote', 0))
+                    executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
+                    if executed_qty > 0:
+                        avg_price = cum_quote / executed_qty
                 pnl_emoji = "🟢" if is_long else "🔴"
                 display_side = "LONG" if is_long else "SHORT"
                 await send_telegram_message(
