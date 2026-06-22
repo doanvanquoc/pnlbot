@@ -1,0 +1,31 @@
+name: Deploy Bot to VPS
+
+on:
+  push:
+    branches:
+      - main  # Hoặc master (tùy thuộc vào nhánh chính của bạn)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}         # IP của VPS
+          username: ${{ secrets.VPS_USER }}     # Username VPS (thường là root)
+          # Bạn có thể chọn 1 trong 2 cách xác thực dưới đây:
+          # Cách A: Dùng mật khẩu VPS (Đơn giản nhất)
+          password: ${{ secrets.VPS_PASSWORD }}
+          # Cách B: Dùng SSH Key (Bảo mật hơn, nếu dùng hãy bỏ comment dòng dưới và xóa dòng password đi)
+          # key: ${{ secrets.VPS_SSH_KEY }}
+          port: 8686
+          script: |
+            cd /opt/pnlbot
+            # Kích hoạt môi trường ảo để đảm bảo git và lệnh chạy đúng quyền
+            git pull origin main
+            # Restart lại service của bot
+            sudo systemctl restart pnlbot
+            # Kiểm tra trạng thái sau khi restart
+            sudo systemctl status pnlbot

@@ -2318,16 +2318,16 @@ async def telegram_webhook_handler(request):
     elif command_base == '/pos':
         await handle_pos_command(request.app['session'], chat_id)
         
-    elif command_base in ('/balance', '/wallet'):
+    elif command_base in ('/balance', '/wallet', '/sodu'):
         await handle_balance_command(request.app['session'], chat_id)
         
     elif command_base in ('/top', '/gainers'):
         await handle_top_command(request.app['session'], chat_id)
         
-    elif command_base == '/orders':
+    elif command_base in ('/orders', '/lenh'):
         await handle_orders_command(request.app['session'], chat_id)
         
-    elif command_base == '/cancel':
+    elif command_base in ('/cancel', '/huy'):
         parts = text.split()
         if len(parts) < 3:
             await send_telegram_message(
