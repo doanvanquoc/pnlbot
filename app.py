@@ -2252,6 +2252,27 @@ async def telegram_webhook_handler(request):
     if not text:
         return web.Response(status=200)
         
+    # Xóa tin nhắn của user nếu là command hoặc tin nhắn tra cứu giá coin được hỗ trợ
+    should_delete = False
+    if not text.startswith('/'):
+        should_delete = True
+    else:
+        command = text.split()[0].lower()
+        command_base = command.split('@')[0]
+        supported_commands = {
+            '/start', '/help', '/pnl', '/pos', '/balance', '/wallet', '/sodu',
+            '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
+            '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
+            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto'
+        }
+        if command_base in supported_commands:
+            should_delete = True
+            
+    if should_delete:
+        message_id = message.get('message_id')
+        if message_id:
+            asyncio.create_task(delete_telegram_message(request.app['session'], chat_id, message_id))
+            
     # Nếu tin nhắn không bắt đầu bằng '/', coi đó là danh sách các coin cần lấy giá
     if not text.startswith('/'):
         coins = text.split()
