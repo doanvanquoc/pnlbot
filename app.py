@@ -1058,12 +1058,35 @@ async def analyze_market(session, symbol, interval='1h'):
 
 async def scan_market_signals(session):
     """
-    Quét qua các coin phổ biến để tìm cơ hội giao dịch có tỉ lệ thắng cao.
+    Quét qua top 100 coin theo volume 24h để tìm cơ hội giao dịch có tỉ lệ thắng cao.
     """
-    coins_to_scan = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'LINK', 'NEAR', 'SUI', 'AVAX', 'OP']
+    url_ticker = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    coins_to_scan = []
+    try:
+        async with session.get(url_ticker, headers=headers) as resp:
+            if resp.status == 200:
+                tickers = await resp.json()
+                usdt_tickers = [t for t in tickers if t['symbol'].endswith('USDT')]
+                # Sắp xếp theo quoteVolume 24h giảm dần
+                usdt_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
+                coins_to_scan = [t['symbol'] for t in usdt_tickers[:100]]
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi gọi API ticker 24h: {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy danh sách top 100 volume: {e}")
+        
+    if not coins_to_scan:
+        # Fallback danh sách coin phổ biến
+        fallback_coins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'LINK', 'NEAR', 'SUI', 'AVAX', 'OP']
+        coins_to_scan = [f"{c}USDT" for c in fallback_coins]
+        
     tasks = []
-    for coin in coins_to_scan:
-        symbol = f"{coin}USDT"
+    for symbol in coins_to_scan:
         tasks.append(analyze_market(session, symbol, interval='1h'))
         
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1078,7 +1101,12 @@ async def scan_market_signals(session):
             else:
                 short_signals.append(res)
                 
-    return long_signals, short_signals
+    # Sắp xếp tín hiệu theo điểm số từ cao xuống thấp để chọn cơ hội tốt nhất
+    long_signals.sort(key=lambda x: x['long_score'], reverse=True)
+    short_signals.sort(key=lambda x: x['short_score'], reverse=True)
+    
+    # Giới hạn lấy tối đa 5 cơ hội tốt nhất cho mỗi chiều để tin nhắn gọn gàng
+    return long_signals[:5], short_signals[:5]
 
 
 async def handle_analyze_command(session, chat_id, coin_name=None):
@@ -1173,7 +1201,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             msg_lines = [
                 "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "Dưới đây là các coin có tín hiệu tốt nhất hiện tại (RSI, EMA, Bollinger, MACD):\n"
+                "Dưới đây là các coin trong Top 100 Volume 24h có tín hiệu tốt nhất hiện tại (RSI, EMA, Bollinger, MACD):\n"
             ]
             
             has_signals = False
