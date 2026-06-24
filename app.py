@@ -892,6 +892,341 @@ async def handle_top_command(session, chat_id):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi xử lý dữ liệu biến động.")
 
 
+async def analyze_market(session, symbol, interval='1h'):
+    """
+    Phân tích kỹ thuật chi tiết cho một symbol (RSI, EMA, Bollinger Bands, MACD).
+    """
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error(f"Lỗi API Binance khi lấy klines cho {symbol}: {body}")
+                return None
+            klines_data = await resp.json()
+            if not isinstance(klines_data, list) or len(klines_data) == 0:
+                return None
+    except Exception as e:
+        logger.error(f"Lỗi kết nối klines cho {symbol}: {e}")
+        return None
+        
+    df = pd.DataFrame(klines_data, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
+    ])
+    df['close'] = df['close'].astype(float)
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    
+    # 1. Tính RSI (14)
+    close_delta = df['close'].diff()
+    up = close_delta.clip(lower=0)
+    down = -1 * close_delta.clip(upper=0)
+    ma_up = up.ewm(com=13, adjust=False).mean()
+    ma_down = down.ewm(com=13, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-10)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # 2. Tính EMA (9, 21)
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    
+    # 3. Tính Bollinger Bands (20, 2)
+    df['ma20'] = df['close'].rolling(window=20).mean()
+    df['std20'] = df['close'].rolling(window=20).std()
+    df['upper_band'] = df['ma20'] + (df['std20'] * 2)
+    df['lower_band'] = df['ma20'] - (df['std20'] * 2)
+    
+    # 4. Tính MACD (12, 26, 9)
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['hist'] = df['macd'] - df['signal']
+    
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    close_price = latest['close']
+    rsi_val = latest['rsi']
+    ema9_val = latest['ema9']
+    ema21_val = latest['ema21']
+    upper_b = latest['upper_band']
+    lower_b = latest['lower_band']
+    macd_val = latest['macd']
+    sig_val = latest['signal']
+    hist_val = latest['hist']
+    prev_hist = prev['hist']
+    
+    # Điểm số để ra quyết định
+    long_score = 0.0
+    short_score = 0.0
+    
+    # Phân tích RSI
+    if rsi_val <= 30:
+        long_score += 2.0
+    elif rsi_val >= 70:
+        short_score += 2.0
+    elif rsi_val < 40:
+        long_score += 0.8
+    elif rsi_val > 60:
+        short_score += 0.8
+        
+    # Phân tích EMA
+    if close_price > ema9_val > ema21_val:
+        long_score += 1.2
+    elif close_price < ema9_val < ema21_val:
+        short_score += 1.2
+        
+    # Phân tích Bollinger Bands
+    if close_price <= lower_b:
+        long_score += 1.5
+    elif close_price >= upper_b:
+        short_score += 1.5
+        
+    # Phân tích MACD
+    if hist_val > 0 and prev_hist <= 0:
+        long_score += 1.0
+    elif hist_val < 0 and prev_hist >= 0:
+        short_score += 1.0
+    elif hist_val > 0:
+        long_score += 0.5
+    elif hist_val < 0:
+        short_score += 0.5
+        
+    signal = 'NEUTRAL'
+    confidence = 'Thấp'
+    
+    if long_score > short_score:
+        if long_score >= 3.0:
+            signal = 'LONG'
+            confidence = 'Mạnh' if long_score >= 4.0 else 'Trung bình'
+    elif short_score > long_score:
+        if short_score >= 3.0:
+            signal = 'SHORT'
+            confidence = 'Mạnh' if short_score >= 4.0 else 'Trung bình'
+            
+    # Tính TP/SL gợi ý
+    tp_price = 0.0
+    sl_price = 0.0
+    bb_width = upper_b - lower_b
+    
+    # Lấy thông tin làm tròn
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+    
+    if signal == 'LONG':
+        sl_price = close_price - (bb_width * 0.6)
+        if sl_price >= close_price:
+            sl_price = close_price * 0.975
+        tp_price = close_price + (close_price - sl_price) * 1.5
+    elif signal == 'SHORT':
+        sl_price = close_price + (bb_width * 0.6)
+        if sl_price <= close_price:
+            sl_price = close_price * 1.025
+        tp_price = close_price - (sl_price - close_price) * 1.5
+        
+    if tp_price > 0:
+        tp_price = round_price_step(tp_price, tick_size, price_p)
+    if sl_price > 0:
+        sl_price = round_price_step(sl_price, tick_size, price_p)
+        
+    return {
+        'symbol': symbol,
+        'close': close_price,
+        'rsi': rsi_val,
+        'ema9': ema9_val,
+        'ema21': ema21_val,
+        'upper_band': upper_b,
+        'lower_band': lower_b,
+        'macd': macd_val,
+        'signal_line': sig_val,
+        'hist': hist_val,
+        'signal': signal,
+        'confidence': confidence,
+        'long_score': long_score,
+        'short_score': short_score,
+        'tp': tp_price,
+        'sl': sl_price
+    }
+
+
+async def scan_market_signals(session):
+    """
+    Quét qua các coin phổ biến để tìm cơ hội giao dịch có tỉ lệ thắng cao.
+    """
+    coins_to_scan = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'LINK', 'NEAR', 'SUI', 'AVAX', 'OP']
+    tasks = []
+    for coin in coins_to_scan:
+        symbol = f"{coin}USDT"
+        tasks.append(analyze_market(session, symbol, interval='1h'))
+        
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    long_signals = []
+    short_signals = []
+    
+    for res in results:
+        if isinstance(res, dict) and res.get('signal') in ('LONG', 'SHORT'):
+            if res['signal'] == 'LONG':
+                long_signals.append(res)
+            else:
+                short_signals.append(res)
+                
+    return long_signals, short_signals
+
+
+async def handle_analyze_command(session, chat_id, coin_name=None):
+    """
+    Xử lý câu lệnh phân tích kỹ thuật và quét tín hiệu.
+    """
+    if coin_name:
+        coin_name = coin_name.upper()
+        symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+        
+        loading_msg_id = await send_telegram_message(
+            session,
+            chat_id,
+            f"⏳ Đang phân tích kỹ thuật cho *{symbol}* (khung 1h)..."
+        )
+        
+        try:
+            res = await analyze_market(session, symbol, interval='1h')
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+                
+            if not res:
+                await send_telegram_message(
+                    session,
+                    chat_id,
+                    f"❌ Không thể lấy dữ liệu phân tích cho *{symbol}*. Vui lòng kiểm tra lại tên coin."
+                )
+                return
+                
+            price_str = format_price(res['close'])
+            rsi_str = f"{res['rsi']:.1f}"
+            ema9_str = format_price(res['ema9'])
+            ema21_str = format_price(res['ema21'])
+            upper_str = format_price(res['upper_band'])
+            lower_str = format_price(res['lower_band'])
+            macd_hist_str = f"{res['hist']:+,.4f}".rstrip('0').rstrip('.')
+            
+            rsi_desc = "Quá bán (Bullish)" if res['rsi'] <= 30 else ("Quá mua (Bearish)" if res['rsi'] >= 70 else "Trung tính")
+            ema_desc = "Tăng (Bullish)" if res['close'] > res['ema9'] > res['ema21'] else ("Giảm (Bearish)" if res['close'] < res['ema9'] < res['ema21'] else "Trung tính")
+            bb_desc = "Chạm biên dưới (Bullish)" if res['close'] <= res['lower_band'] else ("Chạm biên trên (Bearish)" if res['close'] >= res['upper_band'] else "Trung tính")
+            macd_desc = "Bullish" if res['hist'] > 0 else "Bearish"
+            
+            sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL (Đứng ngoài)")
+            conf_color = "🟢" if res['confidence'] == 'Mạnh' else ("🟡" if res['confidence'] == 'Trung bình' else "⚪")
+            
+            msg = (
+                f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol} (1h)*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💵 Giá hiện tại: `*{price_str} USDT*`\n\n"
+                f"🔍 *Các chỉ báo chính:*\n"
+                f"• *RSI (14):* `{rsi_str}` ➜ _{rsi_desc}_\n"
+                f"• *EMA Trend:* Giá vs EMA9 (`{ema9_str}`) & EMA21 (`{ema21_str}`) ➜ _{ema_desc}_\n"
+                f"• *Bollinger Bands:* Biên `{lower_str}` - `{upper_str}` ➜ _{bb_desc}_\n"
+                f"• *MACD:* Hist `{macd_hist_str}` ➜ _{macd_desc}_\n\n"
+                f"🎯 *KẾT LUẬN TÍN HIỆU:*\n"
+                f"👉 Khuyến nghị: **{sig_emoji}**\n"
+                f"🔥 Độ tin cậy: {conf_color} *{res['confidence']}* (L: `{res['long_score']:.1f}` | S: `{res['short_score']:.1f}`)\n\n"
+            )
+            
+            if res['signal'] != 'NEUTRAL':
+                tp_str = format_price(res['tp'])
+                sl_str = format_price(res['sl'])
+                msg += (
+                    f"🛡️ *Kế hoạch giao dịch gợi ý:*\n"
+                    f"• *Entry:* quanh `{price_str} USDT`\n"
+                    f"• *Target TP:* `*{tp_str} USDT*`\n"
+                    f"• *Stop Loss:* `*{sl_str} USDT*`"
+                )
+            else:
+                msg += "💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
+                
+            await send_telegram_message(session, chat_id, msg)
+            
+        except Exception as e:
+            logger.error(f"Lỗi khi xử lý lệnh analyze cho {symbol}: {e}")
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+            await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi phân tích: {e}")
+            
+    else:
+        loading_msg_id = await send_telegram_message(
+            session,
+            chat_id,
+            "🔍 Đang quét thị trường tìm cơ hội giao dịch tỉ lệ thắng cao..."
+        )
+        
+        try:
+            long_signals, short_signals = await scan_market_signals(session)
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+                
+            msg_lines = [
+                "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "Dưới đây là các coin có tín hiệu tốt nhất hiện tại (RSI, EMA, Bollinger, MACD):\n"
+            ]
+            
+            has_signals = False
+            
+            if long_signals:
+                has_signals = True
+                msg_lines.append("🚀 *CƠ HỘI LONG (Tỉ lệ thắng cao):*")
+                for i, res in enumerate(long_signals, 1):
+                    coin = res['symbol'][:-4] if res['symbol'].endswith("USDT") else res['symbol']
+                    price_str = format_price(res['close'])
+                    rsi_str = f"{res['rsi']:.1f}"
+                    tp_str = format_price(res['tp'])
+                    sl_str = format_price(res['sl'])
+                    conf = "Mạnh 🔥" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    msg_lines.append(
+                        f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
+                        f"   • Khuyến nghị: *LONG* (Độ tin cậy: `{conf}`)\n"
+                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                    )
+                msg_lines.append("")
+                
+            if short_signals:
+                has_signals = True
+                msg_lines.append("📉 *CƠ HỘI SHORT (Tỉ lệ thắng cao):*")
+                for i, res in enumerate(short_signals, 1):
+                    coin = res['symbol'][:-4] if res['symbol'].endswith("USDT") else res['symbol']
+                    price_str = format_price(res['close'])
+                    rsi_str = f"{res['rsi']:.1f}"
+                    tp_str = format_price(res['tp'])
+                    sl_str = format_price(res['sl'])
+                    conf = "Mạnh ⚡" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    msg_lines.append(
+                        f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
+                        f"   • Khuyến nghị: *SHORT* (Độ tin cậy: `{conf}`)\n"
+                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                    )
+                    
+            if not has_signals:
+                msg_lines.append("⬜ *Hiện tại chưa phát hiện tín hiệu LONG/SHORT rõ rệt từ các coin phổ biến.*")
+                msg_lines.append("Thị trường đang trong giai đoạn sideway. Bạn nên kiên nhẫn đứng ngoài quan sát.")
+                
+            msg_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            msg_lines.append("💡 *Mẹo:* Sử dụng `/analyze <coin>` để phân tích chi tiết cho một coin cụ thể.")
+            
+            await send_telegram_message(session, chat_id, "\n".join(msg_lines))
+            
+        except Exception as e:
+            logger.error(f"Lỗi khi quét tín hiệu: {e}")
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+            await send_telegram_message(session, chat_id, f"❌ Lỗi khi quét tín hiệu thị trường: {e}")
+
+
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
 async def check_position_mode(session, api_key, api_secret):
     global hedge_mode
@@ -2263,7 +2598,8 @@ async def telegram_webhook_handler(request):
             '/start', '/help', '/pnl', '/pos', '/balance', '/wallet', '/sodu',
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
-            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto'
+            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
+            '/analyze', '/a'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -2316,7 +2652,8 @@ async def telegram_webhook_handler(request):
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
-            "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n\n"
+            "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
+            "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD).\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
             "• Lệnh Market: `/long btc 1000` (LONG btc với volume 1000 USDT)\n"
@@ -2536,6 +2873,11 @@ async def telegram_webhook_handler(request):
             
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
+        
+    elif command_base in ('/analyze', '/a'):
+        parts = text.split()
+        coin_name = parts[1] if len(parts) > 1 else None
+        await handle_analyze_command(request.app['session'], chat_id, coin_name)
         
     return web.Response(status=200)
 
