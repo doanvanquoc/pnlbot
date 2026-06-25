@@ -266,7 +266,7 @@ async def update_position_cache(session, symbol, position_side, amount, entry_pr
                 for p in pos_list:
                     p_idx = int(p.get('positionIdx', 0))
                     if p_idx == position_idx:
-                        final_entry = float(p.get('entryPrice', 0))
+                        final_entry = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
                         logger.info(f"Đã lấy lại thành công entryPrice từ REST API cho {key}: {final_entry}")
                         break
         
@@ -304,7 +304,7 @@ async def init_positions(session, api_key, api_secret):
             if size != 0.0:
                 symbol = p.get('symbol')
                 position_idx = int(p.get('positionIdx', 0))
-                entry_price = float(p.get('entryPrice', 0))
+                entry_price = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
                 leverage = int(float(p.get('leverage', 1)))
                 mark_price = float(p.get('markPrice', 0))
                 unrealised_pnl = float(p.get('unrealisedPnl', 0))
@@ -396,7 +396,7 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                             for p in data_json.get("data", []):
                                 symbol = p.get('symbol')
                                 size = float(p.get('size', 0))
-                                entry_price = float(p.get('entryPrice', 0))
+                                entry_price = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
                                 leverage = int(float(p.get('leverage', 1)))
                                 position_idx = int(p.get('positionIdx', 0))
                                 side = p.get('side')
@@ -1145,7 +1145,7 @@ async def handle_liq_command(session, chat_id):
             symbol = p.get('symbol')
             position_idx = int(p.get('positionIdx', 0))
             size = float(p.get('size', 0))
-            entry_price = float(p.get('entryPrice', 0))
+            entry_price = float(p.get('avgPrice', 0) or p.get('entryPrice', 0) or 0)
             mark_price = float(p.get('markPrice', 0))
             unrealised_pnl = float(p.get('unrealisedPnl', 0))
             leverage = p.get('leverage')
