@@ -231,7 +231,7 @@ async def unsubscribe_mark_price(symbol):
             logger.error(f"Lỗi khi gửi lệnh UNSUBSCRIBE Bybit cho {symbol_upper}: {e}")
 
 # Cập nhật cache vị thế cục bộ
-async def update_position_cache(symbol, position_side, amount, entry_price, leverage, position_idx=0):
+async def update_position_cache(session, symbol, position_side, amount, entry_price, leverage, position_idx=0):
     key = f"{symbol}_{position_side}"
     amount = float(amount)
     entry_price = float(entry_price)
@@ -248,21 +248,43 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
             await unsubscribe_mark_price(symbol)
     else:
         is_new = key not in positions
+        
+        # Bảo vệ entryPrice không bị ghi đè thành 0 hoặc rỗng từ WS event
+        current_entry = positions.get(key, {}).get('entryPrice', 0.0)
+        final_entry = entry_price if entry_price > 0 else current_entry
+        
+        # Nếu vẫn bằng 0 (vị thế mới tinh nhưng WS gửi entryPrice = 0), gọi REST API để lấy entryPrice chính xác
+        if final_entry <= 0:
+            logger.warning(f"Cảnh báo: entryPrice từ WS bằng 0 cho {key}. Đang lấy lại từ REST API...")
+            status, data = await bybit_api_request(
+                session, "GET", "/v5/position/list",
+                params={"category": "linear", "symbol": symbol},
+                is_private=True
+            )
+            if status == 200 and data.get("retCode") == 0:
+                pos_list = data.get("result", {}).get("list", [])
+                for p in pos_list:
+                    p_idx = int(p.get('positionIdx', 0))
+                    if p_idx == position_idx:
+                        final_entry = float(p.get('entryPrice', 0))
+                        logger.info(f"Đã lấy lại thành công entryPrice từ REST API cho {key}: {final_entry}")
+                        break
+        
         positions[key] = {
             'symbol': symbol,
             'positionSide': position_side,
             'positionAmt': amount,
-            'entryPrice': entry_price,
-            'markPrice': positions.get(key, {}).get('markPrice', entry_price),
+            'entryPrice': final_entry,
+            'markPrice': positions.get(key, {}).get('markPrice', final_entry),
             'unrealizedPnL': positions.get(key, {}).get('unrealizedPnL', 0.0),
             'leverage': leverage,
             'positionIdx': position_idx
         }
         
         if is_new:
-            logger.info(f"Đã mở vị thế Bybit mới: {key} (Size: {amount}, Entry: {entry_price})")
+            logger.info(f"Đã mở vị thế Bybit mới: {key} (Size: {amount}, Entry: {final_entry})")
         else:
-            logger.info(f"Cập nhật vị thế Bybit: {key} (Size: {amount}, Entry: {entry_price})")
+            logger.info(f"Cập nhật vị thế Bybit: {key} (Size: {amount}, Entry: {final_entry})")
             
         await subscribe_mark_price(symbol)
 
@@ -390,6 +412,7 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                                     amount = size if side == 'Buy' else -size
                                     
                                 await update_position_cache(
+                                    session=session,
                                     symbol=symbol,
                                     position_side=position_side,
                                     amount=amount,
@@ -846,7 +869,7 @@ async def handle_balance_command(session, chat_id):
     if status == 200 and data.get("retCode") == 0:
         acc_info = data.get("result", {}).get("list", [{}])[0]
         wallet_bal = float(acc_info.get('totalWalletBalance', 0) or 0)
-        pnl = float(acc_info.get('totalUnrealisedPnl', 0) or 0)
+        pnl = float(acc_info.get('totalPerpUPL', 0) or acc_info.get('totalUnrealisedPnl', 0) or 0)
         margin_bal = float(acc_info.get('totalMarginBalance', 0) or 0)
         avail_bal = float(acc_info.get('totalAvailableBalance', 0) or 0)
         
