@@ -1570,9 +1570,12 @@ def round_down(value, decimals):
     return math.floor(value * factor) / factor
 
 # Nạp thông tin độ chính xác từ Bybit V5
-async def init_exchange_info(session):
+async def init_exchange_info(session, symbol=None):
     global symbol_precisions, symbol_price_precisions, symbol_tick_sizes
-    status, data = await bybit_api_request(session, "GET", "/v5/market/instruments-info", params={"category": "linear"})
+    params = {"category": "linear"}
+    if symbol:
+        params["symbol"] = symbol
+    status, data = await bybit_api_request(session, "GET", "/v5/market/instruments-info", params=params)
     if status == 200 and data.get("retCode") == 0:
         instruments = data.get("result", {}).get("list", [])
         for inst in instruments:
@@ -1593,9 +1596,12 @@ async def init_exchange_info(session):
             symbol_precisions[sym] = qty_precision
             symbol_price_precisions[sym] = price_precision
             symbol_tick_sizes[sym] = tick_size if tick_size > 0 else 10**(-price_precision)
-        logger.info(f"Đã nạp thành công độ chính xác ({len(symbol_precisions)} symbols) từ Bybit.")
+        if symbol:
+            logger.info(f"Đã nạp thành công độ chính xác cho đơn lẻ {symbol} từ Bybit.")
+        else:
+            logger.info(f"Đã nạp thành công độ chính xác ({len(symbol_precisions)} symbols) từ Bybit.")
     else:
-        logger.error(f"Lỗi nạp exchangeInfo từ Bybit: {data}")
+        logger.error(f"Lỗi nạp exchangeInfo từ Bybit cho {symbol if symbol else 'all'}: {data}")
 
 def round_price_step(price, tick_size, price_precision):
     if tick_size <= 0:
@@ -1609,10 +1615,16 @@ async def get_symbol_precisions(session, symbol):
     tick_size = symbol_tick_sizes.get(symbol)
     
     if qty_p is None or price_p is None or tick_size is None:
-        await init_exchange_info(session)
-        qty_p = symbol_precisions.get(symbol, 3)
-        price_p = symbol_price_precisions.get(symbol, 4)
-        tick_size = symbol_tick_sizes.get(symbol, 10 ** (-price_p))
+        await init_exchange_info(session, symbol=symbol)
+        qty_p = symbol_precisions.get(symbol)
+        price_p = symbol_price_precisions.get(symbol)
+        tick_size = symbol_tick_sizes.get(symbol)
+        
+        # Nếu vẫn không thấy trong cache, fallback về mặc định
+        if qty_p is None or price_p is None or tick_size is None:
+            qty_p = 3
+            price_p = 4
+            tick_size = 10 ** (-price_p)
         
     return qty_p, price_p, tick_size
 
