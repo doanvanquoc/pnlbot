@@ -892,6 +892,85 @@ async def handle_top_command(session, chat_id):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi xử lý dữ liệu biến động.")
 
 
+async def handle_history_command(session, chat_id, coin_name=None):
+    """
+    Lấy lịch sử chốt vị thế (Realized PnL) từ Binance Futures.
+    """
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    symbol = None
+    if coin_name:
+        coin_name = coin_name.upper()
+        symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+        
+    timestamp = int(time.time() * 1000)
+    params = [
+        "incomeType=REALIZED_PNL",
+        "limit=10",
+        f"timestamp={timestamp}"
+    ]
+    if symbol:
+        params.insert(0, f"symbol={symbol}")
+        
+    query_string = "&".join(params)
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v1/income?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if not data:
+                    await send_telegram_message(
+                        session, 
+                        chat_id, 
+                        f"ℹ️ Không tìm thấy lịch sử chốt vị thế (Realized PnL) nào{' cho ' + symbol if symbol else ''}."
+                    )
+                    return
+                
+                tz_vn = timezone(timedelta(hours=7))
+                lines = ["📜 *LỊCH SỬ CHỐT VỊ THẾ GẦN NHẤT (REALIZED PNL)*\n----------------------------------"]
+                
+                total_realized_pnl = 0.0
+                
+                for i, item in enumerate(data, 1):
+                    sym = item.get('symbol')
+                    income = float(item.get('income', 0))
+                    time_ms = item.get('time')
+                    
+                    total_realized_pnl += income
+                    
+                    time_dt = datetime.fromtimestamp(time_ms / 1000.0, tz=tz_vn)
+                    time_str = time_dt.strftime("%d/%m/%Y %H:%M:%S")
+                    
+                    display_sym = sym[:-4] if sym.endswith("USDT") else sym
+                    pnl_emoji = "🟩" if income >= 0 else "🟥"
+                    pnl_sign = "+" if income >= 0 else ""
+                    
+                    lines.append(
+                        f"{i}. *{display_sym}* ➜ {pnl_emoji} `*{pnl_sign}{income:,.2f} USDT*`\n"
+                        f"   ⏰ Thời gian: `{time_str}`"
+                    )
+                    
+                lines.append("----------------------------------")
+                total_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
+                total_sign = "+" if total_realized_pnl >= 0 else ""
+                lines.append(f"📊 *Tổng kết 10 vị thế gần nhất:*")
+                lines.append(f"💰 Tổng Realized PnL: {total_emoji} `*{total_sign}{total_realized_pnl:,.2f} USDT*`")
+                
+                message = "\n\n".join(lines)
+                await send_telegram_message(session, chat_id, message)
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy lịch sử vị thế: HTTP {resp.status} - {body}")
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi truy vấn lịch sử vị thế từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi trong handle_history_command: {e}")
+        await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi hệ thống khi lấy lịch sử vị thế.")
+
+
 async def analyze_market(session, symbol, interval='1h'):
     """
     Phân tích kỹ thuật chi tiết cho một symbol (RSI, EMA, Bollinger Bands, MACD).
@@ -1021,15 +1100,23 @@ async def analyze_market(session, symbol, interval='1h'):
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
     
     if signal == 'LONG':
+        # Tính SL dựa trên Bollinger Bands
         sl_price = close_price - (bb_width * 0.6)
-        if sl_price >= close_price:
-            sl_price = close_price * 0.975
+        # Chỉ bảo vệ để SL không bị âm hoặc lớn hơn giá hiện tại
+        if sl_price <= 0 or sl_price >= close_price:
+            sl_price = close_price * 0.95  # Mặc định lỗ 5% làm fallback
+            
         tp_price = close_price + (close_price - sl_price) * 1.5
+        
     elif signal == 'SHORT':
+        # Tính SL dựa trên Bollinger Bands
         sl_price = close_price + (bb_width * 0.6)
         if sl_price <= close_price:
-            sl_price = close_price * 1.025
+            sl_price = close_price * 1.05  # Mặc định lỗ 5% làm fallback
+            
         tp_price = close_price - (sl_price - close_price) * 1.5
+        if tp_price <= 0:
+            tp_price = close_price * 0.90  # fallback chốt lời 10%
         
     if tp_price > 0:
         tp_price = round_price_step(tp_price, tick_size, price_p)
@@ -1169,11 +1256,13 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             if res['signal'] != 'NEUTRAL':
                 tp_str = format_price(res['tp'])
                 sl_str = format_price(res['sl'])
+                tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                 msg += (
                     f"🛡️ *Kế hoạch giao dịch gợi ý:*\n"
                     f"• *Entry:* quanh `{price_str} USDT`\n"
-                    f"• *Target TP:* `*{tp_str} USDT*`\n"
-                    f"• *Stop Loss:* `*{sl_str} USDT*`"
+                    f"• *Target TP:* `{tp_str} USDT` ({tp_change:+.2f}%)\n"
+                    f"• *Stop Loss:* `{sl_str} USDT` ({sl_change:+.2f}%)"
                 )
             else:
                 msg += "💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
@@ -1216,10 +1305,12 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = "Mạnh 🔥" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     msg_lines.append(
                         f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
                         f"   • Khuyến nghị: *LONG* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                 msg_lines.append("")
                 
@@ -1233,10 +1324,12 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = "Mạnh ⚡" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     msg_lines.append(
                         f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
                         f"   • Khuyến nghị: *SHORT* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                     
             if not has_signals:
@@ -1253,67 +1346,6 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             if loading_msg_id:
                 await delete_telegram_message(session, chat_id, loading_msg_id)
             await send_telegram_message(session, chat_id, f"❌ Lỗi khi quét tín hiệu thị trường: {e}")
-
-
-async def handle_history_command(session, chat_id, limit=10):
-    """
-    Lấy lịch sử vị thế đã đóng (Realized PnL) từ Binance Futures và hiển thị.
-    """
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    
-    timestamp = int(time.time() * 1000)
-    query_string = f"incomeType=REALIZED_PNL&limit={limit}&timestamp={timestamp}"
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/income?{query_string}&signature={signature}"
-    headers = {"X-MBX-APIKEY": api_key}
-    
-    try:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if not data:
-                    await send_telegram_message(session, chat_id, "ℹ️ Không tìm thấy lịch sử đóng vị thế gần đây.")
-                    return
-                
-                # Sắp xếp theo thời gian mới nhất lên đầu
-                data.sort(key=lambda x: x.get('time', 0), reverse=True)
-                
-                lines = ["📜 *LỊCH SỬ VỊ THẾ ĐÃ ĐÓNG GẦN ĐÂY*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-                tz_vn = timezone(timedelta(hours=7))
-                
-                for i, item in enumerate(data[:limit], 1):
-                    symbol = item.get('symbol', 'UNKNOWN')
-                    display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
-                    pnl = float(item.get('income', 0))
-                    asset = item.get('asset', 'USDT')
-                    msec = item.get('time', 0)
-                    dt = datetime.fromtimestamp(msec / 1000.0, tz=tz_vn)
-                    time_str = dt.strftime("%d/%m %H:%M:%S")
-                    
-                    pnl_emoji = "🟩" if pnl >= 0 else "🟥"
-                    pnl_sign = "+" if pnl >= 0 else ""
-                    
-                    lines.append(
-                        f"{i}. *{display_symbol}* ➜ {pnl_emoji} `*{pnl_sign}{pnl:,.2f} {asset}*`\n"
-                        f"   • Thời gian: `{time_str}`"
-                    )
-                    
-                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                total_pnl = sum(float(x.get('income', 0)) for x in data[:limit])
-                total_emoji = "🟢" if total_pnl >= 0 else "🔴"
-                total_sign = "+" if total_pnl >= 0 else ""
-                lines.append(f"📊 Tổng PnL ({len(data[:limit])} lệnh gần nhất): {total_emoji} `*{total_sign}{total_pnl:,.2f} USDT*`")
-                
-                message = "\n".join(lines)
-                await send_telegram_message(session, chat_id, message)
-            else:
-                body = await resp.text()
-                logger.error(f"Lỗi lấy lịch sử giao dịch: HTTP {resp.status} - {body}")
-                await send_telegram_message(session, chat_id, "❌ Lỗi khi lấy lịch sử đóng vị thế từ Binance.")
-    except Exception as e:
-        logger.error(f"Lỗi trong handle_history_command: {e}")
-        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi tải lịch sử: {e}")
 
 
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
@@ -2688,7 +2720,7 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/his', '/lichsu'
+            '/analyze', '/a', '/history', '/lichsu'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -2743,7 +2775,7 @@ async def telegram_webhook_handler(request):
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD).\n"
-            "📜 `/history [số_lượng]` (hoặc `/his`) - Xem lịch sử các vị thế đã đóng gần nhất.\n\n"
+            "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
             "• Lệnh Market: `/long btc 1000` (LONG btc với volume 1000 USDT)\n"
@@ -2969,17 +3001,10 @@ async def telegram_webhook_handler(request):
         coin_name = parts[1] if len(parts) > 1 else None
         await handle_analyze_command(request.app['session'], chat_id, coin_name)
         
-    elif command_base in ('/history', '/his', '/lichsu'):
+    elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
-        limit = 10
-        if len(parts) > 1:
-            try:
-                limit = int(parts[1])
-                if limit <= 0 or limit > 50:
-                    limit = 10
-            except ValueError:
-                pass
-        await handle_history_command(request.app['session'], chat_id, limit)
+        coin_name = parts[1] if len(parts) > 1 else None
+        await handle_history_command(request.app['session'], chat_id, coin_name)
         
     return web.Response(status=200)
 
