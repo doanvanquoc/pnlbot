@@ -981,15 +981,15 @@ async def handle_history_command(session, chat_id, coin_name=None):
                     pnl_sign = "+" if income >= 0 else ""
                     
                     lines.append(
-                        f"{i}. *{display_sym}* ➜ {pnl_emoji} `*{pnl_sign}{income:,.2f} USDT*`\n"
-                        f"   ⏰ Thời gian: `{time_str}`"
+                        f"{i}. *{display_sym}* ➜ {pnl_emoji} `{pnl_sign}{income:,.2f} USDT`\n"
+                        f"Thời gian: `{time_str}`"
                     )
                     
                 lines.append("----------------------------------")
                 total_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
                 total_sign = "+" if total_realized_pnl >= 0 else ""
                 lines.append(f"📊 *Tổng kết {len(display_data)} vị thế gần nhất:*")
-                lines.append(f"💰 Tổng Realized PnL: {total_emoji} `*{total_sign}{total_realized_pnl:,.2f} USDT*`")
+                lines.append(f"💰 Tổng Realized PnL: {total_emoji} `{total_sign}{total_realized_pnl:,.2f} USDT`")
                 
                 message = "\n\n".join(lines)
                 await send_telegram_message(session, chat_id, message)
