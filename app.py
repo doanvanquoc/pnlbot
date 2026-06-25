@@ -1002,6 +1002,75 @@ async def handle_history_command(session, chat_id, coin_name=None):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi hệ thống khi lấy lịch sử vị thế.")
 
 
+async def handle_liq_command(session, chat_id):
+    """
+    Xem các vị thế đang mở và giá thanh lý của từng vị thế.
+    """
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    
+    timestamp = int(time.time() * 1000)
+    query_string = f"timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    url = f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                
+                open_positions = []
+                for p in data:
+                    amount = float(p.get('positionAmt', 0))
+                    if amount != 0.0:
+                        open_positions.append(p)
+                        
+                if not open_positions:
+                    await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
+                    return
+                    
+                lines = ["☣️ *GIÁ THANH LÝ CÁC VỊ THẾ ĐANG MỞ*\n----------------------------------"]
+                for p in open_positions:
+                    symbol = p.get('symbol')
+                    side = p.get('positionSide')
+                    amount = float(p.get('positionAmt', 0))
+                    entry_price = float(p.get('entryPrice', 0))
+                    mark_price = float(p.get('markPrice', 0))
+                    unrealized_pnl = float(p.get('unrealizedProfit', 0))
+                    leverage = p.get('leverage')
+                    liq_price = float(p.get('liquidationPrice', 0))
+                    
+                    display_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
+                    display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amount > 0)) else "SHORT"
+                    
+                    pnl_emoji = "🟩" if unrealized_pnl >= 0 else "🟥"
+                    pnl_sign = "+" if unrealized_pnl >= 0 else ""
+                    
+                    # Binance trả về 0 nếu CROSS và tài khoản rất an toàn hoặc không có giá thanh lý
+                    liq_price_str = format_price(liq_price) if liq_price > 0 else "Không có ( CROSS/Safe )"
+                    
+                    pos_lines = (
+                        f"🪙 *{display_symbol}* ({display_side})\n"
+                        f"• Entry: `{format_price(entry_price)} USDT`\n"
+                        f"• Mark Price: `{format_price(mark_price)} USDT`\n"
+                        f"• PnL: {pnl_emoji} `{pnl_sign}{unrealized_pnl:,.2f} USDT`\n"
+                        f"• Leverage: `{leverage}x`\n"
+                        f"• **Giá thanh lý:** 💀 `{liq_price_str}`"
+                    )
+                    lines.append(pos_lines)
+                    
+                message = "\n\n".join(lines)
+                await send_telegram_message(session, chat_id, message)
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy dữ liệu positionRisk: HTTP {resp.status} - {body}")
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi lấy thông tin thanh lý từ Binance.")
+    except Exception as e:
+        logger.error(f"Lỗi trong handle_liq_command: {e}")
+        await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi hệ thống khi kiểm tra giá thanh lý.")
+
+
 async def analyze_market(session, symbol, interval='1h'):
     """
     Phân tích kỹ thuật chi tiết cho một symbol (RSI, EMA, Bollinger Bands, MACD).
@@ -2751,7 +2820,7 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/lichsu', '/his'
+            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -2792,6 +2861,7 @@ async def telegram_webhook_handler(request):
             "Các câu lệnh hỗ trợ:\n"
             "📊 `/pnl` - Xem tổng PnL hiện tại.\n"
             "🔍 `/pos` - Xem chi tiết các vị thế đang mở.\n"
+            "💀 `/liq` - Xem các vị thế đang mở kèm giá thanh lý chi tiết.\n"
             "💳 `/balance` (hoặc `/wallet`) - Xem số dư tài khoản & ví Futures.\n"
             "🔥 `/top` (hoặc `/gainers`) - Top 5 tăng/giảm mạnh nhất 24h.\n"
             "⚙️ `/leverage <coin> <hệ_số>` (hoặc `/lev`) - Cài đặt đòn bẩy.\n"
@@ -3036,6 +3106,9 @@ async def telegram_webhook_handler(request):
         parts = text.split()
         coin_name = parts[1] if len(parts) > 1 else None
         await handle_history_command(request.app['session'], chat_id, coin_name)
+        
+    elif command_base == '/liq':
+        await handle_liq_command(request.app['session'], chat_id)
         
     return web.Response(status=200)
 
