@@ -1927,13 +1927,14 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
             return
 
     # Khởi tạo body cho lệnh Bybit V5
+    qty_str = str(int(quantity)) if qty_p == 0 else f"{quantity:.{qty_p}f}"
     order_link_id = f"pnlbot_limit_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     body = {
         "category": "linear",
         "symbol": symbol,
         "side": side,
         "orderType": "Limit" if is_limit else "Market",
-        "qty": str(quantity),
+        "qty": qty_str,
         "positionIdx": position_idx,
         "orderLinkId": order_link_id
     }
@@ -2176,13 +2177,14 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
             
         order_side = 'Buy' if is_long else 'Sell'
         client_order_id = f"pnlbot_dca_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+        qty_str = str(int(quantity_dca)) if qty_p == 0 else f"{quantity_dca:.{qty_p}f}"
         
         body = {
             "category": "linear",
             "symbol": symbol,
             "side": order_side,
             "orderType": "Limit",
-            "qty": str(quantity_dca),
+            "qty": qty_str,
             "price": str(dca_price),
             "timeInForce": "GTC",
             "positionIdx": idx,
@@ -2281,6 +2283,9 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
         await send_telegram_message(session, chat_id, f"❌ Kích thước vị thế của *{symbol}* bằng 0.")
         return
         
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+    qty_str = str(int(abs_amt)) if qty_p == 0 else f"{abs_amt:.{qty_p}f}"
+        
     # Bybit đóng vị thế bằng cách đặt lệnh ngược chiều (hoặc dùng reduceOnly)
     is_long = amt > 0
     side = 'Sell' if is_long else 'Buy'
@@ -2290,7 +2295,7 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
         "symbol": symbol,
         "side": side,
         "orderType": "Market",
-        "qty": str(abs_amt),
+        "qty": qty_str,
         "positionIdx": idx,
         "reduceOnly": True
     }
