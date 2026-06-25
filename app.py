@@ -907,7 +907,7 @@ async def handle_history_command(session, chat_id, coin_name=None):
     timestamp = int(time.time() * 1000)
     params = [
         "incomeType=REALIZED_PNL",
-        "limit=10",
+        "limit=100",  # Lấy nhiều bản ghi thô hơn để sau khi gom nhóm không bị thiếu
         f"timestamp={timestamp}"
     ]
     if symbol:
@@ -930,15 +930,43 @@ async def handle_history_command(session, chat_id, coin_name=None):
                     )
                     return
                 
+                # Gom nhóm các bản ghi PnL rời rạc (fragmented trades) có cùng symbol và cách nhau dưới 10 giây
+                grouped_data = []
+                for item in data:
+                    sym = item.get('symbol')
+                    income = float(item.get('income', 0))
+                    time_ms = item.get('time')
+                    
+                    found = False
+                    for g in grouped_data:
+                        # Nếu cùng symbol và chênh lệch thời gian không quá 10 giây (10000ms), coi như cùng 1 lệnh chốt vị thế
+                        if g['symbol'] == sym and abs(g['time'] - time_ms) <= 10000:
+                            g['income'] += income
+                            # Giữ thời gian mới nhất trong nhóm
+                            if time_ms > g['time']:
+                                g['time'] = time_ms
+                            found = True
+                            break
+                    
+                    if not found:
+                        grouped_data.append({
+                            'symbol': sym,
+                            'income': income,
+                            'time': time_ms
+                        })
+                
+                # Chỉ lấy tối đa 10 vị thế chốt tổng gần nhất để hiển thị
+                display_data = grouped_data[:10]
+                
                 tz_vn = timezone(timedelta(hours=7))
                 lines = ["📜 *LỊCH SỬ CHỐT VỊ THẾ GẦN NHẤT (REALIZED PNL)*\n----------------------------------"]
                 
                 total_realized_pnl = 0.0
                 
-                for i, item in enumerate(data, 1):
-                    sym = item.get('symbol')
-                    income = float(item.get('income', 0))
-                    time_ms = item.get('time')
+                for i, item in enumerate(display_data, 1):
+                    sym = item['symbol']
+                    income = item['income']
+                    time_ms = item['time']
                     
                     total_realized_pnl += income
                     
@@ -957,7 +985,7 @@ async def handle_history_command(session, chat_id, coin_name=None):
                 lines.append("----------------------------------")
                 total_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
                 total_sign = "+" if total_realized_pnl >= 0 else ""
-                lines.append(f"📊 *Tổng kết 10 vị thế gần nhất:*")
+                lines.append(f"📊 *Tổng kết {len(display_data)} vị thế gần nhất:*")
                 lines.append(f"💰 Tổng Realized PnL: {total_emoji} `*{total_sign}{total_realized_pnl:,.2f} USDT*`")
                 
                 message = "\n\n".join(lines)
