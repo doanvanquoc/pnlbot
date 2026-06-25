@@ -955,6 +955,9 @@ async def handle_history_command(session, chat_id, coin_name=None):
                             'time': time_ms
                         })
                 
+                # Sắp xếp lại theo thời gian mới nhất (gần nhất) lên đầu
+                grouped_data.sort(key=lambda x: x['time'], reverse=True)
+                
                 # Chỉ lấy tối đa 10 vị thế chốt tổng gần nhất để hiển thị
                 display_data = grouped_data[:10]
                 
