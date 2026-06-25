@@ -1021,15 +1021,23 @@ async def analyze_market(session, symbol, interval='1h'):
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
     
     if signal == 'LONG':
+        # Tính SL dựa trên Bollinger Bands
         sl_price = close_price - (bb_width * 0.6)
-        if sl_price >= close_price:
-            sl_price = close_price * 0.975
+        # Chỉ bảo vệ để SL không bị âm hoặc lớn hơn giá hiện tại
+        if sl_price <= 0 or sl_price >= close_price:
+            sl_price = close_price * 0.95  # Mặc định lỗ 5% làm fallback
+            
         tp_price = close_price + (close_price - sl_price) * 1.5
+        
     elif signal == 'SHORT':
+        # Tính SL dựa trên Bollinger Bands
         sl_price = close_price + (bb_width * 0.6)
         if sl_price <= close_price:
-            sl_price = close_price * 1.025
+            sl_price = close_price * 1.05  # Mặc định lỗ 5% làm fallback
+            
         tp_price = close_price - (sl_price - close_price) * 1.5
+        if tp_price <= 0:
+            tp_price = close_price * 0.90  # fallback chốt lời 10%
         
     if tp_price > 0:
         tp_price = round_price_step(tp_price, tick_size, price_p)
@@ -1169,11 +1177,13 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             if res['signal'] != 'NEUTRAL':
                 tp_str = format_price(res['tp'])
                 sl_str = format_price(res['sl'])
+                tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                 msg += (
                     f"🛡️ *Kế hoạch giao dịch gợi ý:*\n"
                     f"• *Entry:* quanh `{price_str} USDT`\n"
-                    f"• *Target TP:* `*{tp_str} USDT*`\n"
-                    f"• *Stop Loss:* `*{sl_str} USDT*`"
+                    f"• *Target TP:* `{tp_str} USDT` ({tp_change:+.2f}%)\n"
+                    f"• *Stop Loss:* `{sl_str} USDT` ({sl_change:+.2f}%)"
                 )
             else:
                 msg += "💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
@@ -1216,10 +1226,12 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = "Mạnh 🔥" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     msg_lines.append(
                         f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
                         f"   • Khuyến nghị: *LONG* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                 msg_lines.append("")
                 
@@ -1233,10 +1245,12 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = "Mạnh ⚡" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+                    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     msg_lines.append(
                         f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
                         f"   • Khuyến nghị: *SHORT* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` | SL `{sl_str}`"
+                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                     
             if not has_signals:
