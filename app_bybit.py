@@ -1992,19 +1992,12 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 f"{tp_sl_info}\n"
                 f"🆔 Order ID: `{order_id}`"
             )
+            await send_telegram_message(session, chat_id, msg)
         else:
-            msg = (
-                f"✅ *VÀO LỆNH MARKET THÀNH CÔNG (BYBIT)!*\n"
-                f"----------------------------------\n"
-                f"🪙 Cặp: *{symbol}*\n"
-                f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
-                f"⚙️ Đòn bẩy: *{max_leverage}x*\n"
-                f"📊 Volume ước tính: *{volume:,.2f} USDT*\n"
-                f"🔢 Số lượng: *{quantity} {coin_name}*"
-                f"{tp_sl_info}\n"
-                f"🆔 Order ID: `{order_id}`"
-            )
-        await send_telegram_message(session, chat_id, msg)
+            # Lệnh Market không cần gửi tin nhắn phản hồi đồng bộ ở đây
+            # vì WebSocket private stream (topic "order") sẽ tự động gửi tin nhắn 
+            # "THÔNG BÁO KHỚP LỆNH (BYBIT)" ngay lập tức khi lệnh khớp (chỉ sau 0.5s).
+            pass
     else:
         msg_err = data.get('retMsg', 'Lỗi không xác định')
         code_err = data.get('retCode', -1)
@@ -2314,22 +2307,12 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
     }
     
     try:
-        await send_telegram_message(session, chat_id, f"🔄 Đang gửi lệnh đóng vị thế MARKET cho *{symbol}*...")
         status, data = await bybit_api_request(session, "POST", "/v5/order/create", body=body, is_private=True)
         if status == 200 and data.get("retCode") == 0:
-            order_id = data.get("result", {}).get("orderId")
-            pnl_emoji = "🟢" if is_long else "🔴"
-            display_side = "LONG" if is_long else "SHORT"
-            await send_telegram_message(
-                session,
-                chat_id,
-                f"✅ *ĐÓNG VỊ THẾ THÀNH CÔNG (BYBIT)!*\n"
-                f"----------------------------------\n"
-                f"🪙 Cặp: *{symbol}*\n"
-                f"⚡ Đã đóng vị thế: {pnl_emoji} *{display_side} (MARKET)*\n"
-                f"🔢 Số lượng đã đóng: *{abs_amt}*\n"
-                f"🆔 Order ID: `{order_id}`"
-            )
+            # Lệnh đóng vị thế Market thành công, không cần gửi tin nhắn phản hồi đồng bộ ở đây
+            # vì WebSocket private stream (topic "order") sẽ tự động gửi tin nhắn 
+            # "THÔNG BÁO KHỚP LỆNH (BYBIT)" kèm theo PnL đóng vị thế thực tế ngay lập tức.
+            pass
         else:
             msg_err = data.get('retMsg', 'Lỗi không xác định')
             code_err = data.get('retCode', -1)
