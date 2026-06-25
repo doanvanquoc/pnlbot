@@ -39,6 +39,8 @@ symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPre
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision)
 symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_client_ids = {}   # Lưu map tạm thời orderId -> clientOrderId để biết loại lệnh khi khớp (execution)
+notified_filled_orders = set()  # Lưu các orderId đã thông báo Filled để tránh trùng lặp
+order_realized_pnls = {}     # Lưu map orderId -> realizedPnL từ execution stream
 
 ACTIVE_CHATS_FILE = "active_chats.json"
 active_chats = set()
@@ -397,6 +399,7 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                                 )
                                 
                         # Xử lý sự kiện order (để lưu map clientOrderId)
+                        # Xử lý sự kiện order (để lưu map clientOrderId và thông báo khớp lệnh khi Filled)
                         elif topic == "order":
                             for o in data_json.get("data", []):
                                 order_id = o.get('orderId')
@@ -405,59 +408,45 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                                     order_client_ids[order_id] = client_id
                                     # Giới hạn kích thước map để tránh leak bộ nhớ
                                     if len(order_client_ids) > 1000:
-                                        # Xóa bớt phần tử cũ nhất
                                         key_to_del = next(iter(order_client_ids))
                                         order_client_ids.pop(key_to_del, None)
                                         
-                        # Xử lý sự kiện execution (thông báo khớp lệnh & thanh lý)
-                        elif topic == "execution":
-                            for ex in data_json.get("data", []):
-                                exec_type = ex.get('execType')
-                                symbol = ex.get('symbol')
-                                order_id = ex.get('orderId')
-                                side = ex.get('side')
-                                price = float(ex.get('execPrice', 0))
-                                qty = float(ex.get('execQty', 0))
-                                realized_pnl = float(ex.get('execRealizedPnl', 0))
-                                notional = qty * price
-                                
-                                client_id = order_client_ids.get(order_id, '')
-                                
-                                message = None
-                                
-                                # 1. Thanh lý vị thế (BustTrade)
-                                if exec_type == 'BustTrade':
-                                    pos_side = "LONG" if side == 'Buy' else "SHORT" # side của execution thanh lý ngược lại? Bybit thanh lý mua lại/bán ra để đóng vị thế.
-                                    # Nếu thanh lý vị thế Long, Bybit sẽ tạo lệnh Bán (Sell). Vậy side=Sell -> Long cháy, side=Buy -> Short cháy.
-                                    pos_display = "LONG" if side == 'Sell' else "SHORT"
+                                status = o.get('orderStatus')
+                                if status == 'Filled':
+                                    if order_id in notified_filled_orders:
+                                        continue
+                                    notified_filled_orders.add(order_id)
+                                    if len(notified_filled_orders) > 500:
+                                        notified_filled_orders.remove(next(iter(notified_filled_orders)))
+                                        
+                                    symbol = o.get('symbol')
+                                    side = o.get('side')  # Buy, Sell
+                                    pos_idx = int(o.get('positionIdx', 0))
+                                    price = float(o.get('avgPrice', 0) or o.get('price', 0) or 0)
+                                    qty = float(o.get('cumExecQty', 0) or o.get('qty', 0) or 0)
+                                    notional = qty * price
                                     
-                                    message = (
-                                        f"🚨🚨 *【CẢNH BÁO THANH LÝ (BYBIT)】* 🚨🚨\n"
-                                        f"💀💀💀💀💀💀💀💀💀💀💀💀💀💀\n"
-                                        f"🪙 Cặp: `{symbol}`\n"
-                                        f"💥 Vị thế cháy: 🔴 `{pos_display}`\n"
-                                        f"💵 Giá thanh lý: `{format_price(price)} USDT`\n"
-                                        f"🔢 Số lượng thanh lý: `{qty}` (~`{notional:,.2f} USDT`)\n"
-                                        f"🆔 Order ID: `{order_id}`"
-                                    )
-                                    
-                                # 2. Khớp lệnh (Trade)
-                                elif exec_type == 'Trade':
-                                    # Phân loại loại lệnh hiển thị dựa trên client_id hoặc các trường khác
+                                    # Xác định chiều của lệnh chính
+                                    if pos_idx == 1:
+                                        side_display = "LONG"
+                                    elif pos_idx == 2:
+                                        side_display = "SHORT"
+                                    else:
+                                        side_display = "LONG" if side == 'Buy' else "SHORT"
+                                        
+                                    # Phân loại loại lệnh hiển thị
                                     order_type_display = "Market/Limit"
-                                    
-                                    # Kiểm tra client_id
-                                    client_id_lower = client_id.lower()
-                                    if "dca" in client_id_lower:
-                                        order_type_display = "⚖️ DCA Limit"
-                                    elif "limit" in client_id_lower:
-                                        order_type_display = "⏳ Limit"
-                                    elif "tp" in client_id_lower:
+                                    stop_order_type = o.get('stopOrderType', '')
+                                    if stop_order_type == 'TakeProfit' or "tp" in client_id.lower():
                                         order_type_display = "🎯 CHỐT LỜI (Take Profit)"
-                                    elif "sl" in client_id_lower:
+                                    elif stop_order_type == 'StopLoss' or "sl" in client_id.lower():
                                         order_type_display = "🛡️ CẮT LỖ (Stop Loss)"
-                                    
-                                    side_display = "LONG" if side == 'Buy' else "SHORT"
+                                    elif "dca" in client_id.lower():
+                                        order_type_display = "⚖️ DCA Limit"
+                                    elif "limit" in client_id.lower():
+                                        order_type_display = "⏳ Limit"
+                                        
+                                    realized_pnl = order_realized_pnls.pop(order_id, 0.0)
                                     
                                     msg_lines = [
                                         f"┌──────────────────────────────┐",
@@ -470,7 +459,6 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                                         f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)"
                                     ]
                                     
-                                    # Hiển thị PnL đóng vị thế nếu có
                                     if realized_pnl != 0.0:
                                         pnl_emoji = "🟩" if realized_pnl >= 0 else "🟥"
                                         pnl_sign = "+" if realized_pnl >= 0 else ""
@@ -479,12 +467,52 @@ async def bybit_user_data_stream(session, api_key, api_secret):
                                     msg_lines.append(f"🆔 Order ID: `{order_id}`")
                                     message = "\n".join(msg_lines)
                                     
-                                if message and active_chats:
-                                    for chat_id in list(active_chats):
-                                        try:
-                                            await send_telegram_message(session, chat_id, message)
-                                        except Exception as send_err:
-                                            logger.error(f"Lỗi gửi thông báo event đến {chat_id}: {send_err}")
+                                    if active_chats:
+                                        for chat_id in list(active_chats):
+                                            try:
+                                                await send_telegram_message(session, chat_id, message)
+                                            except Exception as send_err:
+                                                logger.error(f"Lỗi gửi thông báo event đến {chat_id}: {send_err}")
+                                                
+                        # Xử lý sự kiện execution (thông báo thanh lý & lưu realizedPnL của trade)
+                        elif topic == "execution":
+                            for ex in data_json.get("data", []):
+                                exec_type = ex.get('execType')
+                                symbol = ex.get('symbol')
+                                order_id = ex.get('orderId')
+                                side = ex.get('side')
+                                price = float(ex.get('execPrice', 0))
+                                qty = float(ex.get('execQty', 0))
+                                realized_pnl = float(ex.get('execRealizedPnl', 0))
+                                notional = qty * price
+                                
+                                # Lưu realized_pnl của trade này
+                                if realized_pnl != 0.0:
+                                    order_realized_pnls[order_id] = order_realized_pnls.get(order_id, 0.0) + realized_pnl
+                                    # Tránh phình bộ nhớ cho order_realized_pnls
+                                    if len(order_realized_pnls) > 1000:
+                                        key_to_del = next(iter(order_realized_pnls))
+                                        order_realized_pnls.pop(key_to_del, None)
+                                        
+                                # 1. Thanh lý vị thế (BustTrade)
+                                if exec_type == 'BustTrade':
+                                    pos_display = "LONG" if side == 'Sell' else "SHORT"
+                                    message = (
+                                        f"🚨🚨 *【CẢNH BÁO THANH LÝ (BYBIT)】* 🚨🚨\n"
+                                        f"💀💀💀💀💀💀💀💀💀💀💀💀💀💀\n"
+                                        f"🪙 Cặp: `{symbol}`\n"
+                                        f"💥 Vị thế cháy: 🔴 `{pos_display}`\n"
+                                        f"💵 Giá thanh lý: `{format_price(price)} USDT`\n"
+                                        f"🔢 Số lượng thanh lý: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                        f"🆔 Order ID: `{order_id}`"
+                                    )
+                                    
+                                    if active_chats:
+                                        for chat_id in list(active_chats):
+                                            try:
+                                                await send_telegram_message(session, chat_id, message)
+                                            except Exception as send_err:
+                                                logger.error(f"Lỗi gửi thông báo thanh lý đến {chat_id}: {send_err}")
                                             
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("WebSocket Private Bybit bị đóng hoặc lỗi.")
