@@ -2382,7 +2382,7 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq'
+            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq', '/debug'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -2451,6 +2451,11 @@ async def telegram_webhook_handler(request):
         
     elif command_base == '/pos':
         await handle_pos_command(request.app['session'], chat_id)
+        
+    elif command_base == '/debug':
+        import json
+        debug_str = json.dumps(positions, indent=2)
+        await send_telegram_message(request.app['session'], chat_id, f"⚙️ *DEBUG POSITIONS CACHE*:\n```json\n{debug_str[:4000]}\n```")
         
     elif command_base in ('/balance', '/wallet', '/sodu'):
         await handle_balance_command(request.app['session'], chat_id)
