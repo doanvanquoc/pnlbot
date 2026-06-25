@@ -1842,13 +1842,26 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
         )
         return
 
-    # Xác định index và side theo hedge_mode
+    # Kiểm tra Position Mode thực tế của symbol này trên Bybit
+    symbol_hedge_mode = False
+    status_mode, data_mode = await bybit_api_request(
+        session, "GET", "/v5/position/list",
+        params={"category": "linear", "symbol": symbol},
+        is_private=True
+    )
+    if status_mode == 200 and data_mode.get("retCode") == 0:
+        pos_list = data_mode.get("result", {}).get("list", [])
+        symbol_hedge_mode = any(int(p.get('positionIdx', 0)) in (1, 2) for p in pos_list)
+    else:
+        symbol_hedge_mode = hedge_mode
+
+    # Xác định index và side theo symbol_hedge_mode
     if side_type == 'LONG':
         side = 'Buy'
-        position_idx = 1 if hedge_mode else 0
+        position_idx = 1 if symbol_hedge_mode else 0
     else:
         side = 'Sell'
-        position_idx = 2 if hedge_mode else 0
+        position_idx = 2 if symbol_hedge_mode else 0
         
     # Tính toán TP/SL nếu được truyền kèm
     final_tp_price = None
