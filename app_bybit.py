@@ -1928,6 +1928,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
 
     # Khởi tạo body cho lệnh Bybit V5
     qty_str = str(int(quantity)) if qty_p == 0 else f"{quantity:.{qty_p}f}"
+    logger.info(f"Đặt lệnh Bybit {symbol}: volume={volume}, qty_p={qty_p}, quantity={quantity}, qty_str={qty_str}")
     order_link_id = f"pnlbot_limit_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
     body = {
         "category": "linear",
