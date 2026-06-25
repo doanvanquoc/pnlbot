@@ -2751,7 +2751,7 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/lichsu'
+            '/analyze', '/a', '/history', '/lichsu', '/his'
         }
         if command_base in supported_commands:
             should_delete = True
