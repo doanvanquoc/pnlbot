@@ -2008,28 +2008,29 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         f"🆔 Order ID: `{order_id}`"
                     )
                 else:
-                    avg_price = float(data.get('avgPrice', 0))
-                    if avg_price == 0:
-                        cum_quote = float(data.get('cumQuote', 0))
-                        executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
-                        if executed_qty > 0:
-                            avg_price = cum_quote / executed_qty
-                    execute_qty = float(data.get('executedQty', 0))
-                    actual_volume = execute_qty * avg_price
-                    actual_margin = actual_volume / max_leverage
+                    # avg_price = float(data.get('avgPrice', 0))
+                    # if avg_price == 0:
+                    #     cum_quote = float(data.get('cumQuote', 0))
+                    #     executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
+                    #     if executed_qty > 0:
+                    #         avg_price = cum_quote / executed_qty
+                    # execute_qty = float(data.get('executedQty', 0))
+                    # actual_volume = execute_qty * avg_price
+                    # actual_margin = actual_volume / max_leverage
                     
-                    msg = (
-                        f"✅ *VÀO LỆNH MARKET THÀNH CÔNG!*\n"
-                        f"----------------------------------\n"
-                        f"🪙 Cặp: *{symbol}*\n"
-                        f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
-                        f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
-                        f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
-                        f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
-                        f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
-                        f"💵 Giá khớp trung bình: *{format_price(avg_price)} USDT*\n"
-                        f"🆔 Order ID: `{order_id}`"
-                    )
+                    # msg = (
+                    #     f"✅ *VÀO LỆNH MARKET THÀNH CÔNG!*\n"
+                    #     f"----------------------------------\n"
+                    #     f"🪙 Cặp: *{symbol}*\n"
+                    #     f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
+                    #     f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
+                    #     f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
+                    #     f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
+                    #     f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
+                    #     f"💵 Giá khớp trung bình: *{format_price(avg_price)} USDT*\n"
+                    #     f"🆔 Order ID: `{order_id}`"
+                    # )
+                    pass
                 
                 tp_sl_msg_parts = []
 
