@@ -199,7 +199,8 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
             'entryPrice': entry_price,
             'markPrice': positions.get(key, {}).get('markPrice', entry_price),
             'unrealizedPnL': positions.get(key, {}).get('unrealizedPnL', 0.0),
-            'leverage': leverage
+            'leverage': leverage,
+            'fundingRate': positions.get(key, {}).get('fundingRate', 0.0)
         }
         
         if is_new:
@@ -243,7 +244,8 @@ async def init_positions(session, api_key, api_secret):
                         'entryPrice': entry_price,
                         'markPrice': mark_price,
                         'unrealizedPnL': unrealized_pnl,
-                        'leverage': leverage
+                        'leverage': leverage,
+                        'fundingRate': 0.0
                     }
             logger.info(f"Nạp snapshot thành công. Số vị thế đang mở: {len(positions)}")
         else:
@@ -477,6 +479,7 @@ async def binance_mark_price_stream(session):
                             for key, pos in list(positions.items()):
                                 if pos['symbol'] == symbol:
                                     pos['markPrice'] = mark_price
+                                    pos['fundingRate'] = float(data.get('r', 0))
                                     
                                     amt = pos['positionAmt']
                                     entry = pos['entryPrice']
@@ -565,13 +568,15 @@ async def auto_pos_sender_loop(app):
                     side = pos['positionSide']
                     amt = pos['positionAmt']
                     pnl = pos['unrealizedPnL']
+                    funding_rate = pos.get('fundingRate', 0.0)
+                    funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
                     
                     display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
                     display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
                     pnl_emoji = "🟩" if pnl >= 0 else "🟥"
                     sign = "+" if pnl >= 0 else ""
                     
-                    pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*"
+                    pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
                     text_lines.append(pos_text)
                     
                 text_lines.append("----------------------------------")
@@ -639,13 +644,15 @@ async def handle_auto_command(session, chat_id):
                 side = pos['positionSide']
                 amt = pos['positionAmt']
                 pnl = pos['unrealizedPnL']
+                funding_rate = pos.get('fundingRate', 0.0)
+                funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
                 
                 display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
                 display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
                 pnl_emoji = "🟩" if pnl >= 0 else "🟥"
                 sign = "+" if pnl >= 0 else ""
                 
-                pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*"
+                pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
                 text_lines.append(pos_text)
                 
             text_lines.append("----------------------------------")
@@ -721,13 +728,15 @@ async def handle_pos_command(session, chat_id):
         side = pos['positionSide']
         amt = pos['positionAmt']
         pnl = pos['unrealizedPnL']
+        funding_rate = pos.get('fundingRate', 0.0)
+        funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
         
         display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
         display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
         pnl_emoji = "🟩" if pnl >= 0 else "🟥"
         sign = "+" if pnl >= 0 else ""
         
-        pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*"
+        pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
         text_lines.append(pos_text)
         
     text_lines.append("----------------------------------")
@@ -764,7 +773,9 @@ async def get_coin_prices(session, coin_names):
         symbol = coin_upper if coin_upper.endswith("USDT") else f"{coin_upper}USDT"
         targets[symbol] = coin_upper
 
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    url_24h = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    url_premium = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -772,30 +783,47 @@ async def get_coin_prices(session, coin_names):
     if api_key:
         headers["X-MBX-APIKEY"] = api_key
 
-    try:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                # Tạo map nhanh các symbol với giá và % thay đổi
-                prices_map = {}
-                for item in data:
-                    symbol = item['symbol']
-                    prices_map[symbol] = {
-                        'price': float(item['lastPrice']),
-                        'change': float(item['priceChangePercent'])
-                    }
-                
-                results = []
-                for symbol, coin_upper in targets.items():
-                    info = prices_map.get(symbol)
-                    results.append((coin_upper, info))
-                return results
-            else:
-                body = await resp.text()
-                logger.error(f"Lỗi gọi API Binance 24h: HTTP {resp.status} - {body}")
-    except Exception as e:
-        logger.error(f"Lỗi lấy giá coin hàng loạt: {e}")
-    return [(coin.upper(), None) for coin in coin_names]
+    async def fetch_24h():
+        try:
+            async with session.get(url_24h, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            logger.error(f"Lỗi lấy 24hr ticker: {e}")
+        return None
+
+    async def fetch_premium():
+        try:
+            async with session.get(url_premium, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            logger.error(f"Lỗi lấy premiumIndex: {e}")
+        return None
+
+    res_24h, res_premium = await asyncio.gather(fetch_24h(), fetch_premium())
+
+    prices_map = {}
+    if res_24h:
+        for item in res_24h:
+            symbol = item['symbol']
+            prices_map[symbol] = {
+                'price': float(item['lastPrice']),
+                'change': float(item['priceChangePercent']),
+                'funding_rate': 0.0
+            }
+
+    if res_premium and isinstance(res_premium, list):
+        for item in res_premium:
+            symbol = item.get('symbol')
+            if symbol in prices_map:
+                prices_map[symbol]['funding_rate'] = float(item.get('lastFundingRate', 0))
+
+    results = []
+    for symbol, coin_upper in targets.items():
+        info = prices_map.get(symbol)
+        results.append((coin_upper, info))
+    return results
 
 
 async def handle_balance_command(session, chat_id):
@@ -1050,12 +1078,17 @@ async def handle_liq_command(session, chat_id):
                     # Binance trả về 0 nếu CROSS và tài khoản rất an toàn hoặc không có giá thanh lý
                     liq_price_str = format_price(liq_price) if liq_price > 0 else "Không có ( CROSS/Safe )"
                     
+                    # Lấy funding rate hiện tại từ cache
+                    pos_key = f"{symbol}_{side}"
+                    funding_rate = positions.get(pos_key, {}).get('fundingRate', 0.0)
+                    funding_str = f"{funding_rate * 100:+.4f}%"
+                    
                     pos_lines = (
                         f"🪙 *{display_symbol}* ({display_side})\n"
                         f"• Entry: `{format_price(entry_price)} USDT`\n"
                         f"• Mark Price: `{format_price(mark_price)} USDT`\n"
                         f"• PnL: {pnl_emoji} `{pnl_sign}{unrealized_pnl:,.2f} USDT`\n"
-                        f"• Leverage: `{leverage}x`\n"
+                        f"• Leverage: `{leverage}x` | Funding: `{funding_str}`\n"
                         f"• **Giá thanh lý:** 💀 `{liq_price_str}`"
                     )
                     lines.append(pos_lines)
@@ -1296,6 +1329,19 @@ async def scan_market_signals(session):
     return long_signals[:5], short_signals[:5]
 
 
+async def get_single_funding_rate(session, symbol):
+    url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, dict):
+                    return float(data.get('lastFundingRate', 0))
+    except Exception as e:
+        logger.error(f"Lỗi lấy funding rate cho {symbol}: {e}")
+    return 0.0
+
+
 async def handle_analyze_command(session, chat_id, coin_name=None):
     """
     Xử lý câu lệnh phân tích kỹ thuật và quét tín hiệu.
@@ -1311,7 +1357,9 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
         )
         
         try:
+            funding_task = asyncio.create_task(get_single_funding_rate(session, symbol))
             res = await analyze_market(session, symbol, interval='1h')
+            funding_rate = await funding_task
             if loading_msg_id:
                 await delete_telegram_message(session, chat_id, loading_msg_id)
                 
@@ -1324,6 +1372,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 return
                 
             price_str = format_price(res['close'])
+            funding_str = f"{funding_rate * 100:+.4f}%"
             rsi_str = f"{res['rsi']:.1f}"
             ema9_str = format_price(res['ema9'])
             ema21_str = format_price(res['ema21'])
@@ -1342,7 +1391,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             msg = (
                 f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol} (1h)*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💵 Giá hiện tại: `*{price_str} USDT*`\n\n"
+                f"💵 Giá hiện tại: `*{price_str} USDT*`\n"
+                f"⏳ Funding Rate: `{funding_str}`\n\n"
                 f"🔍 *Các chỉ báo chính:*\n"
                 f"• *RSI (14):* `{rsi_str}` ➜ _{rsi_desc}_\n"
                 f"• *EMA Trend:* Giá vs EMA9 (`{ema9_str}`) & EMA21 (`{ema21_str}`) ➜ _{ema_desc}_\n"
@@ -2232,19 +2282,41 @@ async def handle_orders_command(session, chat_id):
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
-        # 1. Gọi API lấy toàn bộ giá coin hiện tại để map với danh sách lệnh chờ
+        # 1. Gọi API lấy toàn bộ giá coin hiện tại và funding rate để map với danh sách lệnh chờ
         prices_map = {}
+        funding_map = {}
         try:
             url_price = "https://fapi.binance.com/fapi/v1/ticker/price"
+            url_premium = "https://fapi.binance.com/fapi/v1/premiumIndex"
             headers_public = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
-            async with session.get(url_price, headers=headers_public) as resp_price:
-                if resp_price.status == 200:
-                    price_data = await resp_price.json()
-                    prices_map = {item['symbol']: float(item['price']) for item in price_data}
+            
+            async def fetch_price():
+                try:
+                    async with session.get(url_price, headers=headers_public) as r:
+                        if r.status == 200:
+                            return await r.json()
+                except Exception as e:
+                    logger.error(f"Lỗi lấy giá: {e}")
+                return None
+                
+            async def fetch_premium():
+                try:
+                    async with session.get(url_premium, headers=headers_public) as r:
+                        if r.status == 200:
+                            return await r.json()
+                except Exception as e:
+                    logger.error(f"Lỗi lấy premiumIndex: {e}")
+                return None
+
+            price_data, premium_data = await asyncio.gather(fetch_price(), fetch_premium())
+            if price_data:
+                prices_map = {item['symbol']: float(item['price']) for item in price_data}
+            if premium_data and isinstance(premium_data, list):
+                funding_map = {item['symbol']: float(item['lastFundingRate']) for item in premium_data}
         except Exception as e:
-            logger.error(f"Lỗi lấy giá hiện tại khi xem orders: {e}")
+            logger.error(f"Lỗi lấy thông tin thị trường khi xem orders: {e}")
 
         async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
@@ -2287,9 +2359,13 @@ async def handle_orders_command(session, chat_id):
                     if current_price is not None:
                         price_line += f"   • Giá hiện tại: *{current_price:,.4f} USDT*\n"
                         
+                    funding_rate = funding_map.get(symbol, 0.0)
+                    funding_str = f"   • Funding Rate: *{funding_rate * 100:+.4f}%*\n"
+                    
                     lines.append(
                         f"{i}. {display_symbol} ({emoji} *{display_side} - {order_type}*)\n"
                         f"{price_line}"
+                        f"{funding_str}"
                         f"   • Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
                         f"   • ID: `{order_id}`\n"
                     )
@@ -2842,10 +2918,12 @@ async def telegram_webhook_handler(request):
                 if info is not None:
                     price = info['price']
                     change = info['change']
+                    funding = info.get('funding_rate', 0.0)
                     formatted = format_price(price)
                     emoji = "🟢" if change >= 0 else "🔴"
                     sign = "+" if change >= 0 else ""
-                    response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%)")
+                    funding_str = f" [FR: {funding * 100:+.4f}%]"
+                    response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%){funding_str}")
                 else:
                     response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
             
