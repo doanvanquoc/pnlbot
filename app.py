@@ -569,7 +569,7 @@ async def auto_pos_sender_loop(app):
                     amt = pos['positionAmt']
                     pnl = pos['unrealizedPnL']
                     funding_rate = pos.get('fundingRate', 0.0)
-                    funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
+                    funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if abs(funding_rate) >= 0.005 else ""
                     
                     display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
                     display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
@@ -645,7 +645,7 @@ async def handle_auto_command(session, chat_id):
                 amt = pos['positionAmt']
                 pnl = pos['unrealizedPnL']
                 funding_rate = pos.get('fundingRate', 0.0)
-                funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
+                funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if abs(funding_rate) >= 0.005 else ""
                 
                 display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
                 display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
@@ -729,7 +729,7 @@ async def handle_pos_command(session, chat_id):
         amt = pos['positionAmt']
         pnl = pos['unrealizedPnL']
         funding_rate = pos.get('fundingRate', 0.0)
-        funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if funding_rate != 0.0 else ""
+        funding_str = f" (FR: {funding_rate * 100:+.4f}%)" if abs(funding_rate) >= 0.005 else ""
         
         display_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
         display_side = "LONG" if (side == 'LONG' or (side == 'BOTH' and amt > 0)) else "SHORT"
@@ -1081,14 +1081,17 @@ async def handle_liq_command(session, chat_id):
                     # Lấy funding rate hiện tại từ cache
                     pos_key = f"{symbol}_{side}"
                     funding_rate = positions.get(pos_key, {}).get('fundingRate', 0.0)
-                    funding_str = f"{funding_rate * 100:+.4f}%"
+                    
+                    funding_part = ""
+                    if abs(funding_rate) >= 0.005:
+                        funding_part = f" | Funding: `{funding_rate * 100:+.4f}%`"
                     
                     pos_lines = (
                         f"🪙 *{display_symbol}* ({display_side})\n"
                         f"• Entry: `{format_price(entry_price)} USDT`\n"
                         f"• Mark Price: `{format_price(mark_price)} USDT`\n"
                         f"• PnL: {pnl_emoji} `{pnl_sign}{unrealized_pnl:,.2f} USDT`\n"
-                        f"• Leverage: `{leverage}x` | Funding: `{funding_str}`\n"
+                        f"• Leverage: `{leverage}x`{funding_part}\n"
                         f"• **Giá thanh lý:** 💀 `{liq_price_str}`"
                     )
                     lines.append(pos_lines)
@@ -1372,7 +1375,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 return
                 
             price_str = format_price(res['close'])
-            funding_str = f"{funding_rate * 100:+.4f}%"
+            funding_line = f"⏳ Funding Rate: `{funding_rate * 100:+.4f}%`\n" if abs(funding_rate) >= 0.005 else ""
             rsi_str = f"{res['rsi']:.1f}"
             ema9_str = format_price(res['ema9'])
             ema21_str = format_price(res['ema21'])
@@ -1392,8 +1395,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol} (1h)*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"💵 Giá hiện tại: `*{price_str} USDT*`\n"
-                f"⏳ Funding Rate: `{funding_str}`\n\n"
-                f"🔍 *Các chỉ báo chính:*\n"
+                f"{funding_line}"
+                f"\n🔍 *Các chỉ báo chính:*\n"
                 f"• *RSI (14):* `{rsi_str}` ➜ _{rsi_desc}_\n"
                 f"• *EMA Trend:* Giá vs EMA9 (`{ema9_str}`) & EMA21 (`{ema21_str}`) ➜ _{ema_desc}_\n"
                 f"• *Bollinger Bands:* Biên `{lower_str}` - `{upper_str}` ➜ _{bb_desc}_\n"
@@ -2360,7 +2363,7 @@ async def handle_orders_command(session, chat_id):
                         price_line += f"   • Giá hiện tại: *{current_price:,.4f} USDT*\n"
                         
                     funding_rate = funding_map.get(symbol, 0.0)
-                    funding_str = f"   • Funding Rate: *{funding_rate * 100:+.4f}%*\n"
+                    funding_str = f"   • Funding Rate: *{funding_rate * 100:+.4f}%*\n" if abs(funding_rate) >= 0.005 else ""
                     
                     lines.append(
                         f"{i}. {display_symbol} ({emoji} *{display_side} - {order_type}*)\n"
@@ -2922,7 +2925,7 @@ async def telegram_webhook_handler(request):
                     formatted = format_price(price)
                     emoji = "🟢" if change >= 0 else "🔴"
                     sign = "+" if change >= 0 else ""
-                    funding_str = f" [FR: {funding * 100:+.4f}%]"
+                    funding_str = f" [FR: {funding * 100:+.4f}%]" if abs(funding) >= 0.005 else ""
                     response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%){funding_str}")
                 else:
                     response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
