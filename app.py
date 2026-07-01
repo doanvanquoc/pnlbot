@@ -38,6 +38,7 @@ hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: On
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
 symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
+order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
 
 ACTIVE_CHATS_FILE = "active_chats.json"
 active_chats = set()
@@ -345,6 +346,12 @@ async def binance_user_data_stream(session, api_key):
                             client_order_id = order_data.get('c', '')
                             orig_type = order_data.get('ot', '')
                             order_type = order_data.get('o', '') # LIMIT, MARKET, etc.
+                            order_id = order_data.get('i')
+                            realized_pnl = float(order_data.get('rp', 0))
+
+                            # Cộng dồn realized_pnl cho mỗi trade fill của cùng 1 order_id
+                            if realized_pnl != 0.0:
+                                order_realized_pnl[order_id] = order_realized_pnl.get(order_id, 0.0) + realized_pnl
                             
                             message = None
                             
@@ -356,7 +363,6 @@ async def binance_user_data_stream(session, api_key):
                                 price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
                                 qty = float(order_data.get('z', 0))
                                 notional = qty * price
-                                order_id = order_data.get('i')
                                 
                                 pos_display = "SHORT" if side == 'BUY' else "LONG"
                                 if pos_side != 'BOTH':
@@ -380,8 +386,9 @@ async def binance_user_data_stream(session, api_key):
                                 price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
                                 qty = float(order_data.get('z', 0))
                                 notional = qty * price
-                                order_id = order_data.get('i')
-                                realized_pnl = float(order_data.get('rp', 0))
+                                
+                                # Lấy tổng realized pnl đã cộng dồn (và xóa khỏi cache vì lệnh đã FILLED kết thúc)
+                                total_realized_pnl = order_realized_pnl.pop(order_id, realized_pnl)
                                 
                                 # Xác định loại lệnh hiển thị
                                 if orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
@@ -409,14 +416,18 @@ async def binance_user_data_stream(session, api_key):
                                 ]
                                 
                                 # Thêm PNL đóng nếu có realized_pnl hoặc là lệnh TP/SL/đóng
-                                is_close_or_reduce = (realized_pnl != 0.0) or (orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'))
+                                is_close_or_reduce = (total_realized_pnl != 0.0) or (orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'))
                                 if is_close_or_reduce:
-                                    pnl_emoji = "🟩" if realized_pnl >= 0 else "🟥"
-                                    pnl_sign = "+" if realized_pnl >= 0 else ""
-                                    msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{realized_pnl:,.2f} USDT*`")
+                                    pnl_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
+                                    pnl_sign = "+" if total_realized_pnl >= 0 else ""
+                                    msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{total_realized_pnl:,.2f} USDT*`")
                                     
                                 msg_lines.append(f"🆔 Order ID: `{order_id}`")
                                 message = "\n".join(msg_lines)
+
+                            # Dọn dẹp cache nếu lệnh kết thúc bằng cách khác (CANCELED/EXPIRED)
+                            if status in ('CANCELED', 'EXPIRED'):
+                                order_realized_pnl.pop(order_id, None)
                                 
                             # Gửi thông báo cho tất cả active_chats
                             if message and active_chats:
