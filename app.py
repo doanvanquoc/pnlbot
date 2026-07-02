@@ -39,6 +39,7 @@ symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPre
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
 symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
+tracking_coins = {}     # Lưu danh sách coin đang tracking giá: {symbol: {'ref_price': float, 'chat_ids': set()}}
 
 ACTIVE_CHATS_FILE = "active_chats.json"
 active_chats = set()
@@ -378,52 +379,75 @@ async def binance_user_data_stream(session, api_key):
                                     f"🆔 Order ID: `{order_id}`"
                                 )
                                 
-                            # 2. Tất cả các lệnh giao dịch khớp hoàn toàn (TRADE FILLED)
-                            elif exec_type == 'TRADE' and status == 'FILLED':
-                                symbol = order_data.get('s')
-                                side = order_data.get('S')        # BUY, SELL
-                                pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
-                                price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
-                                qty = float(order_data.get('z', 0))
-                                notional = qty * price
-                                
-                                # Lấy tổng realized pnl đã cộng dồn (và xóa khỏi cache vì lệnh đã FILLED kết thúc)
-                                total_realized_pnl = order_realized_pnl.pop(order_id, realized_pnl)
-                                
-                                # Xác định loại lệnh hiển thị
-                                if orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
-                                    order_type_display = "🎯 CHỐT LỜI (Take Profit)"
-                                elif orig_type in ('STOP', 'STOP_MARKET'):
-                                    order_type_display = "🛡️ CẮT LỖ (Stop Loss)"
-                                elif "dca" in client_order_id.lower():
-                                    order_type_display = "⚖️ DCA Limit"
-                                elif client_order_id.startswith('pnlbot_limit'):
-                                    order_type_display = "⏳ Limit"
+                            # 2. Xử lý các lệnh giao dịch khớp hoàn toàn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
+                            elif status in ('FILLED', 'NEW', 'CANCELED'):
+                                # Tránh gửi thông báo NEW cho các lệnh không phải LIMIT (như MARKET, TP, SL lúc mới tạo)
+                                if status == 'NEW' and order_type != 'LIMIT':
+                                    pass
                                 else:
-                                    order_type_display = f"{order_type}"
-                                
-                                side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
-                                
-                                msg_lines = [
-                                    f"┌──────────────────────────────┐",
-                                    f"   🔔 *THÔNG BÁO KHỚP LỆNH*",
-                                    f"└──────────────────────────────┘",
-                                    f"🪙 Cặp: `{symbol}`",
-                                    f"⚡ Loại: `{order_type_display} ({side_display})`",
-                                    f"📊 Trạng thái: 🟢 `FILLED`",
-                                    f"💵 Giá khớp: `{format_price(price)} USDT`",
-                                    f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)"
-                                ]
-                                
-                                # Thêm PNL đóng nếu có realized_pnl hoặc là lệnh TP/SL/đóng
-                                is_close_or_reduce = (total_realized_pnl != 0.0) or (orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'))
-                                if is_close_or_reduce:
-                                    pnl_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
-                                    pnl_sign = "+" if total_realized_pnl >= 0 else ""
-                                    msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{total_realized_pnl:,.2f} USDT*`")
+                                    symbol = order_data.get('s')
+                                    side = order_data.get('S')        # BUY, SELL
+                                    pos_side = order_data.get('ps')   # LONG, SHORT, BOTH
+                                    price = float(order_data.get('ap', 0)) or float(order_data.get('L', 0)) or float(order_data.get('p', 0))
+                                    if price == 0:
+                                        price = float(order_data.get('p', 0)) # fallback sang giá đặt ban đầu
                                     
-                                msg_lines.append(f"🆔 Order ID: `{order_id}`")
-                                message = "\n".join(msg_lines)
+                                    qty = float(order_data.get('z', 0)) or float(order_data.get('q', 0))
+                                    notional = qty * price
+                                    
+                                    # Lấy tổng realized pnl đã cộng dồn (và xóa khỏi cache nếu lệnh kết thúc)
+                                    if status in ('FILLED', 'CANCELED'):
+                                        total_realized_pnl = order_realized_pnl.pop(order_id, realized_pnl)
+                                    else:
+                                        total_realized_pnl = realized_pnl
+                                    
+                                    # Xác định loại lệnh hiển thị
+                                    if orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET'):
+                                        order_type_display = "🎯 CHỐT LỜI (Take Profit)"
+                                    elif orig_type in ('STOP', 'STOP_MARKET'):
+                                        order_type_display = "🛡️ CẮT LỖ (Stop Loss)"
+                                    elif "dca" in client_order_id.lower():
+                                        order_type_display = "⚖️ DCA Limit"
+                                    elif client_order_id.startswith('pnlbot_limit'):
+                                        order_type_display = "⏳ Limit"
+                                    else:
+                                        order_type_display = f"{order_type}"
+                                    
+                                    side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
+                                    
+                                    if status == 'FILLED':
+                                        title = "🔔 *THÔNG BÁO KHỚP LỆNH*"
+                                        status_emoji = "🟢 `FILLED`"
+                                        price_label = "Giá khớp"
+                                    elif status == 'NEW':
+                                        title = "⏳ *THÔNG BÁO TẠO LỆNH*"
+                                        status_emoji = "🟡 `NEW` (Chờ khớp)"
+                                        price_label = "Giá đặt"
+                                    else: # CANCELED
+                                        title = "❌ *THÔNG BÁO HỦY LỆNH*"
+                                        status_emoji = "🔴 `CANCELED`"
+                                        price_label = "Giá đặt"
+                                        
+                                    msg_lines = [
+                                        f"┌──────────────────────────────┐",
+                                        f"   {title}",
+                                        f"└──────────────────────────────┘",
+                                        f"🪙 Cặp: `{symbol}`",
+                                        f"⚡ Loại: `{order_type_display} ({side_display})`",
+                                        f"📊 Trạng thái: {status_emoji}",
+                                        f"💵 {price_label}: `{format_price(price)} USDT`",
+                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)"
+                                    ]
+                                    
+                                    # Thêm PNL đóng nếu có realized_pnl hoặc là lệnh TP/SL/đóng
+                                    is_close_or_reduce = (total_realized_pnl != 0.0) or (orig_type in ('TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'STOP', 'STOP_MARKET'))
+                                    if status == 'FILLED' and is_close_or_reduce:
+                                        pnl_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
+                                        pnl_sign = "+" if total_realized_pnl >= 0 else ""
+                                        msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{total_realized_pnl:,.2f} USDT*`")
+                                        
+                                    msg_lines.append(f"🆔 Order ID: `{order_id}`")
+                                    message = "\n".join(msg_lines)
 
                             # Dọn dẹp cache nếu lệnh kết thúc bằng cách khác (CANCELED/EXPIRED)
                             if status in ('CANCELED', 'EXPIRED'):
@@ -1120,9 +1144,10 @@ async def handle_liq_command(session, chat_id):
 
 async def analyze_market(session, symbol, interval='1h'):
     """
-    Phân tích kỹ thuật chi tiết cho một symbol (RSI, EMA, Bollinger Bands, MACD).
+    Phân tích kỹ thuật chi tiết cho một symbol.
+    Chỉ báo: RSI, Stochastic RSI, EMA(9/21/50), Bollinger Bands, MACD, ATR, ADX, Volume Analysis, Support/Resistance.
     """
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=100"
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit=150"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -1149,8 +1174,9 @@ async def analyze_market(session, symbol, interval='1h'):
     df['open'] = df['open'].astype(float)
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
     
-    # 1. Tính RSI (14)
+    # ─── 1. RSI (14) ───
     close_delta = df['close'].diff()
     up = close_delta.clip(lower=0)
     down = -1 * close_delta.clip(upper=0)
@@ -1159,111 +1185,266 @@ async def analyze_market(session, symbol, interval='1h'):
     rs = ma_up / (ma_down + 1e-10)
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # 2. Tính EMA (9, 21)
+    # ─── 2. Stochastic RSI (14, 14, 3, 3) ───
+    rsi_series = df['rsi']
+    rsi_min = rsi_series.rolling(window=14).min()
+    rsi_max = rsi_series.rolling(window=14).max()
+    stoch_rsi = (rsi_series - rsi_min) / (rsi_max - rsi_min + 1e-10)
+    df['stoch_k'] = stoch_rsi.rolling(window=3).mean() * 100
+    df['stoch_d'] = df['stoch_k'].rolling(window=3).mean()
+    
+    # ─── 3. EMA (9, 21, 50) ───
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     
-    # 3. Tính Bollinger Bands (20, 2)
+    # ─── 4. Bollinger Bands (20, 2) ───
     df['ma20'] = df['close'].rolling(window=20).mean()
     df['std20'] = df['close'].rolling(window=20).std()
     df['upper_band'] = df['ma20'] + (df['std20'] * 2)
     df['lower_band'] = df['ma20'] - (df['std20'] * 2)
     
-    # 4. Tính MACD (12, 26, 9)
+    # ─── 5. MACD (12, 26, 9) ───
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
-    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['hist'] = df['macd'] - df['signal']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['hist'] = df['macd'] - df['macd_signal']
+    
+    # ─── 6. ATR (14) ───
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift(1)).abs()
+    low_close = (df['low'] - df['close'].shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = true_range.ewm(span=14, adjust=False).mean()
+    
+    # ─── 7. ADX (14) ───
+    plus_dm = df['high'].diff()
+    minus_dm = -df['low'].diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    atr_14 = df['atr']
+    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / (atr_14 + 1e-10))
+    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / (atr_14 + 1e-10))
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10))
+    df['adx'] = dx.ewm(span=14, adjust=False).mean()
+    df['plus_di'] = plus_di
+    df['minus_di'] = minus_di
+    
+    # ─── 8. Volume Analysis ───
+    df['vol_ma20'] = df['volume'].rolling(window=20).mean()
+    
+    # ─── 9. Support / Resistance (từ đỉnh/đáy gần nhất trong 50 nến) ───
+    lookback = min(50, len(df) - 2)
+    recent = df.tail(lookback)
+    support = recent['low'].min()
+    resistance = recent['high'].max()
     
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     
     close_price = latest['close']
     rsi_val = latest['rsi']
+    stoch_k = latest['stoch_k']
+    stoch_d = latest['stoch_d']
     ema9_val = latest['ema9']
     ema21_val = latest['ema21']
+    ema50_val = latest['ema50']
     upper_b = latest['upper_band']
     lower_b = latest['lower_band']
     macd_val = latest['macd']
-    sig_val = latest['signal']
+    sig_val = latest['macd_signal']
     hist_val = latest['hist']
     prev_hist = prev['hist']
+    atr_val = latest['atr']
+    adx_val = latest['adx']
+    plus_di_val = latest['plus_di']
+    minus_di_val = latest['minus_di']
+    vol_now = latest['volume']
+    vol_avg = latest['vol_ma20']
+    vol_ratio = vol_now / (vol_avg + 1e-10)
     
-    # Điểm số để ra quyết định
+    # ═══════════════════════════════════
+    # HỆ THỐNG CHẤM ĐIỂM (Thang 10)
+    # ═══════════════════════════════════
     long_score = 0.0
     short_score = 0.0
     
-    # Phân tích RSI
-    if rsi_val <= 30:
-        long_score += 2.0
-    elif rsi_val >= 70:
-        short_score += 2.0
-    elif rsi_val < 40:
-        long_score += 0.8
-    elif rsi_val > 60:
-        short_score += 0.8
+    # ── RSI (max 1.5đ) ──
+    if rsi_val <= 25:
+        long_score += 1.5
+    elif rsi_val <= 35:
+        long_score += 1.0
+    elif rsi_val <= 45:
+        long_score += 0.3
+    elif rsi_val >= 75:
+        short_score += 1.5
+    elif rsi_val >= 65:
+        short_score += 1.0
+    elif rsi_val >= 55:
+        short_score += 0.3
         
-    # Phân tích EMA
-    if close_price > ema9_val > ema21_val:
+    # ── Stochastic RSI (max 1.0đ) ──
+    if stoch_k <= 20 and stoch_d <= 20:
+        long_score += 1.0
+    elif stoch_k <= 30:
+        long_score += 0.4
+    elif stoch_k >= 80 and stoch_d >= 80:
+        short_score += 1.0
+    elif stoch_k >= 70:
+        short_score += 0.4
+    # Crossover bonus
+    prev_stoch_k = prev['stoch_k']
+    prev_stoch_d = prev['stoch_d']
+    if stoch_k > stoch_d and prev_stoch_k <= prev_stoch_d and stoch_k <= 40:
+        long_score += 0.5  # Bullish cross ở vùng oversold
+    elif stoch_k < stoch_d and prev_stoch_k >= prev_stoch_d and stoch_k >= 60:
+        short_score += 0.5  # Bearish cross ở vùng overbought
+        
+    # ── EMA Trend (max 2.0đ) ──
+    if close_price > ema9_val > ema21_val > ema50_val:
+        long_score += 2.0  # Uptrend hoàn hảo
+    elif close_price > ema9_val > ema21_val:
         long_score += 1.2
+    elif close_price > ema21_val:
+        long_score += 0.5
+    elif close_price < ema9_val < ema21_val < ema50_val:
+        short_score += 2.0  # Downtrend hoàn hảo
     elif close_price < ema9_val < ema21_val:
         short_score += 1.2
-        
-    # Phân tích Bollinger Bands
-    if close_price <= lower_b:
-        long_score += 1.5
-    elif close_price >= upper_b:
-        short_score += 1.5
-        
-    # Phân tích MACD
-    if hist_val > 0 and prev_hist <= 0:
-        long_score += 1.0
-    elif hist_val < 0 and prev_hist >= 0:
-        short_score += 1.0
-    elif hist_val > 0:
-        long_score += 0.5
-    elif hist_val < 0:
+    elif close_price < ema21_val:
         short_score += 0.5
         
+    # ── Bollinger Bands (max 1.5đ) ──
+    bb_width = upper_b - lower_b
+    bb_pct = (close_price - lower_b) / (bb_width + 1e-10)  # 0 = lower band, 1 = upper band
+    if bb_pct <= 0.0:
+        long_score += 1.5  # Chạm/phá biên dưới
+    elif bb_pct <= 0.15:
+        long_score += 0.8
+    elif bb_pct >= 1.0:
+        short_score += 1.5  # Chạm/phá biên trên
+    elif bb_pct >= 0.85:
+        short_score += 0.8
+        
+    # ── MACD (max 1.5đ) ──
+    if hist_val > 0 and prev_hist <= 0:
+        long_score += 1.5  # Bullish crossover
+    elif hist_val < 0 and prev_hist >= 0:
+        short_score += 1.5  # Bearish crossover
+    elif hist_val > 0 and hist_val > prev_hist:
+        long_score += 0.7  # Momentum tăng
+    elif hist_val > 0:
+        long_score += 0.3
+    elif hist_val < 0 and hist_val < prev_hist:
+        short_score += 0.7  # Momentum giảm
+    elif hist_val < 0:
+        short_score += 0.3
+        
+    # ── ADX - Sức mạnh xu hướng (max 1.0đ) ──
+    if adx_val >= 25:
+        # Xu hướng mạnh → tăng điểm cho bên có DI chiếm ưu thế
+        if plus_di_val > minus_di_val:
+            long_score += min(1.0, (adx_val - 25) / 25 + 0.5)
+        else:
+            short_score += min(1.0, (adx_val - 25) / 25 + 0.5)
+    # ADX thấp (< 20) → thị trường sideway, penalty cả 2 bên
+    if adx_val < 20:
+        long_score *= 0.85
+        short_score *= 0.85
+        
+    # ── Volume Confirmation (max 1.5đ) ──
+    if vol_ratio >= 2.0:
+        # Volume cao bất thường → tăng điểm cho phe đang thắng
+        if long_score > short_score:
+            long_score += 1.5
+        elif short_score > long_score:
+            short_score += 1.5
+    elif vol_ratio >= 1.3:
+        if long_score > short_score:
+            long_score += 0.7
+        elif short_score > long_score:
+            short_score += 0.7
+    elif vol_ratio < 0.5:
+        # Volume quá thấp → tín hiệu yếu, penalty
+        long_score *= 0.8
+        short_score *= 0.8
+        
+    # ═══ PENALTY: Tín hiệu mâu thuẫn ═══
+    # Nếu MACD bearish nhưng RSI bullish (hoặc ngược lại) → giảm điểm
+    macd_bullish = hist_val > 0
+    rsi_bullish = rsi_val < 45
+    macd_bearish = hist_val < 0
+    rsi_bearish = rsi_val > 55
+    if macd_bullish and rsi_bearish:
+        long_score *= 0.85
+    if macd_bearish and rsi_bullish:
+        short_score *= 0.85
+    # Nếu giá trên EMA nhưng RSI quá mua → cảnh báo
+    if close_price > ema21_val and rsi_val >= 70:
+        long_score *= 0.8
+    if close_price < ema21_val and rsi_val <= 30:
+        short_score *= 0.8
+        
+    # ═══ KẾT LUẬN TÍN HIỆU ═══
     signal = 'NEUTRAL'
     confidence = 'Thấp'
     
-    if long_score > short_score:
-        if long_score >= 3.0:
-            signal = 'LONG'
-            confidence = 'Mạnh' if long_score >= 4.0 else 'Trung bình'
-    elif short_score > long_score:
-        if short_score >= 3.0:
-            signal = 'SHORT'
-            confidence = 'Mạnh' if short_score >= 4.0 else 'Trung bình'
+    max_score = max(long_score, short_score)
+    
+    if long_score > short_score and long_score >= 2.5:
+        signal = 'LONG'
+        if long_score >= 6.0:
+            confidence = 'Rất mạnh'
+        elif long_score >= 4.5:
+            confidence = 'Mạnh'
+        elif long_score >= 3.0:
+            confidence = 'Trung bình'
+        else:
+            confidence = 'Yếu'
+    elif short_score > long_score and short_score >= 2.5:
+        signal = 'SHORT'
+        if short_score >= 6.0:
+            confidence = 'Rất mạnh'
+        elif short_score >= 4.5:
+            confidence = 'Mạnh'
+        elif short_score >= 3.0:
+            confidence = 'Trung bình'
+        else:
+            confidence = 'Yếu'
             
-    # Tính TP/SL gợi ý
+    # ═══ TÍNH TP/SL DỰA TRÊN ATR ═══
     tp_price = 0.0
     sl_price = 0.0
-    bb_width = upper_b - lower_b
+    rr_ratio = 2.0  # Risk:Reward = 1:2
     
     # Lấy thông tin làm tròn
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
     
     if signal == 'LONG':
-        # Tính SL dựa trên Bollinger Bands
-        sl_price = close_price - (bb_width * 0.6)
-        # Chỉ bảo vệ để SL không bị âm hoặc lớn hơn giá hiện tại
+        sl_price = close_price - (atr_val * 1.5)
         if sl_price <= 0 or sl_price >= close_price:
-            sl_price = close_price * 0.95  # Mặc định lỗ 5% làm fallback
-            
-        tp_price = close_price + (close_price - sl_price) * 1.5
+            sl_price = close_price * 0.97
+        # SL không vượt quá support gần nhất (nếu support gần)
+        if support > 0 and support < close_price:
+            sl_from_support = support - (atr_val * 0.3)
+            if sl_from_support > 0:
+                sl_price = min(sl_price, sl_from_support)
+        risk = close_price - sl_price
+        tp_price = close_price + (risk * rr_ratio)
         
     elif signal == 'SHORT':
-        # Tính SL dựa trên Bollinger Bands
-        sl_price = close_price + (bb_width * 0.6)
+        sl_price = close_price + (atr_val * 1.5)
         if sl_price <= close_price:
-            sl_price = close_price * 1.05  # Mặc định lỗ 5% làm fallback
-            
-        tp_price = close_price - (sl_price - close_price) * 1.5
+            sl_price = close_price * 1.03
+        # SL không vượt quá resistance gần nhất
+        if resistance > 0 and resistance > close_price:
+            sl_from_resistance = resistance + (atr_val * 0.3)
+            sl_price = max(sl_price, sl_from_resistance)
+        risk = sl_price - close_price
+        tp_price = close_price - (risk * rr_ratio)
         if tp_price <= 0:
-            tp_price = close_price * 0.90  # fallback chốt lời 10%
+            tp_price = close_price * 0.94
         
     if tp_price > 0:
         tp_price = round_price_step(tp_price, tick_size, price_p)
@@ -1272,15 +1453,27 @@ async def analyze_market(session, symbol, interval='1h'):
         
     return {
         'symbol': symbol,
+        'interval': interval,
         'close': close_price,
         'rsi': rsi_val,
+        'stoch_k': stoch_k,
+        'stoch_d': stoch_d,
         'ema9': ema9_val,
         'ema21': ema21_val,
+        'ema50': ema50_val,
         'upper_band': upper_b,
         'lower_band': lower_b,
+        'bb_pct': bb_pct,
         'macd': macd_val,
         'signal_line': sig_val,
         'hist': hist_val,
+        'atr': atr_val,
+        'adx': adx_val,
+        'plus_di': plus_di_val,
+        'minus_di': minus_di_val,
+        'vol_ratio': vol_ratio,
+        'support': support,
+        'resistance': resistance,
         'signal': signal,
         'confidence': confidence,
         'long_score': long_score,
@@ -1356,6 +1549,138 @@ async def get_single_funding_rate(session, symbol):
     return 0.0
 
 
+async def handle_tracking_command(session, chat_id, coin_name):
+    """Bắt đầu theo dõi biến động giá của coin. Gửi thông báo khi biến động >= 5% so với giá tham chiếu trước đó."""
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    
+    # Lấy giá hiện tại làm giá tham chiếu ban đầu
+    url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                await send_telegram_message(session, chat_id, f"❌ Không tìm thấy coin *{symbol}*. Vui lòng kiểm tra lại tên coin.")
+                return
+            data = await resp.json()
+            current_price = float(data.get('price', 0))
+            if current_price <= 0:
+                await send_telegram_message(session, chat_id, f"❌ Không lấy được giá cho *{symbol}*.")
+                return
+    except Exception as e:
+        await send_telegram_message(session, chat_id, f"❌ Lỗi khi lấy giá *{symbol}*: {e}")
+        return
+    
+    if symbol in tracking_coins:
+        tracking_coins[symbol]['chat_ids'].add(chat_id)
+    else:
+        tracking_coins[symbol] = {
+            'ref_price': current_price,
+            'chat_ids': {chat_id}
+        }
+    
+    display = symbol[:-4] if symbol.endswith("USDT") else symbol
+    await send_telegram_message(
+        session, chat_id,
+        f"🔔 *BẮT ĐẦU THEO DÕI: {display}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 Giá tham chiếu: `{format_price(current_price)} USDT`\n"
+        f"📊 Sẽ thông báo khi biến động ≥ *5%* so với giá tham chiếu\n"
+        f"❌ Hủy theo dõi: `/ct {display.lower()}`"
+    )
+
+
+async def handle_cancel_tracking_command(session, chat_id, coin_name=None):
+    """Hủy theo dõi coin."""
+    if coin_name:
+        coin_name = coin_name.upper()
+        symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+        
+        if symbol in tracking_coins and chat_id in tracking_coins[symbol]['chat_ids']:
+            tracking_coins[symbol]['chat_ids'].discard(chat_id)
+            if not tracking_coins[symbol]['chat_ids']:
+                del tracking_coins[symbol]
+            display = symbol[:-4] if symbol.endswith("USDT") else symbol
+            await send_telegram_message(session, chat_id, f"✅ Đã hủy theo dõi *{display}*.")
+        else:
+            await send_telegram_message(session, chat_id, f"❌ Bạn chưa theo dõi coin *{symbol}*.")
+    else:
+        # Hủy tất cả coin đang tracking cho chat_id này
+        removed = []
+        for symbol in list(tracking_coins.keys()):
+            if chat_id in tracking_coins[symbol]['chat_ids']:
+                tracking_coins[symbol]['chat_ids'].discard(chat_id)
+                display = symbol[:-4] if symbol.endswith("USDT") else symbol
+                removed.append(display)
+                if not tracking_coins[symbol]['chat_ids']:
+                    del tracking_coins[symbol]
+        
+        if removed:
+            await send_telegram_message(session, chat_id, f"✅ Đã hủy theo dõi: *{', '.join(removed)}*")
+        else:
+            await send_telegram_message(session, chat_id, "❌ Bạn chưa theo dõi coin nào.")
+
+
+async def tracking_price_loop(app):
+    """Background loop kiểm tra giá các coin đang tracking mỗi 30 giây."""
+    await asyncio.sleep(5)  # Chờ khởi tạo
+    while True:
+        try:
+            if not tracking_coins:
+                await asyncio.sleep(15)
+                continue
+            
+            session = app['session']
+            symbols_to_check = list(tracking_coins.keys())
+            
+            for symbol in symbols_to_check:
+                if symbol not in tracking_coins:
+                    continue
+                    
+                url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                        current_price = float(data.get('price', 0))
+                        if current_price <= 0:
+                            continue
+                except Exception:
+                    continue
+                
+                ref_price = tracking_coins[symbol]['ref_price']
+                change_pct = ((current_price - ref_price) / ref_price) * 100
+                
+                if abs(change_pct) >= 5.0:
+                    # Cập nhật giá tham chiếu mới
+                    tracking_coins[symbol]['ref_price'] = current_price
+                    
+                    display = symbol[:-4] if symbol.endswith("USDT") else symbol
+                    direction = "📈 TĂNG" if change_pct > 0 else "📉 GIẢM"
+                    emoji = "🟢" if change_pct > 0 else "🔴"
+                    
+                    msg = (
+                        f"🔔 *CẢNH BÁO BIẾN ĐỘNG: {display}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{direction} {emoji} *{change_pct:+.2f}%*\n"
+                        f"💵 Giá hiện tại: `{format_price(current_price)} USDT`\n"
+                        f"📊 Giá tham chiếu cũ: `{format_price(ref_price)} USDT`\n"
+                        f"🔄 Giá tham chiếu mới: `{format_price(current_price)} USDT`"
+                    )
+                    
+                    for cid in list(tracking_coins.get(symbol, {}).get('chat_ids', set())):
+                        try:
+                            await send_telegram_message(session, cid, msg)
+                        except Exception as e:
+                            logger.error(f"Lỗi gửi tracking alert đến {cid}: {e}")
+            
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Lỗi trong tracking_price_loop: {e}")
+            await asyncio.sleep(30)
+
 async def handle_analyze_command(session, chat_id, coin_name=None):
     """
     Xử lý câu lệnh phân tích kỹ thuật và quét tín hiệu.
@@ -1367,13 +1692,21 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
         loading_msg_id = await send_telegram_message(
             session,
             chat_id,
-            f"⏳ Đang phân tích kỹ thuật cho *{symbol}* (khung 1h)..."
+            f"⏳ Đang phân tích kỹ thuật đa khung thời gian cho *{symbol}*..."
         )
         
         try:
+            # Phân tích đa khung thời gian (MTF): 15m, 1h, 4h
             funding_task = asyncio.create_task(get_single_funding_rate(session, symbol))
-            res = await analyze_market(session, symbol, interval='1h')
+            res_15m_task = asyncio.create_task(analyze_market(session, symbol, interval='15m'))
+            res_1h_task = asyncio.create_task(analyze_market(session, symbol, interval='1h'))
+            res_4h_task = asyncio.create_task(analyze_market(session, symbol, interval='4h'))
+            
+            res_15m = await res_15m_task
+            res = await res_1h_task  # Khung chính
+            res_4h = await res_4h_task
             funding_rate = await funding_task
+            
             if loading_msg_id:
                 await delete_telegram_message(session, chat_id, loading_msg_id)
                 
@@ -1387,34 +1720,74 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 
             price_str = format_price(res['close'])
             funding_line = f"⏳ Funding Rate: `{funding_rate * 100:+.4f}%`\n" if abs(funding_rate) >= 0.005 else ""
-            rsi_str = f"{res['rsi']:.1f}"
-            ema9_str = format_price(res['ema9'])
-            ema21_str = format_price(res['ema21'])
-            upper_str = format_price(res['upper_band'])
-            lower_str = format_price(res['lower_band'])
-            macd_hist_str = f"{res['hist']:+,.4f}".rstrip('0').rstrip('.')
             
-            rsi_desc = "Quá bán (Bullish)" if res['rsi'] <= 30 else ("Quá mua (Bearish)" if res['rsi'] >= 70 else "Trung tính")
-            ema_desc = "Tăng (Bullish)" if res['close'] > res['ema9'] > res['ema21'] else ("Giảm (Bearish)" if res['close'] < res['ema9'] < res['ema21'] else "Trung tính")
-            bb_desc = "Chạm biên dưới (Bullish)" if res['close'] <= res['lower_band'] else ("Chạm biên trên (Bearish)" if res['close'] >= res['upper_band'] else "Trung tính")
+            # Mô tả chỉ báo
+            rsi_str = f"{res['rsi']:.1f}"
+            rsi_desc = "Quá bán 🟢" if res['rsi'] <= 30 else ("Quá mua 🔴" if res['rsi'] >= 70 else "Trung tính")
+            
+            stoch_str = f"K:{res['stoch_k']:.1f} D:{res['stoch_d']:.1f}"
+            stoch_desc = "Quá bán 🟢" if res['stoch_k'] <= 20 else ("Quá mua 🔴" if res['stoch_k'] >= 80 else "Trung tính")
+            
+            if res['close'] > res['ema9'] > res['ema21'] > res['ema50']:
+                ema_desc = "Uptrend 🟢"
+            elif res['close'] > res['ema9'] > res['ema21']:
+                ema_desc = "Tăng nhẹ"
+            elif res['close'] < res['ema9'] < res['ema21'] < res['ema50']:
+                ema_desc = "Downtrend 🔴"
+            elif res['close'] < res['ema9'] < res['ema21']:
+                ema_desc = "Giảm nhẹ"
+            else:
+                ema_desc = "Sideway"
+            
+            bb_pct_str = f"{res['bb_pct'] * 100:.0f}%"
+            bb_desc = "Chạm biên dưới 🟢" if res['bb_pct'] <= 0.05 else ("Chạm biên trên 🔴" if res['bb_pct'] >= 0.95 else "Trung tính")
+            
+            macd_hist_str = f"{res['hist']:+,.4f}".rstrip('0').rstrip('.')
             macd_desc = "Bullish" if res['hist'] > 0 else "Bearish"
             
-            sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL (Đứng ngoài)")
-            conf_color = "🟢" if res['confidence'] == 'Mạnh' else ("🟡" if res['confidence'] == 'Trung bình' else "⚪")
+            adx_str = f"{res['adx']:.1f}"
+            adx_desc = "Trending mạnh 🔥" if res['adx'] >= 40 else ("Trending" if res['adx'] >= 25 else "Sideway ⚠️")
+            
+            atr_str = format_price(res['atr'])
+            atr_pct = (res['atr'] / res['close']) * 100
+            
+            vol_desc = "Rất cao 🔥" if res['vol_ratio'] >= 2.0 else ("Cao" if res['vol_ratio'] >= 1.3 else ("Thấp ⚠️" if res['vol_ratio'] < 0.5 else "Bình thường"))
+            
+            sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL")
+            conf_map = {'Rất mạnh': '🔥🔥', 'Mạnh': '🔥', 'Trung bình': '🟡', 'Yếu': '⚪', 'Thấp': '⚪'}
+            conf_icon = conf_map.get(res['confidence'], '⚪')
             
             msg = (
-                f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol} (1h)*\n"
+                f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"💵 Giá hiện tại: `*{price_str} USDT*`\n"
+                f"💵 Giá hiện tại: `{price_str} USDT`\n"
                 f"{funding_line}"
-                f"\n🔍 *Các chỉ báo chính:*\n"
+                f"\n🔍 *Chỉ báo chính (1h):*\n"
                 f"• *RSI (14):* `{rsi_str}` ➜ _{rsi_desc}_\n"
-                f"• *EMA Trend:* Giá vs EMA9 (`{ema9_str}`) & EMA21 (`{ema21_str}`) ➜ _{ema_desc}_\n"
-                f"• *Bollinger Bands:* Biên `{lower_str}` - `{upper_str}` ➜ _{bb_desc}_\n"
-                f"• *MACD:* Hist `{macd_hist_str}` ➜ _{macd_desc}_\n\n"
-                f"🎯 *KẾT LUẬN TÍN HIỆU:*\n"
-                f"👉 Khuyến nghị: **{sig_emoji}**\n"
-                f"🔥 Độ tin cậy: {conf_color} *{res['confidence']}* (L: `{res['long_score']:.1f}` | S: `{res['short_score']:.1f}`)\n\n"
+                f"• *Stoch RSI:* `{stoch_str}` ➜ _{stoch_desc}_\n"
+                f"• *EMA (9/21/50):* _{ema_desc}_\n"
+                f"• *Bollinger:* `{bb_pct_str}` ➜ _{bb_desc}_\n"
+                f"• *MACD Hist:* `{macd_hist_str}` ➜ _{macd_desc}_\n"
+                f"• *ADX:* `{adx_str}` ➜ _{adx_desc}_\n"
+                f"• *ATR:* `{atr_str}` ({atr_pct:.2f}%)\n"
+                f"• *Volume:* `{res['vol_ratio']:.1f}x` trung bình ➜ _{vol_desc}_\n"
+                f"• *S/R:* Support `{format_price(res['support'])}` | Resistance `{format_price(res['resistance'])}`\n"
+            )
+            
+            # MTF Summary
+            msg += "\n⏱ *Phân tích đa khung (MTF):*\n"
+            for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h)]:
+                if tf_res:
+                    tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
+                    msg += f"• *{tf_name}:* {tf_sig} ({tf_res['confidence']}) | L:`{tf_res['long_score']:.1f}` S:`{tf_res['short_score']:.1f}`\n"
+                else:
+                    msg += f"• *{tf_name}:* ❌ Không có dữ liệu\n"
+            
+            # Kết luận
+            msg += (
+                f"\n🎯 *KẾT LUẬN (Khung 1h):*\n"
+                f"👉 Khuyến nghị: *{sig_emoji}*\n"
+                f"🔥 Độ tin cậy: {conf_icon} *{res['confidence']}* (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
             )
             
             if res['signal'] != 'NEUTRAL':
@@ -1422,14 +1795,18 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 sl_str = format_price(res['sl'])
                 tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                 sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+                risk = abs(res['close'] - res['sl'])
+                reward = abs(res['tp'] - res['close'])
+                rr = reward / (risk + 1e-10)
                 msg += (
-                    f"🛡️ *Kế hoạch giao dịch gợi ý:*\n"
+                    f"\n🛡️ *Kế hoạch giao dịch gợi ý:*\n"
                     f"• *Entry:* quanh `{price_str} USDT`\n"
                     f"• *Target TP:* `{tp_str} USDT` ({tp_change:+.2f}%)\n"
-                    f"• *Stop Loss:* `{sl_str} USDT` ({sl_change:+.2f}%)"
+                    f"• *Stop Loss:* `{sl_str} USDT` ({sl_change:+.2f}%)\n"
+                    f"• *Risk:Reward =* `1:{rr:.1f}`"
                 )
             else:
-                msg += "💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
+                msg += "\n💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
                 
             await send_telegram_message(session, chat_id, msg)
             
@@ -1438,7 +1815,6 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             if loading_msg_id:
                 await delete_telegram_message(session, chat_id, loading_msg_id)
             await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi phân tích: {e}")
-            
     else:
         loading_msg_id = await send_telegram_message(
             session,
@@ -1468,13 +1844,15 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
-                    conf = "Mạnh 🔥" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    conf = "Rất mạnh 🔥🔥" if res['confidence'] == 'Rất mạnh' else ("Mạnh 🔥" if res['confidence'] == 'Mạnh' else res['confidence'])
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+                    adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
+                    vol_str = f"{res['vol_ratio']:.1f}x" if 'vol_ratio' in res else "?"
                     msg_lines.append(
-                        f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
-                        f"   • Khuyến nghị: *LONG* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
+                        f"{i}. *{coin}* ➜ `{price_str}` | RSI `{rsi_str}` | ADX `{adx_str}` | Vol `{vol_str}`\n"
+                        f"   • *LONG* ({conf}) | Score: `{res['long_score']:.1f}`\n"
+                        f"   • TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                 msg_lines.append("")
                 
@@ -1487,13 +1865,15 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
-                    conf = "Mạnh ⚡" if res['confidence'] == 'Mạnh' else "Trung bình"
+                    conf = "Rất mạnh ⚡⚡" if res['confidence'] == 'Rất mạnh' else ("Mạnh ⚡" if res['confidence'] == 'Mạnh' else res['confidence'])
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+                    adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
+                    vol_str = f"{res['vol_ratio']:.1f}x" if 'vol_ratio' in res else "?"
                     msg_lines.append(
-                        f"{i}. *{coin}* ➜ Price: `{price_str}` (RSI: `{rsi_str}`)\n"
-                        f"   • Khuyến nghị: *SHORT* (Độ tin cậy: `{conf}`)\n"
-                        f"   • Gợi ý: TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
+                        f"{i}. *{coin}* ➜ `{price_str}` | RSI `{rsi_str}` | ADX `{adx_str}` | Vol `{vol_str}`\n"
+                        f"   • *SHORT* ({conf}) | Score: `{res['short_score']:.1f}`\n"
+                        f"   • TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                     
             if not has_signals:
@@ -2059,42 +2439,15 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 order_id = data.get('orderId')
                 pnl_emoji = "🟢" if side_type == 'LONG' else "🔴"
                 
-                if is_limit:
-                    msg = (
-                        f"⏳ *TẠO LỆNH LIMIT THÀNH CÔNG!*\n"
-                        f"----------------------------------\n"
-                        f"🪙 Cặp: *{symbol}*\n"
-                        f"⚡ Lệnh: {pnl_emoji} *{side_type} (LIMIT)*\n"
-                        f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
-                        f"💵 Giá đặt Limit: *{format_price(limit_price)} USDT*\n"
-                        f"📊 Volume lệnh: *{volume:,.2f} USDT*\n"
-                        f"🔢 Số lượng: *{quantity} {coin_name}*\n"
-                        f"🆔 Order ID: `{order_id}`"
-                    )
-                else:
-                    # avg_price = float(data.get('avgPrice', 0))
-                    # if avg_price == 0:
-                    #     cum_quote = float(data.get('cumQuote', 0))
-                    #     executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
-                    #     if executed_qty > 0:
-                    #         avg_price = cum_quote / executed_qty
-                    # execute_qty = float(data.get('executedQty', 0))
-                    # actual_volume = execute_qty * avg_price
-                    # actual_margin = actual_volume / max_leverage
-                    
-                    # msg = (
-                    #     f"✅ *VÀO LỆNH MARKET THÀNH CÔNG!*\n"
-                    #     f"----------------------------------\n"
-                    #     f"🪙 Cặp: *{symbol}*\n"
-                    #     f"⚡ Lệnh: {pnl_emoji} *{side_type} (MARKET)*\n"
-                    #     f"⚙️ Đòn bẩy áp dụng: *{max_leverage}x* (Tối đa)\n"
-                    #     f"📊 Volume khớp: *{actual_volume:,.2f} USDT*\n"
-                    #     f"💵 Kí quỹ ước tính (Margin): ~*{actual_margin:,.4f} USDT*\n"
-                    #     f"🔢 Số lượng: *{execute_qty} {coin_name}*\n"
-                    #     f"💵 Giá khớp trung bình: *{format_price(avg_price)} USDT*\n"
-                    #     f"🆔 Order ID: `{order_id}`"
-                    # )
-                    pass
+                msg = ""
+                if not is_limit:
+                    avg_price = float(data.get('avgPrice', 0))
+                    if avg_price == 0:
+                        cum_quote = float(data.get('cumQuote', 0))
+                        executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
+                        if executed_qty > 0:
+                            avg_price = cum_quote / executed_qty
+                    execute_qty = float(data.get('executedQty', 0))
                 
                 tp_sl_msg_parts = []
 
@@ -2220,7 +2573,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                         tp_sl_msg_parts.append(f"❌ *Lỗi đặt SL:* `{e}`")
 
                 if tp_sl_msg_parts:
-                    msg += "\n\n" + "\n".join(tp_sl_msg_parts)
+                    msg = "\n".join(tp_sl_msg_parts)
                     
                     if any("GTE" in r or "closePosition" in r for r in tp_sl_msg_parts):
                         msg += (
@@ -2229,8 +2582,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             f"Khi bạn đặt TP/SL mà cả TP và SL đều nằm cùng một phía so với giá hiện tại (cả hai đều cao hơn hoặc đều thấp hơn giá thị trường), chúng sẽ trùng điều kiện kích hoạt (GTE/LTE) dẫn đến lệnh thứ hai bị từ chối.\n"
                             f"👉 *Giải pháp:* Cài đặt TP/SL khi giá hiện tại nằm giữa khoảng TP và SL, hoặc hủy bớt lệnh cũ trên app Binance rồi thử lại."
                         )
-
-                await send_telegram_message(session, chat_id, msg)
+                    await send_telegram_message(session, chat_id, msg)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
                 code_err = data.get('code', -1)
@@ -2665,19 +3017,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
                 data = await resp.json()
                 if resp.status == 200:
                     order_id = data.get('orderId')
-                    pnl_emoji = "🟢" if is_long else "🔴"
-                    await send_telegram_message(
-                        session, 
-                        chat_id, 
-                        f"✅ *ĐẶT LỆNH LIMIT DCA THÀNH CÔNG!*\n"
-                        f"----------------------------------\n"
-                        f"🪙 Cặp: *{symbol}*\n"
-                        f"⚡ DCA vị thế: {pnl_emoji} *{pos_display}*\n"
-                        f"💵 Giá đặt DCA Limit: *{format_price(dca_price)} USDT*\n"
-                        f"📊 Volume DCA: *{volume:,.2f} USDT*\n"
-                        f"🔢 Số lượng DCA thêm: *{quantity_dca} {coin_name}*\n"
-                        f"🆔 Order ID: `{order_id}`"
-                    )
+                    logger.info(f"Đặt lệnh DCA Limit thành công cho {symbol}: orderId={order_id}")
                 else:
                     msg_err = data.get('msg', 'Lỗi không xác định')
                     code_err = data.get('code', -1)
@@ -2833,32 +3173,47 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
-        await send_telegram_message(
-            session,
-            chat_id,
-            f"🔄 Đang gửi lệnh đóng vị thế MARKET cho *{symbol}*..."
-        )
         async with session.post(url, headers=headers) as resp:
             data = await resp.json()
             if resp.status == 200:
-                avg_price = float(data.get('avgPrice', 0))
-                if avg_price == 0:
-                    cum_quote = float(data.get('cumQuote', 0))
-                    executed_qty = float(data.get('executedQty', 0)) or float(data.get('cumQty', 0))
-                    if executed_qty > 0:
-                        avg_price = cum_quote / executed_qty
-                pnl_emoji = "🟢" if is_long else "🔴"
-                display_side = "LONG" if is_long else "SHORT"
-                await send_telegram_message(
-                    session,
-                    chat_id,
-                    f"✅ *ĐÓNG VỊ THẾ THÀNH CÔNG!*\n"
-                    f"----------------------------------\n"
-                    f"🪙 Cặp: *{symbol}*\n"
-                    f"⚡ Đã đóng vị thế: {pnl_emoji} *{display_side} (MARKET)*\n"
-                    f"🔢 Số lượng đã đóng: *{abs_amt}*\n"
-                    f"💵 Giá khớp trung bình: *{format_price(avg_price)} USDT*"
-                )
+                logger.info(f"Đã gửi lệnh đóng vị thế thành công cho {symbol}")
+                
+                # Tự động hủy toàn bộ các lệnh DCA đang mở của symbol đó
+                try:
+                    timestamp_dca = int(time.time() * 1000)
+                    params_dca = [
+                        f"symbol={symbol}",
+                        f"timestamp={timestamp_dca}"
+                    ]
+                    query_dca = "&".join(params_dca)
+                    sig_dca = get_binance_signature(query_dca, api_secret)
+                    url_dca = f"https://fapi.binance.com/fapi/v1/openOrders?{query_dca}&signature={sig_dca}"
+                    
+                    async with session.get(url_dca, headers=headers) as resp_dca:
+                        if resp_dca.status == 200:
+                            orders_dca = await resp_dca.json()
+                            if isinstance(orders_dca, list):
+                                for order in orders_dca:
+                                    client_order_id = order.get('clientOrderId', '')
+                                    if "dca" in client_order_id.lower():
+                                        order_id = order.get('orderId')
+                                        if order_id:
+                                            del_timestamp = int(time.time() * 1000)
+                                            del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
+                                            del_sig = get_binance_signature(del_query, api_secret)
+                                            del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
+                                            
+                                            async with session.delete(del_url, headers=headers) as del_resp:
+                                                del_data = await del_resp.json()
+                                                if del_resp.status == 200:
+                                                    logger.info(f"Đã tự động hủy lệnh DCA cũ: orderId={order_id} của {symbol}")
+                                                else:
+                                                    logger.warning(f"Không thể hủy lệnh DCA cũ: {del_data.get('msg')}")
+                        else:
+                            body = await resp_dca.text()
+                            logger.error(f"Lỗi lấy openOrders để hủy DCA: HTTP {resp_dca.status} - {body}")
+                except Exception as e:
+                    logger.error(f"Lỗi trong quá trình tự động hủy lệnh DCA khi đóng vị thế: {e}")
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
                 code_err = data.get('code', -1)
@@ -2911,7 +3266,8 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq'
+            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
+            '/tracking', '/t', '/ct', '/canceltracking'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -2969,6 +3325,8 @@ async def telegram_webhook_handler(request):
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD).\n"
+            "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
+            "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
@@ -3203,6 +3561,23 @@ async def telegram_webhook_handler(request):
     elif command_base == '/liq':
         await handle_liq_command(request.app['session'], chat_id)
         
+    elif command_base in ('/tracking', '/t'):
+        parts = text.split()
+        if len(parts) < 2:
+            await send_telegram_message(
+                request.app['session'],
+                chat_id,
+                "❌ Sai cú pháp!\nSử dụng: `/t <coin>`\nVí dụ: `/t btc`"
+            )
+        else:
+            coin_name = parts[1]
+            await handle_tracking_command(request.app['session'], chat_id, coin_name)
+    
+    elif command_base in ('/ct', '/canceltracking'):
+        parts = text.split()
+        coin_name = parts[1] if len(parts) > 1 else None
+        await handle_cancel_tracking_command(request.app['session'], chat_id, coin_name)
+        
     return web.Response(status=200)
 
 
@@ -3254,6 +3629,9 @@ async def on_startup(app):
     app['auto_pos_task'] = asyncio.create_task(
         auto_pos_sender_loop(app)
     )
+    app['tracking_price_task'] = asyncio.create_task(
+        tracking_price_loop(app)
+    )
 
 async def on_cleanup(app):
     logger.info("Đang giải phóng tài nguyên...")
@@ -3263,6 +3641,8 @@ async def on_cleanup(app):
         app['mark_price_task'].cancel()
     if 'auto_pos_task' in app:
         app['auto_pos_task'].cancel()
+    if 'tracking_price_task' in app:
+        app['tracking_price_task'].cancel()
         
     if 'session' in app:
         await app['session'].close()
