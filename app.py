@@ -379,7 +379,7 @@ async def binance_user_data_stream(session, api_key):
                                     f"🆔 Order ID: `{order_id}`"
                                 )
                                 
-                            # 2. Xử lý các lệnh giao dịch khớp hoàn toàn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
+                            # 2. Xử lý các lệnh giao dịch khớp hoàn toànn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
                             elif status in ('FILLED', 'NEW', 'CANCELED'):
                                 # Tránh gửi thông báo NEW cho các lệnh không phải LIMIT (như MARKET, TP, SL lúc mới tạo)
                                 if status == 'NEW' and order_type != 'LIMIT':
