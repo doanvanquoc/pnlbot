@@ -1754,8 +1754,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             vol_desc = "Rất cao 🔥" if res['vol_ratio'] >= 2.0 else ("Cao" if res['vol_ratio'] >= 1.3 else ("Thấp ⚠️" if res['vol_ratio'] < 0.5 else "Bình thường"))
             
             sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL")
-            conf_map = {'Rất mạnh': '🔥🔥', 'Mạnh': '🔥', 'Trung bình': '🟡', 'Yếu': '⚪', 'Thấp': '⚪'}
-            conf_icon = conf_map.get(res['confidence'], '⚪')
+            conf_map = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung bình': '⭐⭐⭐', 'Yếu': '⭐⭐', 'Thấp': '⭐'}
+            conf_icon = conf_map.get(res['confidence'], '⭐')
             
             msg = (
                 f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol}*\n"
@@ -1779,7 +1779,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h)]:
                 if tf_res:
                     tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
-                    msg += f"• *{tf_name}:* {tf_sig} ({tf_res['confidence']}) | L:`{tf_res['long_score']:.1f}` S:`{tf_res['short_score']:.1f}`\n"
+                    tf_conf_star = conf_map.get(tf_res['confidence'], '⭐')
+                    msg += f"• *{tf_name}:* {tf_sig} ({tf_conf_star}) | L:`{tf_res['long_score']:.1f}` S:`{tf_res['short_score']:.1f}`\n"
                 else:
                     msg += f"• *{tf_name}:* ❌ Không có dữ liệu\n"
             
@@ -1787,7 +1788,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             msg += (
                 f"\n🎯 *KẾT LUẬN (Khung 1h):*\n"
                 f"👉 Khuyến nghị: *{sig_emoji}*\n"
-                f"🔥 Độ tin cậy: {conf_icon} *{res['confidence']}* (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
+                f"🔥 Độ tin cậy: {conf_icon} (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
             )
             
             if res['signal'] != 'NEUTRAL':
@@ -1835,6 +1836,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             
             has_signals = False
             
+            conf_map = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung bình': '⭐⭐⭐', 'Yếu': '⭐⭐', 'Thấp': '⭐'}
             if long_signals:
                 has_signals = True
                 msg_lines.append("🚀 *CƠ HỘI LONG (Tỉ lệ thắng cao):*")
@@ -1844,7 +1846,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
-                    conf = "Rất mạnh 🔥🔥" if res['confidence'] == 'Rất mạnh' else ("Mạnh 🔥" if res['confidence'] == 'Mạnh' else res['confidence'])
+                    conf = conf_map.get(res['confidence'], '⭐')
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
@@ -1865,7 +1867,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
-                    conf = "Rất mạnh ⚡⚡" if res['confidence'] == 'Rất mạnh' else ("Mạnh ⚡" if res['confidence'] == 'Mạnh' else res['confidence'])
+                    conf = conf_map.get(res['confidence'], '⭐')
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
                     adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
