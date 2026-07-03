@@ -1486,6 +1486,7 @@ async def analyze_market(session, symbol, interval='1h'):
 async def scan_market_signals(session):
     """
     Quét qua top 100 coin theo volume 24h để tìm cơ hội giao dịch có tỉ lệ thắng cao.
+    Chỉ trả về các tín hiệu có độ tin cậy từ 4 sao trở lên (Mạnh và Rất mạnh).
     """
     url_ticker = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     headers = {
@@ -1523,10 +1524,12 @@ async def scan_market_signals(session):
     
     for res in results:
         if isinstance(res, dict) and res.get('signal') in ('LONG', 'SHORT'):
-            if res['signal'] == 'LONG':
-                long_signals.append(res)
-            else:
-                short_signals.append(res)
+            # Chỉ lấy các tín hiệu có độ tin cậy từ Mạnh (4 sao) trở lên
+            if res['confidence'] in ('Mạnh', 'Rất mạnh'):
+                if res['signal'] == 'LONG':
+                    long_signals.append(res)
+                else:
+                    short_signals.append(res)
                 
     # Sắp xếp tín hiệu theo điểm số từ cao xuống thấp để chọn cơ hội tốt nhất
     long_signals.sort(key=lambda x: x['long_score'], reverse=True)
@@ -1684,6 +1687,7 @@ async def tracking_price_loop(app):
 async def handle_analyze_command(session, chat_id, coin_name=None):
     """
     Xử lý câu lệnh phân tích kỹ thuật và quét tín hiệu.
+    Chỉ trả về các tín hiệu có độ tin cậy từ 4 sao trở lên (Mạnh và Rất mạnh).
     """
     if coin_name:
         coin_name = coin_name.upper()
@@ -1791,7 +1795,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 f"🔥 Độ tin cậy: {conf_icon} (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
             )
             
-            if res['signal'] != 'NEUTRAL':
+            if res['signal'] != 'NEUTRAL' and res['confidence'] in ('Mạnh', 'Rất mạnh'):
                 tp_str = format_price(res['tp'])
                 sl_str = format_price(res['sl'])
                 tp_change = ((res['tp'] - res['close']) / res['close']) * 100
@@ -1807,7 +1811,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     f"• *Risk:Reward =* `1:{rr:.1f}`"
                 )
             else:
-                msg += "\n💡 *Gợi ý:* Thị trường chưa có xu hướng rõ ràng, nên kiên nhẫn đứng ngoài quan sát thêm."
+                msg += "\n💡 *Gợi ý:* Tín hiệu chưa đủ mạnh (dưới 4 sao) hoặc thị trường chưa có xu hướng rõ ràng. Nên kiên nhẫn đứng ngoài quan sát thêm."
                 
             await send_telegram_message(session, chat_id, msg)
             
@@ -1820,7 +1824,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
         loading_msg_id = await send_telegram_message(
             session,
             chat_id,
-            "🔍 Đang quét thị trường tìm cơ hội giao dịch tỉ lệ thắng cao..."
+            "🔍 Đang quét thị trường tìm cơ hội giao dịch tỉ lệ thắng cao (chỉ hiển thị tín hiệu 4-5 sao)..."
         )
         
         try:
@@ -1831,7 +1835,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             msg_lines = [
                 "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                "Dưới đây là các coin trong Top 100 Volume 24h có tín hiệu tốt nhất hiện tại (RSI, EMA, Bollinger, MACD):\n"
+                "📌 *Chỉ hiển thị tín hiệu có độ tin cậy 4-5 sao (Mạnh - Rất mạnh)*",
+                ""
             ]
             
             has_signals = False
@@ -1879,8 +1884,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     )
                     
             if not has_signals:
-                msg_lines.append("⬜ *Hiện tại chưa phát hiện tín hiệu LONG/SHORT rõ rệt từ các coin phổ biến.*")
-                msg_lines.append("Thị trường đang trong giai đoạn sideway. Bạn nên kiên nhẫn đứng ngoài quan sát.")
+                msg_lines.append("⬜ *Hiện tại không phát hiện tín hiệu 4-5 sao nào từ các coin phổ biến.*")
+                msg_lines.append("Thị trường đang trong giai đoạn sideway hoặc chưa có tín hiệu mạnh. Bạn nên kiên nhẫn đứng ngoài quan sát thêm.")
                 
             msg_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             msg_lines.append("💡 *Mẹo:* Sử dụng `/analyze <coin>` để phân tích chi tiết cho một coin cụ thể.")
@@ -3326,7 +3331,7 @@ async def telegram_webhook_handler(request):
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
-            "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD).\n"
+            "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao.\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
