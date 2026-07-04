@@ -173,6 +173,54 @@ async def unsubscribe_mark_price(symbol):
         except Exception as e:
             logger.error(f"Lỗi khi gửi lệnh UNSUBSCRIBE cho {symbol}: {e}")
 
+# Hàm hủy DCA dùng chung
+async def cancel_dca_orders(session, api_key, api_secret, symbol):
+    """
+    Hủy tất cả các lệnh DCA đang mở của một symbol.
+    """
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        timestamp = int(time.time() * 1000)
+        params = [
+            f"symbol={symbol}",
+            f"timestamp={timestamp}"
+        ]
+        query = "&".join(params)
+        sig = get_binance_signature(query, api_secret)
+        url = f"https://fapi.binance.com/fapi/v1/openOrders?{query}&signature={sig}"
+        
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                orders = await resp.json()
+                if isinstance(orders, list):
+                    cancelled_count = 0
+                    for order in orders:
+                        client_order_id = order.get('clientOrderId', '')
+                        if "dca" in client_order_id.lower():
+                            order_id = order.get('orderId')
+                            if order_id:
+                                del_timestamp = int(time.time() * 1000)
+                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
+                                del_sig = get_binance_signature(del_query, api_secret)
+                                del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
+                                
+                                async with session.delete(del_url, headers=headers) as del_resp:
+                                    del_data = await del_resp.json()
+                                    if del_resp.status == 200:
+                                        cancelled_count += 1
+                                        logger.info(f"Đã tự động hủy lệnh DCA: orderId={order_id} của {symbol}")
+                                    else:
+                                        logger.warning(f"Không thể hủy lệnh DCA {order_id}: {del_data.get('msg')}")
+                    if cancelled_count > 0:
+                        logger.info(f"Đã hủy {cancelled_count} lệnh DCA của {symbol}")
+                        return True
+            else:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy openOrders để hủy DCA: HTTP {resp.status} - {body}")
+    except Exception as e:
+        logger.error(f"Lỗi trong cancel_dca_orders cho {symbol}: {e}")
+    return False
+
 # Cập nhật cache vị thế cục bộ
 async def update_position_cache(symbol, position_side, amount, entry_price, leverage):
     key = f"{symbol}_{position_side}"
@@ -183,6 +231,26 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
     if amount == 0.0:
         # Vị thế bị đóng hoàn toàn
         if key in positions:
+            # Tự động hủy lệnh DCA khi vị thế đóng (do TP/SL hoặc thanh lý)
+            try:
+                # Lấy session từ context nếu có
+                import sys
+                session = None
+                # Tìm session trong stack frame
+                for frame_info in sys._current_frames().values():
+                    if 'session' in frame_info.f_locals and frame_info.f_locals['session'] is not None:
+                        session = frame_info.f_locals['session']
+                        break
+                
+                if session:
+                    api_key = os.getenv("BINANCE_API_KEY")
+                    api_secret = os.getenv("BINANCE_API_SECRET")
+                    await cancel_dca_orders(session, api_key, api_secret, symbol)
+                else:
+                    logger.warning(f"Không tìm thấy session để hủy DCA cho {symbol}")
+            except Exception as e:
+                logger.error(f"Lỗi khi tự động hủy DCA cho {symbol}: {e}")
+            
             del positions[key]
             notified_thresholds.pop(key, None)
             logger.info(f"Đã đóng vị thế: {key}")
@@ -379,7 +447,7 @@ async def binance_user_data_stream(session, api_key):
                                     f"🆔 Order ID: `{order_id}`"
                                 )
                                 
-                            # 2. Xử lý các lệnh giao dịch khớp hoàn toànn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
+                            # 2. Xử lý các lệnh giao dịch khớp hoàn toàn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
                             elif status in ('FILLED', 'NEW', 'CANCELED'):
                                 # Tránh gửi thông báo NEW cho các lệnh không phải LIMIT (như MARKET, TP, SL lúc mới tạo)
                                 if status == 'NEW' and order_type != 'LIMIT':
@@ -3186,41 +3254,7 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
                 logger.info(f"Đã gửi lệnh đóng vị thế thành công cho {symbol}")
                 
                 # Tự động hủy toàn bộ các lệnh DCA đang mở của symbol đó
-                try:
-                    timestamp_dca = int(time.time() * 1000)
-                    params_dca = [
-                        f"symbol={symbol}",
-                        f"timestamp={timestamp_dca}"
-                    ]
-                    query_dca = "&".join(params_dca)
-                    sig_dca = get_binance_signature(query_dca, api_secret)
-                    url_dca = f"https://fapi.binance.com/fapi/v1/openOrders?{query_dca}&signature={sig_dca}"
-                    
-                    async with session.get(url_dca, headers=headers) as resp_dca:
-                        if resp_dca.status == 200:
-                            orders_dca = await resp_dca.json()
-                            if isinstance(orders_dca, list):
-                                for order in orders_dca:
-                                    client_order_id = order.get('clientOrderId', '')
-                                    if "dca" in client_order_id.lower():
-                                        order_id = order.get('orderId')
-                                        if order_id:
-                                            del_timestamp = int(time.time() * 1000)
-                                            del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
-                                            del_sig = get_binance_signature(del_query, api_secret)
-                                            del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
-                                            
-                                            async with session.delete(del_url, headers=headers) as del_resp:
-                                                del_data = await del_resp.json()
-                                                if del_resp.status == 200:
-                                                    logger.info(f"Đã tự động hủy lệnh DCA cũ: orderId={order_id} của {symbol}")
-                                                else:
-                                                    logger.warning(f"Không thể hủy lệnh DCA cũ: {del_data.get('msg')}")
-                        else:
-                            body = await resp_dca.text()
-                            logger.error(f"Lỗi lấy openOrders để hủy DCA: HTTP {resp_dca.status} - {body}")
-                except Exception as e:
-                    logger.error(f"Lỗi trong quá trình tự động hủy lệnh DCA khi đóng vị thế: {e}")
+                await cancel_dca_orders(session, api_key, api_secret, symbol)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
                 code_err = data.get('code', -1)
