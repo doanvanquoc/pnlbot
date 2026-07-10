@@ -438,9 +438,13 @@ async def binance_user_data_stream(session, api_key):
                                     pos_display = pos_side
                                     
                                 message = (
-                                    f"💀 *THANH LÝ {symbol} ({pos_display})*\n"
-                                    f"💵 Giá: `{format_price(price)} USDT`\n"
-                                    f"🔢 Size: `{qty}` (~`{notional:,.2f} USDT`)"
+                                    f"🚨🚨 *【CẢNH BÁO THANH LÝ】* 🚨🚨\n"
+                                    f"💀💀💀💀💀💀💀💀💀💀💀💀💀💀\n"
+                                    f"🪙 Cặp: `{symbol}`\n"
+                                    f"💥 Vị thế cháy: 🔴 `{pos_display}`\n"
+                                    f"💵 Giá thanh lý: `{format_price(price)} USDT`\n"
+                                    f"🔢 Số lượng thanh lý: `{qty}` (~`{notional:,.2f} USDT`)\n"
+                                    f"🆔 Order ID: `{order_id}`"
                                 )
                                 
                             # 2. Xử lý các lệnh giao dịch khớp hoàn toàn (FILLED), mới tạo (NEW - chỉ cho LIMIT), hoặc bị hủy (CANCELED)
@@ -480,22 +484,27 @@ async def binance_user_data_stream(session, api_key):
                                     side_display = f"{side} ({pos_side})" if pos_side != 'BOTH' else side
                                     
                                     if status == 'FILLED':
-                                        icon = "🟢"
-                                        action = f"Khớp: {order_type_display} {side_display}"
-                                        price_label = "Giá"
+                                        title = "🔔 *THÔNG BÁO KHỚP LỆNH*"
+                                        status_emoji = "🟢 `FILLED`"
+                                        price_label = "Giá khớp"
                                     elif status == 'NEW':
-                                        icon = "🟡"
-                                        action = f"Đặt: {order_type_display} {side_display}"
-                                        price_label = "Giá"
+                                        title = "⏳ *THÔNG BÁO TẠO LỆNH*"
+                                        status_emoji = "🟡 `NEW` (Chờ khớp)"
+                                        price_label = "Giá đặt"
                                     else: # CANCELED
-                                        icon = "❌"
-                                        action = f"Hủy: {order_type_display} {side_display}"
-                                        price_label = "Giá"
+                                        title = "❌ *THÔNG BÁO HỦY LỆNH*"
+                                        status_emoji = "🔴 `CANCELED`"
+                                        price_label = "Giá đặt"
                                         
                                     msg_lines = [
-                                        f"{icon} *{action} - {symbol}*",
+                                        f"┌──────────────────────────────┐",
+                                        f"   {title}",
+                                        f"└──────────────────────────────┘",
+                                        f"🪙 Cặp: `{symbol}`",
+                                        f"⚡ Loại: `{order_type_display} ({side_display})`",
+                                        f"📊 Trạng thái: {status_emoji}",
                                         f"💵 {price_label}: `{format_price(price)} USDT`",
-                                        f"🔢 Size: `{qty}` (~`{notional:,.2f} USDT`)"
+                                        f"🔢 Số lượng: `{qty}` (~`{notional:,.2f} USDT`)"
                                     ]
                                     
                                     # Thêm PNL đóng nếu có realized_pnl hoặc là lệnh TP/SL/đóng
@@ -505,6 +514,7 @@ async def binance_user_data_stream(session, api_key):
                                         pnl_sign = "+" if total_realized_pnl >= 0 else ""
                                         msg_lines.append(f"💰 PnL đóng: {pnl_emoji} `*{pnl_sign}{total_realized_pnl:,.2f} USDT*`")
                                         
+                                    msg_lines.append(f"🆔 Order ID: `{order_id}`")
                                     message = "\n".join(msg_lines)
 
                             # Dọn dẹp cache nếu lệnh kết thúc bằng cách khác (CANCELED/EXPIRED)
@@ -599,19 +609,25 @@ async def binance_mark_price_stream(session):
                                                         display_symbol = symbol[:-4] if symbol.endswith('USDT') else symbol
                                                         display_side = 'LONG' if side_sign > 0 else 'SHORT'
                                                         
-                                                        pnl_val = pos['unrealizedPnL']
-                                                        pnl_sign = "+" if pnl_val >= 0 else ""
                                                         if direction > 0:
                                                             alert_msg = (
-                                                                f"📈 *{display_symbol} ({display_side}) +{pct_change:.1f}%*\n"
-                                                                f"💵 Giá: `{format_price(mark_price)}` (Entry: `{format_price(entry)}`)\n"
-                                                                f"💰 PnL: `*{pnl_sign}{pnl_val:,.2f} USDT*`"
+                                                                f"📈📈 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📈📈\n"
+                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                                f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
+                                                                f"🟢 Vị thế đã dương *+{pct_change:.1f}%* so với Entry\n"
+                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
+                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
+                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
                                                             )
                                                         else:
                                                             alert_msg = (
-                                                                f"📉 *{display_symbol} ({display_side}) -{abs(pct_change):.1f}%*\n"
-                                                                f"💵 Giá: `{format_price(mark_price)}` (Entry: `{format_price(entry)}`)\n"
-                                                                f"💰 PnL: `*{pnl_sign}{pnl_val:,.2f} USDT*`"
+                                                                f"📉📉 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📉📉\n"
+                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                                                f"🪙 Cặp: `{display_symbol}` ({display_side})\n"
+                                                                f"🔴 Vị thế đã âm *{abs(pct_change):.1f}%* so với Entry\n"
+                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
+                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
+                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
                                                             )
                                                         
                                                         sent_ok = False
@@ -649,7 +665,7 @@ async def auto_pos_sender_loop(app):
                 tz_vn = timezone(timedelta(hours=7))
                 now_str = datetime.now(tz_vn).strftime("%d/%m/%Y %H:%M:%S")
                 
-                text_lines = [f"🕒 *Cập nhật:* `{now_str}`"]
+                text_lines = [f"🕒 *Cập nhật lúc:* `{now_str}`\n"]
                 for key, pos in positions.items():
                     symbol = pos['symbol']
                     side = pos['positionSide']
@@ -663,13 +679,14 @@ async def auto_pos_sender_loop(app):
                     pnl_emoji = "🟩" if pnl >= 0 else "🟥"
                     sign = "+" if pnl >= 0 else ""
                     
-                    pos_text = f"{pnl_emoji} {display_symbol} ({display_side}): *{sign}{pnl:,.2f} USDT*{funding_str}"
+                    pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
                     text_lines.append(pos_text)
                     
+                text_lines.append("----------------------------------")
                 total_pnl = sum(p.get('unrealizedPnL', 0.0) for p in positions.values())
                 pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
                 sign = "+" if total_pnl >= 0 else ""
-                text_lines.append(f"📊 *Tổng PnL: {sign}{total_pnl:,.2f} USDT* {pnl_emoji}")
+                text_lines.append(f"📊 Tổng PnL: *{sign}{total_pnl:,.2f} USDT*")
                 
                 message = "\n\n".join(text_lines)
                 
@@ -724,7 +741,7 @@ async def handle_auto_command(session, chat_id):
         
         # Gửi luôn vị thế hiện tại ngay lập tức và lưu message_id làm tin nhắn auto đầu tiên
         if positions:
-            text_lines = ["🔍 *VỊ THẾ ĐANG MỞ (1P)*"]
+            text_lines = ["🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (1P)*\n----------------------------------"]
             for key, pos in positions.items():
                 symbol = pos['symbol']
                 side = pos['positionSide']
@@ -738,13 +755,14 @@ async def handle_auto_command(session, chat_id):
                 pnl_emoji = "🟩" if pnl >= 0 else "🟥"
                 sign = "+" if pnl >= 0 else ""
                 
-                pos_text = f"{pnl_emoji} {display_symbol} ({display_side}): *{sign}{pnl:,.2f} USDT*{funding_str}"
+                pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
                 text_lines.append(pos_text)
                 
+            text_lines.append("----------------------------------")
             total_pnl = sum(p.get('unrealizedPnL', 0.0) for p in positions.values())
             pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
             sign = "+" if total_pnl >= 0 else ""
-            text_lines.append(f"📊 *Tổng PnL: {sign}{total_pnl:,.2f} USDT* {pnl_emoji}")
+            text_lines.append(f"📊 Tổng PnL: *{sign}{total_pnl:,.2f} USDT*")
             
             message = "\n\n".join(text_lines)
             
@@ -793,8 +811,10 @@ async def handle_pnl_command(session, chat_id):
     sign = "+" if total_pnl >= 0 else ""
     
     message = (
-        f"📊 *PnL: {sign}{total_pnl:,.2f} USDT* {pnl_emoji}\n"
-        f"🔥 Vị thế mở: *{len(positions)}*"
+        f"📊 *TỔNG PNL VỊ THẾ HIỆN TẠI*\n"
+        f"----------------------------------\n"
+        f"💰 Trạng thái: {pnl_emoji} *{sign}{total_pnl:,.2f} USDT*\n"
+        f"🔥 Vị thế đang mở: *{len(positions)}*"
     )
     await send_telegram_message(session, chat_id, message)
 
@@ -804,7 +824,7 @@ async def handle_pos_command(session, chat_id):
         await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
         return
         
-    text_lines = ["🔍 *VỊ THẾ ĐANG MỞ*"]
+    text_lines = ["🔍 *CHI TIẾT VỊ THẾ ĐANG MỞ*\n----------------------------------"]
     
     for key, pos in positions.items():
         symbol = pos['symbol']
@@ -819,13 +839,14 @@ async def handle_pos_command(session, chat_id):
         pnl_emoji = "🟩" if pnl >= 0 else "🟥"
         sign = "+" if pnl >= 0 else ""
         
-        pos_text = f"{pnl_emoji} {display_symbol} ({display_side}): *{sign}{pnl:,.2f} USDT*{funding_str}"
+        pos_text = f"{display_symbol} ({display_side}) ➜ {pnl_emoji} *{sign}{pnl:,.2f} USDT*{funding_str}"
         text_lines.append(pos_text)
         
+    text_lines.append("----------------------------------")
     total_pnl = sum(p.get('unrealizedPnL', 0.0) for p in positions.values())
     pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
     sign = "+" if total_pnl >= 0 else ""
-    text_lines.append(f"📊 *Tổng PnL: {sign}{total_pnl:,.2f} USDT* {pnl_emoji}")
+    text_lines.append(f"📊 Tổng PnL: *{sign}{total_pnl:,.2f} USDT*")
     
     message = "\n\n".join(text_lines)
     await send_telegram_message(session, chat_id, message)
@@ -932,12 +953,13 @@ async def handle_balance_command(session, chat_id):
                 pnl_sign = "+" if pnl >= 0 else ""
                 
                 message = (
-                     f"💳 *Tài khoản Futures*\n"
-                     f"💰 Số dư ví: *{wallet_bal:,.2f} USDT*\n"
-                     f"📊 PnL mở: {pnl_emoji} *{pnl_sign}{pnl:,.2f} USDT*\n"
-                     f"🛡️ Margin: *{margin_bal:,.2f} USDT*\n"
-                     f"🟢 Khả dụng: *{avail_bal:,.2f} USDT*"
-                 )
+                    f"💳 *THÔNG TIN TÀI KHOẢN FUTURES*\n"
+                    f"----------------------------------\n"
+                    f"💰 Số dư ví: *{wallet_bal:,.2f} USDT*\n"
+                    f"📊 PnL chưa thực hiện: {pnl_emoji} *{pnl_sign}{pnl:,.2f} USDT*\n"
+                    f"🛡️ Số dư ký quỹ (Margin Balance): *{margin_bal:,.2f} USDT*\n"
+                    f"🟢 Khả dụng vào lệnh: *{avail_bal:,.2f} USDT*"
+                )
                 await send_telegram_message(session, chat_id, message)
             else:
                 body = await resp.text()
@@ -978,17 +1000,17 @@ async def handle_top_command(session, chat_id):
                 top_losers = usdt_tickers[-5:]
                 top_losers.reverse()
                 
-                lines = ["🔥 *Top 24h (Futures)*"]
-                 
-                lines.append("🚀 *Top 5 Tăng:*")
+                lines = ["🔥 *TOP BIẾN ĐỘNG TRONG 24H (FUTURES)*\n----------------------------------"]
+                
+                lines.append("🚀 *Top 5 Tăng Mạnh Nhất:*")
                 for i, item in enumerate(top_gainers, 1):
                     formatted_p = format_price(item['price'])
-                    lines.append(f"{i}. {item['symbol']}: *{formatted_p}* (+{item['change']:.2f}%)")
+                    lines.append(f"{i}. {item['symbol']} ➜ *{formatted_p}* (🟢 +{item['change']:.2f}%)")
                     
-                lines.append("\n📉 *Top 5 Giảm:*")
+                lines.append("\n📉 *Top 5 Giảm Mạnh Nhất:*")
                 for i, item in enumerate(top_losers, 1):
                     formatted_p = format_price(item['price'])
-                    lines.append(f"{i}. {item['symbol']}: *{formatted_p}* ({item['change']:.2f}%)")
+                    lines.append(f"{i}. {item['symbol']} ➜ *{formatted_p}* (🔴 {item['change']:.2f}%)")
                 
                 message = "\n".join(lines)
                 await send_telegram_message(session, chat_id, message)
@@ -1071,8 +1093,8 @@ async def handle_history_command(session, chat_id, coin_name=None):
                 display_data = grouped_data[:10]
                 
                 tz_vn = timezone(timedelta(hours=7))
-                lines = ["📜 *Realized PnL Gần Nhất*"]
-                 
+                lines = ["📜 *LỊCH SỬ CHỐT VỊ THẾ GẦN NHẤT (REALIZED PNL)*\n----------------------------------"]
+                
                 total_realized_pnl = 0.0
                 
                 for i, item in enumerate(display_data, 1):
@@ -1083,21 +1105,24 @@ async def handle_history_command(session, chat_id, coin_name=None):
                     total_realized_pnl += income
                     
                     time_dt = datetime.fromtimestamp(time_ms / 1000.0, tz=tz_vn)
-                    time_str = time_dt.strftime("%d/%m %H:%M")
+                    time_str = time_dt.strftime("%d/%m/%Y %H:%M:%S")
                     
                     display_sym = sym[:-4] if sym.endswith("USDT") else sym
                     pnl_emoji = "🟩" if income >= 0 else "🟥"
                     pnl_sign = "+" if income >= 0 else ""
                     
                     lines.append(
-                        f"{i}. *{display_sym}*: {pnl_emoji} `{pnl_sign}{income:,.2f} USDT` ({time_str})"
+                        f"{i}. *{display_sym}* ➜ {pnl_emoji} `{pnl_sign}{income:,.2f} USDT`\n"
+                        f"Thời gian: `{time_str}`"
                     )
                     
+                lines.append("----------------------------------")
                 total_emoji = "🟩" if total_realized_pnl >= 0 else "🟥"
                 total_sign = "+" if total_realized_pnl >= 0 else ""
-                lines.append(f"\n📊 *Tổng ({len(display_data)} lệnh)*: {total_emoji} `{total_sign}{total_realized_pnl:,.2f} USDT`")
+                lines.append(f"📊 *Tổng kết {len(display_data)} vị thế gần nhất:*")
+                lines.append(f"💰 Tổng Realized PnL: {total_emoji} `{total_sign}{total_realized_pnl:,.2f} USDT`")
                 
-                message = "\n".join(lines)
+                message = "\n\n".join(lines)
                 await send_telegram_message(session, chat_id, message)
             else:
                 body = await resp.text()
@@ -1136,7 +1161,7 @@ async def handle_liq_command(session, chat_id):
                     await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
                     return
                     
-                lines = ["💀 *Giá Thanh Lý Vị Thế*"]
+                lines = ["☣️ *GIÁ THANH LÝ CÁC VỊ THẾ ĐANG MỞ*\n----------------------------------"]
                 for p in open_positions:
                     symbol = p.get('symbol')
                     side = p.get('positionSide')
@@ -1627,8 +1652,11 @@ async def handle_tracking_command(session, chat_id, coin_name):
     display = symbol[:-4] if symbol.endswith("USDT") else symbol
     await send_telegram_message(
         session, chat_id,
-        f"🔔 *Theo dõi {display}* (Ref: `{format_price(current_price)} USDT`)\n"
-        f"📊 Biến động ≥ *5%* sẽ báo | Hủy: `/ct {display.lower()}`"
+        f"🔔 *BẮT ĐẦU THEO DÕI: {display}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 Giá tham chiếu: `{format_price(current_price)} USDT`\n"
+        f"📊 Sẽ thông báo khi biến động ≥ *5%* so với giá tham chiếu\n"
+        f"❌ Hủy theo dõi: `/ct {display.lower()}`"
     )
 
 
@@ -1703,8 +1731,12 @@ async def tracking_price_loop(app):
                     emoji = "🟢" if change_pct > 0 else "🔴"
                     
                     msg = (
-                        f"🔔 *{display}* {direction} {emoji} *{change_pct:+.2f}%*\n"
-                        f"💵 Giá: `{format_price(current_price)} USDT` (Cũ: `{format_price(ref_price)}`)"
+                        f"🔔 *CẢNH BÁO BIẾN ĐỘNG: {display}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{direction} {emoji} *{change_pct:+.2f}%*\n"
+                        f"💵 Giá hiện tại: `{format_price(current_price)} USDT`\n"
+                        f"📊 Giá tham chiếu cũ: `{format_price(ref_price)} USDT`\n"
+                        f"🔄 Giá tham chiếu mới: `{format_price(current_price)} USDT`"
                     )
                     
                     for cid in list(tracking_coins.get(symbol, {}).get('chat_ids', set())):
@@ -1798,28 +1830,37 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             conf_icon = conf_map.get(res['confidence'], '⭐')
             
             msg = (
-                f"📊 *Phân tích {symbol}*: `{price_str} USDT`\n"
+                f"📊 *PHÂN TÍCH KỸ THUẬT: {symbol}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💵 Giá hiện tại: `{price_str} USDT`\n"
                 f"{funding_line}"
-                f"• RSI: `{rsi_str}` ({rsi_desc}) | Stoch: `{stoch_str}` ({stoch_desc})\n"
-                f"• EMA: {ema_desc} | Bollinger: `{bb_pct_str}` ({bb_desc})\n"
-                f"• MACD: `{macd_hist_str}` ({macd_desc}) | ADX: `{adx_str}` ({adx_desc})\n"
-                f"• ATR: `{atr_str}` ({atr_pct:.2f}%) | Vol: `{res['vol_ratio']:.1f}x` ({vol_desc})\n"
-                f"• Hỗ trợ/Kháng cự: `{format_price(res['support'])}` / `{format_price(res['resistance'])}`"
+                f"\n🔍 *Chỉ báo chính (1h):*\n"
+                f"• *RSI (14):* `{rsi_str}` ➜ _{rsi_desc}_\n"
+                f"• *Stoch RSI:* `{stoch_str}` ➜ _{stoch_desc}_\n"
+                f"• *EMA (9/21/50):* _{ema_desc}_\n"
+                f"• *Bollinger:* `{bb_pct_str}` ➜ _{bb_desc}_\n"
+                f"• *MACD Hist:* `{macd_hist_str}` ➜ _{macd_desc}_\n"
+                f"• *ADX:* `{adx_str}` ➜ _{adx_desc}_\n"
+                f"• *ATR:* `{atr_str}` ({atr_pct:.2f}%)\n"
+                f"• *Volume:* `{res['vol_ratio']:.1f}x` trung bình ➜ _{vol_desc}_\n"
+                f"• *S/R:* Support `{format_price(res['support'])}` | Resistance `{format_price(res['resistance'])}`\n"
             )
             
             # MTF Summary
-            msg += "\n⏱ *Khung thời gian (MTF):*\n"
+            msg += "\n⏱ *Phân tích đa khung (MTF):*\n"
             for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h)]:
                 if tf_res:
                     tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
                     tf_conf_star = conf_map.get(tf_res['confidence'], '⭐')
-                    msg += f"• *{tf_name}:* {tf_sig} ({tf_conf_star})\n"
+                    msg += f"• *{tf_name}:* {tf_sig} ({tf_conf_star}) | L:`{tf_res['long_score']:.1f}` S:`{tf_res['short_score']:.1f}`\n"
                 else:
-                    msg += f"• *{tf_name}:* ❌ N/A\n"
+                    msg += f"• *{tf_name}:* ❌ Không có dữ liệu\n"
             
             # Kết luận
             msg += (
-                f"\n🎯 *Khuyến nghị (1h):* Khuyên dùng *{sig_emoji}* ({conf_icon})\n"
+                f"\n🎯 *KẾT LUẬN (Khung 1h):*\n"
+                f"👉 Khuyến nghị: *{sig_emoji}*\n"
+                f"🔥 Độ tin cậy: {conf_icon} (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
             )
             
             if res['signal'] != 'NEUTRAL' and res['confidence'] in ('Mạnh', 'Rất mạnh'):
@@ -1831,13 +1872,14 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 reward = abs(res['tp'] - res['close'])
                 rr = reward / (risk + 1e-10)
                 msg += (
-                    f"• Entry: `{price_str}`\n"
-                    f"• TP: `{tp_str}` ({tp_change:+.2f}%)\n"
-                    f"• SL: `{sl_str}` ({sl_change:+.2f}%)\n"
-                    f"• R:R = `1:{rr:.1f}`"
+                    f"\n🛡️ *Kế hoạch giao dịch gợi ý:*\n"
+                    f"• *Entry:* quanh `{price_str} USDT`\n"
+                    f"• *Target TP:* `{tp_str} USDT` ({tp_change:+.2f}%)\n"
+                    f"• *Stop Loss:* `{sl_str} USDT` ({sl_change:+.2f}%)\n"
+                    f"• *Risk:Reward =* `1:{rr:.1f}`"
                 )
             else:
-                msg += "\n💡 Tín hiệu chưa đủ mạnh (dưới 4 sao) hoặc sideway."
+                msg += "\n💡 *Gợi ý:* Tín hiệu chưa đủ mạnh (dưới 4 sao) hoặc thị trường chưa có xu hướng rõ ràng. Nên kiên nhẫn đứng ngoài quan sát thêm."
                 
             await send_telegram_message(session, chat_id, msg)
             
@@ -1859,7 +1901,10 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 await delete_telegram_message(session, chat_id, loading_msg_id)
                 
             msg_lines = [
-                "🔍 *TÍN HIỆU GIAO DỊCH (4-5⭐)*\n"
+                "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "📌 *Chỉ hiển thị tín hiệu có độ tin cậy 4-5 sao (Mạnh - Rất mạnh)*",
+                ""
             ]
             
             has_signals = False
@@ -1867,41 +1912,51 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             conf_map = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung bình': '⭐⭐⭐', 'Yếu': '⭐⭐', 'Thấp': '⭐'}
             if long_signals:
                 has_signals = True
-                msg_lines.append("🚀 *LONG:*")
+                msg_lines.append("🚀 *CƠ HỘI LONG (Tỉ lệ thắng cao):*")
                 for i, res in enumerate(long_signals, 1):
                     coin = res['symbol'][:-4] if res['symbol'].endswith("USDT") else res['symbol']
                     price_str = format_price(res['close'])
+                    rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = conf_map.get(res['confidence'], '⭐')
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+                    adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
+                    vol_str = f"{res['vol_ratio']:.1f}x" if 'vol_ratio' in res else "?"
                     msg_lines.append(
-                        f"{i}. *{coin}*: `{price_str}` ({conf})\n"
-                        f"   TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
+                        f"{i}. *{coin}* ➜ `{price_str}` | RSI `{rsi_str}` | ADX `{adx_str}` | Vol `{vol_str}`\n"
+                        f"   • *LONG* ({conf}) | Score: `{res['long_score']:.1f}`\n"
+                        f"   • TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                 msg_lines.append("")
                 
             if short_signals:
                 has_signals = True
-                msg_lines.append("📉 *SHORT:*")
+                msg_lines.append("📉 *CƠ HỘI SHORT (Tỉ lệ thắng cao):*")
                 for i, res in enumerate(short_signals, 1):
                     coin = res['symbol'][:-4] if res['symbol'].endswith("USDT") else res['symbol']
                     price_str = format_price(res['close'])
+                    rsi_str = f"{res['rsi']:.1f}"
                     tp_str = format_price(res['tp'])
                     sl_str = format_price(res['sl'])
                     conf = conf_map.get(res['confidence'], '⭐')
                     tp_change = ((res['tp'] - res['close']) / res['close']) * 100
                     sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+                    adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
+                    vol_str = f"{res['vol_ratio']:.1f}x" if 'vol_ratio' in res else "?"
                     msg_lines.append(
-                        f"{i}. *{coin}*: `{price_str}` ({conf})\n"
-                        f"   TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
+                        f"{i}. *{coin}* ➜ `{price_str}` | RSI `{rsi_str}` | ADX `{adx_str}` | Vol `{vol_str}`\n"
+                        f"   • *SHORT* ({conf}) | Score: `{res['short_score']:.1f}`\n"
+                        f"   • TP `{tp_str}` ({tp_change:+.2f}%) | SL `{sl_str}` ({sl_change:+.2f}%)"
                     )
                     
             if not has_signals:
-                msg_lines.append("⬜ *Không phát hiện tín hiệu 4-5 sao từ các coin.*")
+                msg_lines.append("⬜ *Hiện tại không phát hiện tín hiệu 4-5 sao nào từ các coin phổ biến.*")
+                msg_lines.append("Thị trường đang trong giai đoạn sideway hoặc chưa có tín hiệu mạnh. Bạn nên kiên nhẫn đứng ngoài quan sát thêm.")
                 
-            msg_lines.append("\n💡 *Mẹo:* `/analyze <coin>` để phân tích chi tiết.")
+            msg_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            msg_lines.append("💡 *Mẹo:* Sử dụng `/analyze <coin>` để phân tích chi tiết cho một coin cụ thể.")
             
             await send_telegram_message(session, chat_id, "\n".join(msg_lines))
             
@@ -2549,7 +2604,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             tp_data = await tp_resp.json()
                             if tp_resp.status == 200:
                                 tp_id = tp_data.get('orderId') or tp_data.get('algoId')
-                                tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời tại *{final_tp_price:,.4f}* (ID: `{tp_id}`)")
+                                tp_sl_msg_parts.append(f"🎯 *TP:* Chốt lời ở giá *{final_tp_price:,.4f}* (Thành công, ID: `{tp_id}`)")
                             else:
                                 tp_err = tp_data.get('msg', 'Lỗi không xác định')
                                 tp_sl_msg_parts.append(f"❌ *Lỗi đặt TP:* `{tp_err}`")
@@ -2585,7 +2640,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                             sl_data = await sl_resp.json()
                             if sl_resp.status == 200:
                                 sl_id = sl_data.get('orderId') or sl_data.get('algoId')
-                                tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ tại *{final_sl_price:,.4f}* (ID: `{sl_id}`)")
+                                tp_sl_msg_parts.append(f"🛡️ *SL:* Cắt lỗ ở giá *{final_sl_price:,.4f}* (Thành công, ID: `{sl_id}`)")
                             else:
                                 sl_err = sl_data.get('msg', 'Lỗi không xác định')
                                 tp_sl_msg_parts.append(f"❌ *Lỗi đặt SL:* `{sl_err}`")
@@ -2596,7 +2651,12 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                     msg = "\n".join(tp_sl_msg_parts)
                     
                     if any("GTE" in r or "closePosition" in r for r in tp_sl_msg_parts):
-                        msg += "\n\n⚠️ Tránh đặt TP/SL cùng một phía so với giá hiện tại (lỗi GTE từ Binance)."
+                        msg += (
+                            f"\n\n⚠️ *Lưu ý lỗi GTE/closePosition từ Binance:*\n"
+                            f"Binance quy định chỉ được phép tồn tại *1 lệnh đóng vị thế (closePosition)* có cùng điều kiện kích hoạt GTE (hoặc LTE).\n"
+                            f"Khi bạn đặt TP/SL mà cả TP và SL đều nằm cùng một phía so với giá hiện tại (cả hai đều cao hơn hoặc đều thấp hơn giá thị trường), chúng sẽ trùng điều kiện kích hoạt (GTE/LTE) dẫn đến lệnh thứ hai bị từ chối.\n"
+                            f"👉 *Giải pháp:* Cài đặt TP/SL khi giá hiện tại nằm giữa khoảng TP và SL, hoặc hủy bớt lệnh cũ trên app Binance rồi thử lại."
+                        )
                     await send_telegram_message(session, chat_id, msg)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
@@ -2611,6 +2671,7 @@ async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     
+    # Chuẩn hóa coin
     coin_name = coin_name.upper()
     symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
     
@@ -2619,22 +2680,36 @@ async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
         if leverage < 1 or leverage > 125:
             raise ValueError()
     except ValueError:
-        await send_telegram_message(session, chat_id, "❌ Đòn bẩy phải là số nguyên từ 1 đến 125.")
+        await send_telegram_message(session, chat_id, "❌ Hệ số đòn bẩy không hợp lệ. Vui lòng nhập số nguyên từ 1 đến 125.")
         return
         
-    ret_leverage = await set_leverage(session, api_key, api_secret, symbol, leverage)
-    if ret_leverage:
-        await send_telegram_message(
-            session, 
-            chat_id, 
-            f"✅ Đã chỉnh đòn bẩy *{symbol}* thành *{ret_leverage}x*"
-        )
-    else:
-        await send_telegram_message(
-            session, 
-            chat_id, 
-            f"❌ Không thể thiết lập đòn bẩy cho *{symbol}*. Vui lòng kiểm tra lại trên Binance."
-        )
+    timestamp = int(time.time() * 1000)
+    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}"
+    signature = get_binance_signature(query_string, api_secret)
+    
+    url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    
+    try:
+        async with session.post(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200:
+                ret_leverage = data.get('leverage')
+                await send_telegram_message(
+                    session, 
+                    chat_id, 
+                    f"✅ *CÀI ĐẶT ĐỒN BẨY THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"⚙️ Đòn bẩy mới: *{ret_leverage}x*"
+                )
+            else:
+                msg_err = data.get('msg', 'Lỗi không xác định')
+                code_err = data.get('code', -1)
+                await send_telegram_message(session, chat_id, f"❌ *Cài đặt đòn bẩy thất bại!*\nBinance báo lỗi: `{msg_err}` (Code: {code_err})")
+    except Exception as e:
+        logger.error(f"Lỗi khi cài đặt đòn bẩy cho {symbol}: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi hệ thống khi cài đặt đòn bẩy: {e}")
 
 
 async def handle_orders_command(session, chat_id):
@@ -2648,6 +2723,7 @@ async def handle_orders_command(session, chat_id):
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
+        # 1. Gọi API lấy toàn bộ giá coin hiện tại và funding rate để map với danh sách lệnh chờ
         prices_map = {}
         funding_map = {}
         try:
@@ -2691,7 +2767,7 @@ async def handle_orders_command(session, chat_id):
                     await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có lệnh chờ (Open Orders) nào trên tài khoản Futures.")
                     return
                 
-                lines = ["⏳ *Lệnh Chờ Khớp*"]
+                lines = ["⏳ *DANH SÁCH LỆNH ĐANG CHỜ KHỚP*\n----------------------------------"]
                 for i, order in enumerate(data, 1):
                     symbol = order.get('symbol')
                     order_id = order.get('orderId')
@@ -2720,18 +2796,19 @@ async def handle_orders_command(session, chat_id):
                         else:
                             current_price = None
                     
-                    price_line = f"   • Giá đặt: `{price:,.4f} USDT` "
+                    price_line = f"   • Giá đặt: *{price:,.4f} USDT*\n"
                     if current_price is not None:
-                        price_line += f"| Hiện tại: `{current_price:,.4f} USDT` "
+                        price_line += f"   • Giá hiện tại: *{current_price:,.4f} USDT*\n"
                         
                     funding_rate = funding_map.get(symbol, 0.0)
-                    funding_str = f"   • FR: *{funding_rate * 100:+.4f}%*\n" if abs(funding_rate) >= 0.005 else ""
+                    funding_str = f"   • Funding Rate: *{funding_rate * 100:+.4f}%*\n" if abs(funding_rate) >= 0.005 else ""
                     
                     lines.append(
-                        f"{i}. {display_symbol} ({emoji} {display_side} - {order_type})\n"
-                        f"{price_line.strip()}\n"
+                        f"{i}. {display_symbol} ({emoji} *{display_side} - {order_type}*)\n"
+                        f"{price_line}"
                         f"{funding_str}"
-                        f"   • Size: `{qty}` (~`{notional:,.2f} USDT`) | ID: `{order_id}`"
+                        f"   • Số lượng: *{qty}* (~*{notional:,.2f} USDT*)\n"
+                        f"   • ID: `{order_id}`\n"
                     )
                 
                 message = "\n".join(lines)
@@ -2764,6 +2841,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
 
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
 
+    # Không ép kiểu float ngay lập tức vì hỗ trợ định dạng % (phần trăm) và u (USDT PnL)
     if tp_price_str:
         tp_price_str = tp_price_str.strip()
     if sl_price_str:
@@ -2788,6 +2866,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
         order_side = 'SELL' if is_long else 'BUY'
         pos_display = 'LONG' if is_long else 'SHORT'
         
+        # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
         final_tp_price = None
         if tp_price_str:
             try:
@@ -2818,6 +2897,7 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
             except Exception as e:
                 results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi tính toán '{sl_price_str}': {e}")
         
+        # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
         if final_tp_price is not None or final_sl_price is not None:
             await cancel_existing_tpsl(
                 session, 
@@ -2852,10 +2932,10 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     data = await resp.json()
                     if resp.status == 200:
                         order_id = data.get('orderId') or data.get('algoId')
-                        results.append(f"   • TP ({pos_display} @ {format_price(final_tp_price)}): 🟢 Thành công (ID: `{order_id}`)")
+                        results.append(f"   • TP (*{pos_display}* tại giá *{format_price(final_tp_price)}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
-                        results.append(f"   • TP ({pos_display} @ {format_price(final_tp_price)}): 🔴 Thất bại: `{msg_err}`")
+                        results.append(f"   • TP (*{pos_display}* tại giá *{format_price(final_tp_price)}*): 🔴 Thất bại: `{msg_err}`")
             except Exception as e:
                 results.append(f"   • TP (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
                 
@@ -2882,20 +2962,26 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                     data = await resp.json()
                     if resp.status == 200:
                         order_id = data.get('orderId') or data.get('algoId')
-                        results.append(f"   • SL ({pos_display} @ {format_price(final_sl_price)}): 🟢 Thành công (ID: `{order_id}`)")
+                        results.append(f"   • SL (*{pos_display}* tại giá *{format_price(final_sl_price)}*): 🟢 Thành công (ID: `{order_id}`)")
                     else:
                         msg_err = data.get('msg', 'Lỗi không xác định')
-                        results.append(f"   • SL ({pos_display} @ {format_price(final_sl_price)}): 🔴 Thất bại: `{msg_err}`")
+                        results.append(f"   • SL (*{pos_display}* tại giá *{format_price(final_sl_price)}*): 🔴 Thất bại: `{msg_err}`")
             except Exception as e:
                 results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi kết nối: {e}")
                 
     msg = (
-        f"🎯 *Kết quả TP/SL {symbol}*\n" +
+        f"🎯 *KẾT QUẢ CÀI ĐẶT TP/SL CHO {symbol}*\n"
+        f"----------------------------------\n" +
         "\n".join(results)
     )
     
     if any("GTE" in r or "closePosition" in r for r in results):
-        msg += "\n\n⚠️ Tránh đặt TP/SL cùng một phía so với giá hiện tại (lỗi GTE từ Binance)."
+        msg += (
+            f"\n\n⚠️ *Lưu ý lỗi GTE/closePosition từ Binance:*\n"
+            f"Binance quy định chỉ được phép tồn tại *1 lệnh đóng vị thế (closePosition)* có cùng điều kiện kích hoạt GTE (hoặc LTE).\n"
+            f"Khi bạn đặt TP/SL mà cả TP và SL đều nằm cùng một phía so với giá hiện tại (cả hai đều cao hơn hoặc đều thấp hơn giá thị trường), chúng sẽ trùng điều kiện kích hoạt (GTE/LTE) dẫn đến lệnh thứ hai bị từ chối.\n"
+            f"👉 *Giải pháp:* Cài đặt TP/SL khi giá hiện tại nằm giữa khoảng TP và SL, hoặc hủy bớt lệnh cũ trên app Binance rồi thử lại."
+        )
     await send_telegram_message(session, chat_id, msg)
 
 
@@ -2914,6 +3000,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
         await send_telegram_message(session, chat_id, "❌ Số tiền volume không hợp lệ. Vui lòng nhập số dương lớn hơn 0.")
         return
 
+    # Lọc các vị thế đang mở (Amt khác 0)
     target_positions = [pos for pos in positions.values() if pos['symbol'] == symbol and float(pos.get('positionAmt', 0)) != 0]
     
     if not target_positions:
@@ -3045,7 +3132,10 @@ async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
                 await send_telegram_message(
                     session, 
                     chat_id, 
-                    f"✅ Đã hủy lệnh *{symbol}* (ID: `{order_id}`)"
+                    f"✅ *HỦY LỆNH THÀNH CÔNG!*\n"
+                    f"----------------------------------\n"
+                    f"🪙 Cặp: *{symbol}*\n"
+                    f"🆔 Order ID đã hủy: `{order_id}`"
                 )
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
