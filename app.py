@@ -2137,6 +2137,7 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         'pattern': candle_pattern,
         'oi_change': oi_change,
         'taker_ratio': taker_ratio,
+        'funding_rate': funding_rate_val,
         'signal': signal,
         'confidence': confidence,
         'long_score': long_score,
@@ -2285,9 +2286,14 @@ async def scan_market_signals(session):
         
         async def ai_gate(res):
             async with ai_sem:
-                digest = build_ai_digest(res['symbol'], [("1h", res), ("4h", res.get('res_4h')), ("1d", res.get('res_1d'))],
-                                          oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'))
-                verdict = await get_ai_verdict_cached(session, f"scan_{res['symbol']}", digest)
+                # Digest phải GIỐNG HỆT với nhánh /a <coin> (đủ 4 khung + funding)
+                # để AI cho ra kết luận nhất quán giữa quét và phân tích chi tiết
+                res_15m = await analyze_with_sem(res['symbol'], '15m', fetch_extras=False)
+                digest = build_ai_digest(res['symbol'],
+                                          [("15m", res_15m), ("1h", res), ("4h", res.get('res_4h')), ("1d", res.get('res_1d'))],
+                                          oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'),
+                                          funding_rate=res.get('funding_rate'))
+                verdict = await get_ai_verdict_cached(session, f"ai_{res['symbol']}", digest)
             res['ai'] = verdict
             return res
         
@@ -2466,30 +2472,26 @@ async def tracking_price_loop(app):
             await asyncio.sleep(30)
 
 def format_scan_item(i, res, direction):
-    """Dựng 1 dòng tín hiệu quét thị trường (dùng chung cho LONG/SHORT)."""
+    """Dựng 1 khối tín hiệu quét thị trường — thiết kế gọn để xem trên điện thoại."""
     coin = display_symbol(res['symbol'])
-    price_str = format_price(res['close'])
-    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
-    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
-    adx_str = f"{res['adx']:.0f}" if 'adx' in res else "?"
-    vol_str = f"{res['vol_ratio']:.1f}x" if 'vol_ratio' in res else "?"
     conf = CONF_MAP.get(res['confidence'], '⭐')
     score = res['long_score'] if direction == 'LONG' else res['short_score']
-    ai_tag = " | 🤖 AI✓" if res.get('ai') else ""
+    tp_change = ((res['tp'] - res['close']) / res['close']) * 100
+    sl_change = ((res['sl'] - res['close']) / res['close']) * 100
+    ai_tag = " 🤖" if res.get('ai') else ""
     return (
-        f"{i}. *{coin}* ➜ `{price_str}` | RSI `{res['rsi']:.1f}` | ADX `{adx_str}` | Vol `{vol_str}`\n"
-        f"   • *{direction}* ({conf}) | Score: `{score:.1f}`{ai_tag}\n"
-        f"   • TP `{format_price(res['tp'])}` ({tp_change:+.2f}%) | SL `{format_price(res['sl'])}` ({sl_change:+.2f}%)"
+        f"{i}. *{coin}* {conf} S:`{score:.1f}` @ `{format_price(res['close'])}`{ai_tag}\n"
+        f"   TP `{format_price(res['tp'])}` ({tp_change:+.1f}%)\n"
+        f"   SL `{format_price(res['sl'])}` ({sl_change:+.1f}%)"
     )
 
 
 async def _send_scan_results(session, chat_id, long_signals, short_signals, cache_age=0):
     ai_enabled = bool(os.getenv("DASH_TOKEN"))
+    filter_desc = "MTF · BTC · Win-rate · AI 🤖" if ai_enabled else "MTF · BTC · Win-rate"
     msg_lines = [
-        "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📌 *Chỉ hiển thị tín hiệu có độ tin cậy 4-5 sao (Mạnh - Rất mạnh)*",
-        "🧭 Bộ lọc: MTF 1h+4h+1d | BTC trend | Win-rate | " + ("AI đối chiếu 🤖" if ai_enabled else "Rule engine"),
+        "🔍 *QUÉT CƠ HỘI (1h)*",
+        f"🧭 Lọc: {filter_desc}",
         ""
     ]
     
@@ -2497,30 +2499,30 @@ async def _send_scan_results(session, chat_id, long_signals, short_signals, cach
     
     if long_signals:
         has_signals = True
-        msg_lines.append("🚀 *CƠ HỘI LONG (Tỉ lệ thắng cao):*")
+        msg_lines.append("🚀 *CƠ HỘI LONG:*")
         for i, res in enumerate(long_signals, 1):
             msg_lines.append(format_scan_item(i, res, 'LONG'))
         msg_lines.append("")
         
     if short_signals:
         has_signals = True
-        msg_lines.append("📉 *CƠ HỘI SHORT (Tỉ lệ thắng cao):*")
+        msg_lines.append("📉 *CƠ HỘI SHORT:*")
         for i, res in enumerate(short_signals, 1):
             msg_lines.append(format_scan_item(i, res, 'SHORT'))
             
     if not has_signals:
-        msg_lines.append("⬜ *Hiện tại không phát hiện tín hiệu 4-5 sao nào từ các coin phổ biến.*")
-        msg_lines.append("Thị trường đang trong giai đoạn sideway hoặc chưa có tín hiệu mạnh. Bạn nên kiên nhẫn đứng ngoài quan sát thêm.")
+        msg_lines.append("⬜ *Chưa có tín hiệu 4-5 sao nào.*")
+        msg_lines.append("_Thị trường sideway hoặc chưa rõ hướng — nên kiên nhẫn quan sát thêm._")
         
-    msg_lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    msg_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     stats_line = format_signal_stats()
     if stats_line:
         msg_lines.append(stats_line)
     if cache_age > 0:
-        msg_lines.append(f"🕒 _Dữ liệu cập nhật cách đây {cache_age}s (cache 5p)_")
+        msg_lines.append(f"🕒 _Cập nhật cách đây {cache_age}s (cache 5p)_")
     else:
-        msg_lines.append("🕒 _Dữ liệu quét trực tiếp thời gian thực_")
-    msg_lines.append("💡 *Mẹo:* Sử dụng `/analyze <coin>` để phân tích chi tiết cho một coin cụ thể.")
+        msg_lines.append("🕒 _Quét trực tiếp thời gian thực_")
+    msg_lines.append("💡 Chi tiết: `/a <coin>`")
     
     await send_telegram_message(session, chat_id, "\n".join(msg_lines))
 
@@ -2569,7 +2571,9 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             apply_btc_penalty(res, btc_res)
                 
             price_str = format_price(res['close'])
-            funding_rate = await get_single_funding_rate(session, symbol)
+            funding_rate = res.get('funding_rate')
+            if funding_rate is None:
+                funding_rate = await get_single_funding_rate(session, symbol)
             funding_line = f"⏳ Funding Rate: `{funding_rate * 100:+.4f}%`\n" if abs(funding_rate) >= 0.005 else ""
             oi_change = res.get('oi_change')
             taker_ratio = res.get('taker_ratio')
@@ -2665,7 +2669,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             if os.getenv("DASH_TOKEN"):
                 digest = build_ai_digest(symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
                                           oi_change=oi_change, taker_ratio=taker_ratio, funding_rate=funding_rate)
-                ai_verdict = await get_ai_verdict_cached(session, f"coin_{symbol}", digest)
+                ai_verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
                 if ai_verdict:
                     ai_dir = ai_verdict.get('direction', 'NEUTRAL')
                     ai_emoji = "🟩 LONG" if ai_dir == 'LONG' else ("🟥 SHORT" if ai_dir == 'SHORT' else "⬜ NEUTRAL")
