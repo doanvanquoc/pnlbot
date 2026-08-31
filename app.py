@@ -287,7 +287,7 @@ async def signal_tracking_loop(app):
             await asyncio.sleep(30)
 
 
-# ─── AI phân tích realtime qua OpenCode Go (OpenAI-compatible) ───
+# ─── AI phân tích realtime (endpoint OpenAI-compatible) ───
 AI_CACHE_TTL = 600
 ai_verdict_cache = {}
 
@@ -306,10 +306,10 @@ def _extract_json(text):
 
 async def get_ai_analysis(session, digest):
     """Gọi LLM phân tích digest chỉ báo. Trả về {direction, confidence, reason} hoặc None."""
-    api_key = os.getenv("OPENCODE_API_KEY")
+    api_key = os.getenv("DASH_TOKEN")
     if not api_key or not digest:
         return None
-    model = os.getenv("OPENCODE_MODEL", "glm-5.3-flash")
+    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
     url = "https://opencode.ai/zen/go/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     system_prompt = (
@@ -326,10 +326,12 @@ async def get_ai_analysis(session, digest):
             {"role": "user", "content": digest}
         ],
         "temperature": 0.2,
-        "max_tokens": 400
+        # glm-5.3-flash là thinking model: reasoning_content tiêu tốn token nên
+        # cần budget đủ lớn để phần JSON cuối cùng không bị cắt (finish_reason=length)
+        "max_tokens": 2000
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=45)
+        timeout = aiohttp.ClientTimeout(total=60)
         async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -342,6 +344,9 @@ async def get_ai_analysis(session, digest):
                 verdict['confidence'] = verdict.get('confidence', 'trung bình')
                 verdict['reason'] = str(verdict.get('reason', ''))[:250]
                 return verdict
+            # glm-5.3-flash là thinking model: nếu max_tokens quá nhỏ, phần suy luận
+            # (reasoning_content) ăn hết budget và content trả về rỗng
+            logger.warning(f"AI trả lời không parse được JSON (content rỗng hoặc sai định dạng): {str(content)[:150]}")
             return None
     except Exception as e:
         logger.warning(f"Lỗi gọi AI analysis: {e}")
@@ -2267,7 +2272,7 @@ async def scan_market_signals(session):
     short_signals = sorted([r for r in survivors if r['signal'] == 'SHORT'], key=lambda x: x['short_score'], reverse=True)
     
     # Bước 5: Gate chặt bằng AI — chỉ giữ tín hiệu AI cùng chiều (top 10 ứng viên tốt nhất)
-    ai_enabled = bool(os.getenv("OPENCODE_API_KEY"))
+    ai_enabled = bool(os.getenv("DASH_TOKEN"))
     if ai_enabled and (long_signals or short_signals):
         top_candidates = []
         for r in long_signals[:5]:
@@ -2479,7 +2484,7 @@ def format_scan_item(i, res, direction):
 
 
 async def _send_scan_results(session, chat_id, long_signals, short_signals, cache_age=0):
-    ai_enabled = bool(os.getenv("OPENCODE_API_KEY"))
+    ai_enabled = bool(os.getenv("DASH_TOKEN"))
     msg_lines = [
         "🔍 *QUÉT TÍN HIỆU CƠ HỘI GIAO DỊCH (1h)*",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -2655,9 +2660,9 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 f"🔥 Độ tin cậy: {conf_icon} (L:`{res['long_score']:.1f}` | S:`{res['short_score']:.1f}`)\n"
             )
             
-            # AI phân tích độc lập qua OpenCode Go (nếu cấu hình OPENCODE_API_KEY)
+            # AI phân tích độc lập (nếu cấu hình DASH_TOKEN)
             ai_verdict = None
-            if os.getenv("OPENCODE_API_KEY"):
+            if os.getenv("DASH_TOKEN"):
                 digest = build_ai_digest(symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
                                           oi_change=oi_change, taker_ratio=taker_ratio, funding_rate=funding_rate)
                 ai_verdict = await get_ai_verdict_cached(session, f"coin_{symbol}", digest)
@@ -2665,7 +2670,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                     ai_dir = ai_verdict.get('direction', 'NEUTRAL')
                     ai_emoji = "🟩 LONG" if ai_dir == 'LONG' else ("🟥 SHORT" if ai_dir == 'SHORT' else "⬜ NEUTRAL")
                     msg += (
-                        f"\n🤖 *AI phân tích (OpenCode Go):*\n"
+                        f"\n🤖 *AI phân tích:*\n"
                         f"👉 AI khuyến nghị: *{ai_emoji}* _({ai_verdict.get('confidence', 'trung bình')})_\n"
                         f"💬 _{ai_verdict.get('reason', '')}_\n"
                     )
@@ -4080,7 +4085,7 @@ async def process_telegram_message(request, chat_id, text):
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
-            "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình OPENCODE_API_KEY.\n"
+            "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
