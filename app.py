@@ -660,7 +660,7 @@ async def delete_telegram_message(session, chat_id, message_id):
     return False
 
 # Sửa tin nhắn Telegram
-async def edit_telegram_message(session, chat_id, message_id, text):
+async def edit_telegram_message(session, chat_id, message_id, text, reply_markup=None):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     url = f"https://api.telegram.org/bot{token}/editMessageText"
     payload = {
@@ -669,6 +669,8 @@ async def edit_telegram_message(session, chat_id, message_id, text):
         "text": text,
         "parse_mode": "Markdown"
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         async with session.post(url, json=payload) as resp:
             if resp.status == 200:
@@ -3077,29 +3079,26 @@ async def build_account_context(session):
                     f"PnL chưa thực hiện: {float(data.get('totalUnrealizedProfit', 0)):+,.2f} USDT, "
                     f"Khả dụng: {float(data.get('availableBalance', 0)):,.2f} USDT"
                 )
-        ts2 = int(time.time() * 1000)
-        qs2 = f"timestamp={ts2}"
-        sig2 = get_binance_signature(qs2, api_secret)
-        async with session.get(f"https://fapi.binance.com/fapi/v2/positionRisk?{qs2}&signature={sig2}", headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
-                if open_positions:
-                    lines.append("- Vị thế đang mở:")
-                    for p in open_positions[:15]:
-                        amount = float(p.get('positionAmt', 0))
-                        entry = float(p.get('entryPrice', 0))
-                        mark = float(p.get('markPrice', 0))
-                        pnl = float(p.get('unRealizedProfit', p.get('unrealizedProfit', 0)))
-                        liq = float(p.get('liquidationPrice', 0))
-                        line = (
-                            f"  · {p.get('symbol')} {pos_side_display(p.get('positionSide'), amount)}: "
-                            f"entry {format_price(entry)}, mark {format_price(mark)}, "
-                            f"PnL {fmt_signed(pnl)} USDT, đòn bẩy {p.get('leverage')}x"
-                        )
-                        if liq > 0:
-                            line += f", giá thanh lý {format_price(liq)}"
-                        lines.append(line)
+        pos_data, pos_err = await get_position_risk(session)
+        if not pos_err and pos_data:
+            open_positions = [p for p in pos_data if float(p.get('positionAmt', 0)) != 0.0]
+            if open_positions:
+                lines.append("- Vị thế đang mở:")
+                for p in open_positions[:15]:
+                    amount = float(p.get('positionAmt', 0))
+                    entry = float(p.get('entryPrice', 0))
+                    mark = float(p.get('markPrice', 0))
+                    pnl = float(p.get('unRealizedProfit', p.get('unrealizedProfit', 0)))
+                    liq = float(p.get('liquidationPrice', 0))
+                    line = (
+                        f"  · {p.get('symbol')} {pos_side_display(p.get('positionSide'), amount)}: "
+                        f"entry {format_price(entry)}, mark {format_price(mark)}, "
+                        f"PnL {fmt_signed(pnl)} USDT, đòn bẩy {p.get('leverage')}x"
+                    )
+                    if liq > 0:
+                        line += f", giá thanh lý {format_price(liq)}"
+                    line += format_position_tpsl(p)
+                    lines.append(line)
                 else:
                     lines.append("- Không có vị thế nào đang mở.")
     except Exception as e:
@@ -3206,6 +3205,31 @@ def _norm_symbol(args):
     return symbol
 
 
+async def get_position_risk(session, params=None):
+    """Lấy positionRisk: ưu tiên v3 (có tpPrice/slPrice - TP/SL gắn trên vị thế đặt từ app), fallback v2."""
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v3/positionRisk', params)
+    if err:
+        data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', params)
+    return data, err
+
+
+def format_position_tpsl(p):
+    """Dựng mô tả TP/SL gắn trên vị thế (nếu có) từ record positionRisk."""
+    try:
+        tp_price = float(p.get('tpPrice') or 0)
+        sl_price = float(p.get('slPrice') or 0)
+    except (TypeError, ValueError):
+        tp_price = sl_price = 0
+    parts = []
+    if tp_price > 0:
+        parts.append(f"TP {format_price(tp_price)}")
+    if sl_price > 0:
+        parts.append(f"SL {format_price(sl_price)}")
+    if parts:
+        return f" | TP/SL gắn trên vị thế: {', '.join(parts)}"
+    return " | chưa có TP/SL"
+
+
 async def tool_get_account_summary(session, chat_id, args):
     data, err = await binance_signed_request(session, 'GET', '/fapi/v2/account')
     if err:
@@ -3217,7 +3241,7 @@ async def tool_get_account_summary(session, chat_id, args):
 
 
 async def tool_get_positions(session, chat_id, args):
-    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk')
+    data, err = await get_position_risk(session)
     if err:
         return f"LỖI: {err}"
     open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
@@ -3235,6 +3259,7 @@ async def tool_get_positions(session, chat_id, args):
                 f"PnL {fmt_signed(pnl)} USDT, đòn bẩy {p.get('leverage')}x")
         if liq > 0:
             line += f", giá thanh lý {format_price(liq)}"
+        line += format_position_tpsl(p)
         lines.append(line)
     return "\n".join(lines)
 
@@ -3302,16 +3327,35 @@ async def tool_get_income_history(session, chat_id, args):
 
 
 async def _stage_order(session, chat_id, order_type, params, desc):
-    """Soạn lệnh ghi vào hàng chờ xác nhận (hỗ trợ NHIỀU lệnh cùng lúc), không thực thi ngay."""
+    """Soạn lệnh ghi vào hàng chờ xác nhận (hỗ trợ NHIỀU lệnh/cùng coin), không thực thi ngay."""
     entry = pending_orders.get(chat_id)
     if not entry or time.time() - entry.get('ts', 0) > PENDING_ORDER_TTL:
         entry = {'items': [], 'ts': time.time()}
-    entry['items'].append({'type': order_type, 'params': params, 'desc': desc})
+    entry['items'].append({'type': order_type, 'params': params, 'desc': desc, 'coin': params.get('symbol', '')})
     entry['ts'] = time.time()
     pending_orders[chat_id] = entry
     return (f"NEEDS_CONFIRMATION: Lệnh đã được soạn (hiện có {len(entry['items'])} lệnh chờ xác nhận):\n" + desc +
-            "\nHãy trình bày lại chi tiết lệnh cho người dùng và nhắc họ trả lời 'xác nhận' để hệ thống đặt TẤT CẢ các lệnh đã soạn, hoặc 'hủy' để bỏ. "
-            "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
+            "\nHãy trình bày lại chi tiết lệnh cho người dùng. Hệ thống sẽ TỰ ĐỘNG đính kèm nút '✅ Xác nhận / ❌ Hủy' vào tin nhắn sau — "
+            "bạn KHÔNG cần nhắc người dùng gõ 'xác nhận', chỉ nói rõ lệnh nào làm gì. KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
+
+
+def build_pending_keyboard(items):
+    """Dựng bàn phím xác nhận: 1 coin -> nút chung; nhiều coin -> từng nút theo coin."""
+    coins = []
+    for it in items:
+        coin = it.get('coin') or 'KHÁC'
+        if coin not in coins:
+            coins.append(coin)
+    if len(coins) <= 1:
+        return CONFIRM_KEYBOARD
+    rows = []
+    for coin in coins:
+        disp = coin[:-4] if coin.endswith('USDT') else coin
+        rows.append([
+            {"text": f"✅ Xác nhận {disp}", "callback_data": f"ai_confirm:{coin}"},
+            {"text": f"❌ Hủy {disp}", "callback_data": f"ai_cancel:{coin}"}
+        ])
+    return {"inline_keyboard": rows}
 
 
 async def tool_place_order(session, chat_id, args):
@@ -3367,7 +3411,7 @@ async def tool_cancel_order(session, chat_id, args):
 
 async def tool_close_position(session, chat_id, args):
     symbol = _norm_symbol(args)
-    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', {'symbol': symbol})
+    data, err = await get_position_risk(session, {'symbol': symbol})
     if err:
         return f"LỖI: {err}"
     open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
@@ -3563,14 +3607,11 @@ async def get_ai_agent_response(session, messages, tools):
         return None, str(e)
 
 
-async def execute_pending_order(session, chat_id):
-    """Thực thi TẤT CẢ lệnh đã soạn khi người dùng xác nhận. Trả về text kết quả."""
-    pending = pending_orders.pop(chat_id, None)
-    if not pending or not pending.get('items'):
-        return "Không có lệnh nào đang chờ xác nhận."
+async def _execute_items(session, items):
+    """Thực thi một danh sách lệnh đã soạn. Trả về text kết quả."""
     results = []
     ok_count = 0
-    for item in pending['items']:
+    for item in items:
         if item['type'] == 'place_order':
             data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', item['params'])
         elif item['type'] == 'cancel_order':
@@ -3586,8 +3627,46 @@ async def execute_pending_order(session, chat_id):
         else:
             ok_count += 1
             results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId')} trên {item['params'].get('symbol')}.")
-    header = f"🚀 *Đã thực thi {ok_count}/{len(pending['items'])} lệnh:*\n" if len(pending['items']) > 1 else ""
+    header = f"🚀 *Đã thực thi {ok_count}/{len(items)} lệnh:*\n" if len(items) > 1 else ""
     return header + "\n\n".join(results)
+
+
+async def execute_pending_order(session, chat_id):
+    """Thực thi TẤT CẢ lệnh đã soạn khi người dùng xác nhận bằng chữ. Trả về text kết quả."""
+    pending = pending_orders.pop(chat_id, None)
+    if not pending or not pending.get('items'):
+        return "Không có lệnh nào đang chờ xác nhận."
+    return await _execute_items(session, pending['items'])
+
+
+async def execute_pending_for_coin(session, chat_id, symbol):
+    """Thực thi các lệnh của MỘT coin (bấm nút theo coin). Trả về (text, remaining_items).
+    Items được tách ra nguyên tử trước khi await, nên bấm lại coin khác vẫn hoạt động độc lập."""
+    entry = pending_orders.get(chat_id)
+    if not entry or not entry.get('items'):
+        return "⚠️ Không có lệnh nào đang chờ xác nhận (có thể đã thực thi hoặc hết hạn).", []
+    chosen = [it for it in entry['items'] if (it.get('coin') or '') == symbol]
+    if not chosen:
+        return f"⚠️ Không còn lệnh chờ xác nhận cho {symbol}.", list(entry['items'])
+    entry['items'] = [it for it in entry['items'] if it not in chosen]
+    remaining = list(entry['items'])
+    if not remaining:
+        del pending_orders[chat_id]
+    text = await _execute_items(session, chosen)
+    return text, remaining
+
+
+async def cancel_pending_for_coin(session, chat_id, symbol):
+    """Hủy các lệnh chờ của MỘT coin. Trả về (text, remaining_items)."""
+    entry = pending_orders.get(chat_id)
+    if not entry or not entry.get('items'):
+        return "⚠️ Không có lệnh nào đang chờ xác nhận.", []
+    chosen = [it for it in entry['items'] if (it.get('coin') or '') == symbol]
+    entry['items'] = [it for it in entry['items'] if it not in chosen]
+    remaining = list(entry['items'])
+    if not remaining:
+        del pending_orders[chat_id]
+    return f"🚫 *Đã hủy các lệnh chờ của {symbol}.*", remaining
 
 
 CONFIRM_KEYBOARD = {
@@ -3599,7 +3678,7 @@ CONFIRM_KEYBOARD = {
 
 
 async def send_pending_confirmation_buttons(session, chat_id, reply_to=None):
-    """Nếu có lệnh đã soạn chờ xác nhận, gửi tin nhắn kèm nút Xác nhận/Hủy."""
+    """Nếu có lệnh đã soạn chờ xác nhận, gửi tin nhắn kèm nút Xác nhận/Hủy (theo coin nếu nhiều coin)."""
     pending = pending_orders.get(chat_id)
     if not pending or not pending.get('items'):
         return
@@ -3609,11 +3688,12 @@ async def send_pending_confirmation_buttons(session, chat_id, reply_to=None):
            + "\n".join(f"• {it['desc']}" for it in items[:5])
     if len(items) > 5:
         text += f"\n• ... và {len(items) - 5} lệnh khác"
-    await send_telegram_message(session, chat_id, text, reply_to=reply_to, reply_markup=CONFIRM_KEYBOARD)
+    kb = build_pending_keyboard(items)
+    await send_telegram_message(session, chat_id, text, reply_to=reply_to, reply_markup=kb)
 
 
 async def handle_order_callback(session, cb):
-    """Xử lý khi người dùng bấm nút Xác nhận/Hủy trên tin nhắn lệnh do AI soạn."""
+    """Xử lý khi người dùng bấm nút Xác nhận/Hủy (chung hoặc theo coin) trên tin nhắn lệnh AI soạn."""
     try:
         cb_id = cb.get('id')
         cb_data = cb.get('data') or ''
@@ -3639,9 +3719,12 @@ async def handle_order_callback(session, cb):
             await answer_cb("Bạn không phải người tạo yêu cầu này.")
             return
 
+        action, _, arg = cb_data.partition(':')
+        symbol = arg.strip().upper() or None
         new_text = None
+        reply_kb = None
         pending = pending_orders.get(chat_id)
-        if cb_data == 'ai_confirm':
+        if action == 'ai_confirm':
             if not pending or not pending.get('items'):
                 new_text = "⚠️ Không có lệnh nào đang chờ xác nhận (có thể đã thực thi hoặc hết hạn)."
                 await answer_cb("Không có lệnh chờ")
@@ -3651,11 +3734,24 @@ async def handle_order_callback(session, cb):
                 await answer_cb("Đã hết hạn")
             else:
                 await answer_cb("Đang đặt lệnh...")
-                new_text = await execute_pending_order(session, chat_id)
-        elif cb_data == 'ai_cancel':
-            pending_orders.pop(chat_id, None)
+                if symbol:
+                    # Xác nhận cho 1 coin: lệnh coin đó được tách ra thực thi,
+                    # các coin còn lại giữ nguyên nút để bấm tiếp
+                    new_text, remaining = await execute_pending_for_coin(session, chat_id, symbol)
+                    if remaining:
+                        reply_kb = build_pending_keyboard(remaining)
+                        new_text += "\n\n⏳ Vẫn còn lệnh chờ xác nhận của coin khác bên dưới 👇"
+                else:
+                    new_text = await execute_pending_order(session, chat_id)
+        elif action == 'ai_cancel':
             await answer_cb("Đã hủy")
-            new_text = "🚫 *Đã hủy các lệnh đang chờ xác nhận.*"
+            if symbol:
+                new_text, remaining = await cancel_pending_for_coin(session, chat_id, symbol)
+                if remaining:
+                    reply_kb = build_pending_keyboard(remaining)
+            else:
+                pending_orders.pop(chat_id, None)
+                new_text = "🚫 *Đã hủy các lệnh đang chờ xác nhận.*"
         else:
             await answer_cb()
             return
@@ -3663,9 +3759,9 @@ async def handle_order_callback(session, cb):
         if new_text:
             message_id = msg.get('message_id')
             if message_id:
-                edited = await edit_telegram_message(session, chat_id, message_id, new_text)
+                edited = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=reply_kb)
                 if not edited:
-                    await send_telegram_message(session, chat_id, new_text)
+                    await send_telegram_message(session, chat_id, new_text, reply_markup=reply_kb)
     except Exception as e:
         logger.error(f"Lỗi xử lý callback nút xác nhận: {e}")
 
@@ -3737,8 +3833,10 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "Khi người dùng nói lệnh theo giá trị USDT (vd 'long 400u'): tính quantity = giá trị / giá entry lấy từ scan_market "
             "hoặc giá mark từ get_positions, và ghi rõ phép tính trong câu trả lời. "
             "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ đọc, (2) gọi công cụ soạn lệnh, "
-            "(3) trình bày chi tiết lệnh và nhắc người dùng trả lời 'xác nhận' hoặc 'hủy' — hệ thống chỉ thực thi sau khi xác nhận. "
-            "Chỉ soạn lệnh khi người dùng thể hiện ý định rõ ràng (đặt/close/hủy). "
+            "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
+            "QUAN TRỌNG: khi câu trả lời có đề xuất lệnh cụ thể (coin, hướng, giá entry/TP/SL, quantity), hãy SOẠN NGAY các lệnh đó bằng "
+            "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
+            "người dùng không thích thì bấm Hủy hoặc bỏ qua (tự hết hạn). Chỉ không soạn khi trả lời thuần phân tích/kiến thức, không kèm đề xuất lệnh cụ thể. "
             "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
             "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
@@ -3761,7 +3859,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
                 f"Tin nhắn người dùng vừa gửi: '{question}'. Nếu đây là lời đồng ý/chỉnh sửa/hủy liên quan đến các lệnh trên, "
                 f"hãy xử lý theo ý họ (chỉnh sửa = soạn lại lệnh bằng công cụ). "
                 f"KHÔNG diễn giải các từ đồng ý chung như 'oke', 'ok', 'được' thành tên coin hay mã nào đó. "
-                f"Lệnh CHỈ được hệ thống đặt khi người dùng gõ 'xác nhận'.)"
+                f"Lệnh CHỈ được hệ thống đặt khi người dùng bấm nút '✅ Xác nhận' hoặc gõ 'xác nhận'.)"
             )
         if image_data_url:
             user_content = [
