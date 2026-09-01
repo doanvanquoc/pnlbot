@@ -4911,29 +4911,50 @@ async def telegram_webhook_handler(request):
 
 
 # Xử lý nội dung tin nhắn/lệnh Telegram (chạy nền sau khi webhook đã phản hồi 200)
+def is_coin_price_query(text):
+    """Phân biệt text thuần tên coin ('btc eth sol' -> tra giá nhanh) với câu hỏi tự do (đưa cho AI agent).
+    Token hợp lệ: chỉ gồm chữ/số và phải trùng symbol futures có trên sàn (BTCUSDT, 1000PEPE...)."""
+    tokens = [t.strip(',.;:!?()[]').lower() for t in text.split()]
+    if not tokens:
+        return False
+    # exchangeInfo chưa nạp (hiếm, ngay khi khởi động): fallback theo hình dạng token
+    if not symbol_precisions:
+        return all(re.fullmatch(r'[a-z0-9]{2,12}', t) for t in tokens)
+    for t in tokens:
+        if not re.fullmatch(r'[a-z0-9]{2,12}', t):
+            return False
+        sym = t.upper()
+        if sym + 'USDT' not in symbol_precisions and sym not in symbol_precisions:
+            return False
+    return True
+
+
 async def process_telegram_message(request, chat_id, text):
-    # Nếu tin nhắn không bắt đầu bằng '/', coi đó là danh sách các coin cần lấy giá
+    # Nếu tin nhắn không bắt đầu bằng '/': tên coin thuần -> tra giá nhanh, còn lại -> AI agent
     if not text.startswith('/'):
-        coins = text.split()
-        if coins:
-            results = await get_coin_prices(request.app['session'], coins)
-            
-            response_lines = []
-            for coin_name, info in results:
-                if info is not None:
-                    price = info['price']
-                    change = info['change']
-                    funding = info.get('funding_rate', 0.0)
-                    formatted = format_price(price)
-                    emoji = "🟢" if change >= 0 else "🔴"
-                    sign = "+" if change >= 0 else ""
-                    funding_str = f" [FR: {funding * 100:+.4f}%]" if abs(funding) >= 0.005 else ""
-                    response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%){funding_str}")
-                else:
-                    response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
-            
-            if response_lines:
-                await send_telegram_message(request.app['session'], chat_id, "\n".join(response_lines))
+        if is_coin_price_query(text):
+            coins = text.split()
+            if coins:
+                results = await get_coin_prices(request.app['session'], coins)
+
+                response_lines = []
+                for coin_name, info in results:
+                    if info is not None:
+                        price = info['price']
+                        change = info['change']
+                        funding = info.get('funding_rate', 0.0)
+                        formatted = format_price(price)
+                        emoji = "🟢" if change >= 0 else "🔴"
+                        sign = "+" if change >= 0 else ""
+                        funding_str = f" [FR: {funding * 100:+.4f}%]" if abs(funding) >= 0.005 else ""
+                        response_lines.append(f"{coin_name.upper()}: {formatted} ({emoji} {sign}{change:.2f}%){funding_str}")
+                    else:
+                        response_lines.append(f"{coin_name.upper()}: Không tìm thấy")
+
+                if response_lines:
+                    await send_telegram_message(request.app['session'], chat_id, "\n".join(response_lines))
+        else:
+            await handle_ai_command(request.app['session'], chat_id, text)
         return web.Response(status=200)
         
     command = text.split()[0].lower()
@@ -4968,6 +4989,7 @@ async def process_telegram_message(request, chat_id, text):
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
+            "• Gõ câu hỏi/chỉ dẫn bất kỳ bằng tiếng Việt (không cần `/ai`) để trò chuyện với AI agent: phân tích coin, hỏi tài khoản, đặt lệnh...\n"
             "• Lệnh Market: `/long btc 1000` (LONG btc với volume 1000 USDT)\n"
             "• Lệnh Limit: `/long btc 1000 98000` (LONG btc với volume 1000 USDT tại giá 98000)"
         )
