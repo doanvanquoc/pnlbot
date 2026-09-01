@@ -596,7 +596,7 @@ def get_binance_signature(query_string, secret_key):
     ).hexdigest()
 
 # Gửi tin nhắn Telegram
-async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=None):
+async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=None, reply_markup=None):
     if not is_auto:
         has_new_activity[chat_id] = True
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -609,6 +609,8 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
     }
     if reply_to:
         payload["reply_to_message_id"] = reply_to
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
@@ -625,6 +627,10 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
                         retry_after = 1
                     logger.warning(f"Telegram 429 rate limit: thử lại sau {retry_after}s (lần {attempt + 1}/{max_attempts})")
                     await asyncio.sleep(min(retry_after, 5))
+                    continue
+                # Lỗi parse markdown (400): thử lại không parse_mode để tin nhắn không bị mất
+                if resp.status == 400 and 'parse_mode' in payload:
+                    payload.pop('parse_mode')
                     continue
                 body = await resp.text()
                 logger.error(f"Lỗi gửi tin nhắn Telegram: HTTP {resp.status} - {body}")
@@ -3234,6 +3240,7 @@ async def tool_get_positions(session, chat_id, args):
 
 
 async def tool_get_open_orders(session, chat_id, args):
+    """Lệnh đang chờ: gồm cả LIMIT lẫn lệnh điều kiện (STOP_MARKET, TAKE_PROFIT_MARKET...)."""
     params = {}
     if args.get('symbol'):
         params['symbol'] = _norm_symbol(args)
@@ -3241,12 +3248,24 @@ async def tool_get_open_orders(session, chat_id, args):
     if err:
         return f"LỖI: {err}"
     if not data:
-        return "Không có lệnh nào đang chờ khớp."
+        return "Không có lệnh nào đang chờ (kể cả lệnh điều kiện)."
     lines = []
     for o in data[:20]:
-        lines.append(f"{o.get('symbol')} #{o.get('orderId')} {o.get('side')} {o.get('type')} "
-                     f"qty {o.get('origQty')} @ {o.get('price')}"
-                     + (" (reduceOnly)" if o.get('reduceOnly') else ""))
+        otype = o.get('type', '')
+        line = (f"{o.get('symbol')} #{o.get('orderId')} {o.get('side')} {otype} "
+                f"qty {o.get('origQty')}")
+        # Lệnh điều kiện: hiển thị giá kích hoạt thay vì price (price=0 với MARKET variants)
+        stop_price = float(o.get('stopPrice') or 0)
+        if stop_price > 0:
+            line += f" | kích hoạt khi chạm {format_price(stop_price)}"
+            wt = o.get('workingType')
+            if wt:
+                line += f" (theo {wt})"
+        else:
+            line += f" @ {o.get('price')}"
+        if o.get('reduceOnly'):
+            line += " (reduceOnly - chỉ đóng vị thế)"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -3305,12 +3324,14 @@ async def tool_place_order(session, chat_id, args):
         return "LỖI: quantity không hợp lệ."
     if side not in ('BUY', 'SELL'):
         return "LỖI: side phải là BUY hoặc SELL."
-    if otype not in ('MARKET', 'LIMIT'):
-        return "LỖI: chỉ hỗ trợ MARKET hoặc LIMIT."
+    if otype not in ('MARKET', 'LIMIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
+        return "LỖI: chỉ hỗ trợ MARKET, LIMIT, STOP_MARKET, TAKE_PROFIT_MARKET."
     if quantity <= 0:
         return "LỖI: quantity phải > 0."
     if otype == 'LIMIT' and not args.get('price'):
         return "LỖI: lệnh LIMIT cần price."
+    if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET') and not args.get('stop_price'):
+        return "LỖI: lệnh điều kiện cần stop_price (giá kích hoạt)."
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
     quantity = round(quantity, qty_p)
     params = {'symbol': symbol, 'side': side, 'type': otype, 'quantity': f"{quantity:.{qty_p}f}"}
@@ -3319,6 +3340,14 @@ async def tool_place_order(session, chat_id, args):
         price = round_price_step(float(args['price']), tick_size, price_p)
         params.update({'price': f"{price:.{price_p}f}", 'timeInForce': 'GTC'})
         desc += f" @ {price}"
+    elif otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
+        stop_price = round_price_step(float(args['stop_price']), tick_size, price_p)
+        params['stopPrice'] = f"{stop_price:.{price_p}f}"
+        if args.get('working_type'):
+            wt = str(args['working_type']).upper()
+            if wt in ('MARK_PRICE', 'CONTRACT_PRICE'):
+                params['workingType'] = wt
+        desc += f" | kích hoạt khi chạm {stop_price}"
     if hedge_mode:
         params['positionSide'] = str(args.get('position_side') or ('LONG' if side == 'BUY' else 'SHORT')).upper()
     elif args.get('reduce_only'):
@@ -3469,10 +3498,10 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_positions", "description": "Danh sách vị thế futures đang mở: entry, mark, PnL, đòn bẩy, giá thanh lý.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "get_open_orders", "description": "Các lệnh đang chờ khớp.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Tùy chọn, ví dụ BTCUSDT"}}}}},
+    {"type": "function", "function": {"name": "get_open_orders", "description": "Các lệnh đang chờ, gồm cả LIMIT lẫn lệnh điều kiện (STOP_MARKET, TAKE_PROFIT_MARKET) kèm giá kích hoạt.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Tùy chọn, ví dụ BTCUSDT"}}}}},
     {"type": "function", "function": {"name": "get_order_history", "description": "Lịch sử lệnh của một symbol.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "limit": {"type": "integer"}}}, "required": ["symbol"]}},
     {"type": "function", "function": {"name": "get_income_history", "description": "Lịch sử thu nhập tài khoản: REALIZED_PNL, FUNDING_FEE, COMMISSION.", "parameters": {"type": "object", "properties": {"income_type": {"type": "string"}, "limit": {"type": "integer"}}}}},
-    {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. LIMIT bắt buộc có price.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
+    {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế hoặc lệnh điều kiện TP/SL (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. LIMIT bắt buộc có price. STOP_MARKET/TAKE_PROFIT_MARKET bắt buộc có stop_price (giá kích hoạt); dùng reduce_only=true để làm TP/SL cho vị thế hiện có.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "stop_price": {"type": "number", "description": "Giá kích hoạt, bắt buộc với STOP_MARKET/TAKE_PROFIT_MARKET"}, "working_type": {"type": "string", "enum": ["MARK_PRICE", "CONTRACT_PRICE"], "description": "Cơ sở kích hoạt, mặc định MARK_PRICE"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
     {"type": "function", "function": {"name": "cancel_order", "description": "Soạn hủy một lệnh đang chờ (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "order_id": {"type": "string"}}, "required": ["symbol", "order_id"]}}},
     {"type": "function", "function": {"name": "close_position", "description": "Soạn đóng TOÀN BỘ vị thế của một symbol bằng lệnh market (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}}},
 ]
@@ -3493,10 +3522,10 @@ TOOL_EXECUTORS = {
 
 
 async def get_ai_agent_response(session, messages, tools):
-    """Một lượt gọi LLM hỗ trợ tool calling. Trả về message dict hoặc None."""
+    """Một lượt gọi LLM hỗ trợ tool calling. Trả về (message_dict, None) khi OK hoặc (None, error_detail) khi lỗi."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
-        return None
+        return None, "Chưa cấu hình DASH_TOKEN."
     model = os.getenv("DASH_MODEL", "glm-5.3-flash")
     url = "https://opencode.ai/zen/go/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -3513,12 +3542,25 @@ async def get_ai_agent_response(session, messages, tools):
             if resp.status != 200:
                 body = await resp.text()
                 logger.warning(f"AI agent trả lỗi HTTP {resp.status}: {body[:200]}")
-                return None
+                return None, f"HTTP {resp.status}: {body[:200]}"
             data = await resp.json()
-            return data.get('choices', [{}])[0].get('message')
+            choice = data.get('choices', [{}])[0]
+            msg = choice.get('message')
+            if msg is None:
+                return None, f"Phản hồi AI không đúng định dạng: {str(data)[:200]}"
+            has_tool_calls = bool(msg.get('tool_calls'))
+            has_content = bool((msg.get('content') or '').strip())
+            if not has_tool_calls and not has_content:
+                fr = choice.get('finish_reason')
+                logger.warning(f"AI agent trả về rỗng (finish_reason={fr}).")
+                return None, f"AI trả về nội dung rỗng (finish_reason={fr}) — có thể bị cắt ngắn do hết token."
+            return msg, None
+    except asyncio.TimeoutError:
+        logger.warning("AI agent timeout sau 90s.")
+        return None, "AI phản hồi quá lâu (timeout 90s)."
     except Exception as e:
         logger.warning(f"Lỗi gọi AI agent: {e}")
-        return None
+        return None, str(e)
 
 
 async def execute_pending_order(session, chat_id):
@@ -3546,6 +3588,86 @@ async def execute_pending_order(session, chat_id):
             results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId')} trên {item['params'].get('symbol')}.")
     header = f"🚀 *Đã thực thi {ok_count}/{len(pending['items'])} lệnh:*\n" if len(pending['items']) > 1 else ""
     return header + "\n\n".join(results)
+
+
+CONFIRM_KEYBOARD = {
+    "inline_keyboard": [[
+        {"text": "✅ Xác nhận", "callback_data": "ai_confirm"},
+        {"text": "❌ Hủy", "callback_data": "ai_cancel"}
+    ]]
+}
+
+
+async def send_pending_confirmation_buttons(session, chat_id, reply_to=None):
+    """Nếu có lệnh đã soạn chờ xác nhận, gửi tin nhắn kèm nút Xác nhận/Hủy."""
+    pending = pending_orders.get(chat_id)
+    if not pending or not pending.get('items'):
+        return
+    items = pending['items']
+    mins = int(PENDING_ORDER_TTL / 60)
+    text = f"⚠️ *Xác nhận đặt {len(items)} lệnh* (tự hết hạn sau {mins} phút):\n" \
+           + "\n".join(f"• {it['desc']}" for it in items[:5])
+    if len(items) > 5:
+        text += f"\n• ... và {len(items) - 5} lệnh khác"
+    await send_telegram_message(session, chat_id, text, reply_to=reply_to, reply_markup=CONFIRM_KEYBOARD)
+
+
+async def handle_order_callback(session, cb):
+    """Xử lý khi người dùng bấm nút Xác nhận/Hủy trên tin nhắn lệnh do AI soạn."""
+    try:
+        cb_id = cb.get('id')
+        cb_data = cb.get('data') or ''
+        msg = cb.get('message') or {}
+        chat_id = (msg.get('chat') or {}).get('id')
+        from_id = (cb.get('from') or {}).get('id')
+        if not chat_id or not cb_id:
+            return
+
+        async def answer_cb(text=None):
+            try:
+                url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/answerCallbackQuery"
+                payload = {"callback_query_id": cb_id}
+                if text:
+                    payload["text"] = text
+                async with session.post(url, json=payload) as resp:
+                    await resp.read()
+            except Exception as e:
+                logger.warning(f"Lỗi answerCallbackQuery: {e}")
+
+        # Chỉ cho phép người trong cùng chat bấm nút (chat riêng: from trùng chat)
+        if from_id and chat_id > 0 and from_id != chat_id:
+            await answer_cb("Bạn không phải người tạo yêu cầu này.")
+            return
+
+        new_text = None
+        pending = pending_orders.get(chat_id)
+        if cb_data == 'ai_confirm':
+            if not pending or not pending.get('items'):
+                new_text = "⚠️ Không có lệnh nào đang chờ xác nhận (có thể đã thực thi hoặc hết hạn)."
+                await answer_cb("Không có lệnh chờ")
+            elif time.time() - pending['ts'] > PENDING_ORDER_TTL:
+                del pending_orders[chat_id]
+                new_text = "⚠️ *Đã hết thời hạn xác nhận lệnh (10 phút).*"
+                await answer_cb("Đã hết hạn")
+            else:
+                await answer_cb("Đang đặt lệnh...")
+                new_text = await execute_pending_order(session, chat_id)
+        elif cb_data == 'ai_cancel':
+            pending_orders.pop(chat_id, None)
+            await answer_cb("Đã hủy")
+            new_text = "🚫 *Đã hủy các lệnh đang chờ xác nhận.*"
+        else:
+            await answer_cb()
+            return
+
+        if new_text:
+            message_id = msg.get('message_id')
+            if message_id:
+                edited = await edit_telegram_message(session, chat_id, message_id, new_text)
+                if not edited:
+                    await send_telegram_message(session, chat_id, new_text)
+    except Exception as e:
+        logger.error(f"Lỗi xử lý callback nút xác nhận: {e}")
 
 
 async def handle_ai_command(session, chat_id, question=None, reply_to=None, image_data_url=None, photo_sizes=None):
@@ -3655,6 +3777,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         )
 
         final_text = None
+        error_detail = None
         TOOL_LABELS = {
             'analyze_coin': '📊 đang phân tích coin',
             'get_price': '📈 đang tra giá coin',
@@ -3669,8 +3792,10 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             'close_position': '🔒 đang soạn lệnh đóng vị thế',
         }
         for _ in range(8):
-            msg = await get_ai_agent_response(session, messages, ASK_TOOLS)
-            if not msg:
+            msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS)
+            if err:
+                error_detail = err
+                logger.warning(f"Agent dừng với lỗi: {err}")
                 break
             tool_calls = msg.get('tool_calls')
             if tool_calls:
@@ -3702,6 +3827,8 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
                 continue
             final_text = (msg.get('content') or '').strip()
             break
+        else:
+            error_detail = "AI xử lý quá nhiều bước liên tiếp (trên 8 bước) mà chưa kết luận — thử hỏi cụ thể hơn nhé."
 
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
@@ -3711,13 +3838,18 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             history.append({"role": "assistant", "content": final_text[:1500]})
             ai_chat_history[chat_id] = history[-AI_HISTORY_MAX_MSGS:]
             await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}", reply_to=reply_to)
+        elif error_detail:
+            await send_telegram_message(session, chat_id, f"⚠️ AI gặp sự cố: {error_detail[:300]}\nThử lại hoặc hỏi theo cách khác nhé.", reply_to=reply_to)
         else:
             await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.", reply_to=reply_to)
+        # Nếu AI đã soạn lệnh, gửi kèm nút Xác nhận/Hủy
+        await send_pending_confirmation_buttons(session, chat_id, reply_to=reply_to)
     except Exception as e:
         logger.error(f"Lỗi khi xử lý lệnh AI: {e}")
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}", reply_to=reply_to)
+        await send_pending_confirmation_buttons(session, chat_id, reply_to=reply_to)
 
 
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
@@ -4943,7 +5075,13 @@ async def telegram_webhook_handler(request):
     except Exception as e:
         logger.error(f"Lỗi parse JSON webhook body: {e}")
         return web.Response(status=400)
-        
+
+    # Nút inline (Xác nhận/Hủy lệnh AI soạn): Telegram gửi về dạng callback_query
+    callback_query = data.get('callback_query')
+    if callback_query:
+        asyncio.create_task(handle_order_callback(request.app['session'], callback_query))
+        return web.Response(status=200)
+
     message = data.get('message')
     if not message:
         return web.Response(status=200)
