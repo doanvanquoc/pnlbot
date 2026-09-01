@@ -3349,7 +3349,57 @@ async def tool_get_price(session, chat_id, args):
     return "\n".join(lines)
 
 
+async def tool_analyze_coin(session, chat_id, args):
+    """Phân tích chuyên sâu MỘT coin: chỉ báo đa khung + rule engine + nhận định AI, kèm TP/SL."""
+    symbol = _norm_symbol(args)
+    res_15m_t = asyncio.create_task(analyze_market(session, symbol, interval='15m', fetch_extras=False))
+    res_1h_t = asyncio.create_task(analyze_market(session, symbol, interval='1h'))
+    res_4h_t = asyncio.create_task(analyze_market(session, symbol, interval='4h', fetch_extras=False))
+    res_1d_t = asyncio.create_task(analyze_market(session, symbol, interval='1d', fetch_extras=False))
+    ob_t = asyncio.create_task(get_orderbook_summary(session, symbol))
+    dom_t = asyncio.create_task(get_btc_dominance(session))
+
+    res_15m = await res_15m_t
+    res = await res_1h_t
+    res_4h = await res_4h_t
+    res_1d = await res_1d_t
+    orderbook = await ob_t
+    btc_dominance = await dom_t
+
+    if not res:
+        return f"Không lấy được dữ liệu cho {symbol}. Kiểm tra lại tên coin."
+
+    funding_rate = res.get('funding_rate')
+    if funding_rate is None:
+        funding_rate = await get_single_funding_rate(session, symbol)
+
+    digest = build_ai_digest(
+        symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
+        oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'), funding_rate=funding_rate,
+        orderbook=orderbook, btc_dominance=btc_dominance
+    )
+    verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
+
+    lines = [f"{symbol}: giá {format_price(res['close'])} USDT"]
+    mtf = []
+    for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)]:
+        if tf_res:
+            mtf.append(f"{tf_name}: {tf_res['signal']} (L:{tf_res['long_score']:.1f}/S:{tf_res['short_score']:.1f})")
+    lines.append("Rule engine MTF: " + " | ".join(mtf))
+    lines.append(f"Rule 1h: {res['signal']} (độ tin cậy {res['confidence']})")
+    lines.append(f"TP gợi ý {format_price(res['tp'])}, SL gợi ý {format_price(res['sl'])}")
+    if verdict:
+        lines.append(f"AI nhận định: {verdict.get('direction', 'NEUTRAL')} "
+                     f"(độ tin cậy {verdict.get('confidence', 'trung bình')}) — {verdict.get('reason', '')}")
+        for b in verdict.get('analysis', [])[:4]:
+            lines.append(f"· {b}")
+    else:
+        lines.append("AI: không có nhận định (chưa cấu hình DASH_TOKEN hoặc AI lỗi).")
+    return "\n".join(lines)
+
+
 ASK_TOOLS = [
+    {"type": "function", "function": {"name": "analyze_coin", "description": "Phân tích chuyên sâu MỘT coin cụ thể: chỉ báo đa khung 15m/1h/4h/1d + rule engine + nhận định AI kèm TP/SL. Dùng khi người dùng hỏi về xu hướng hoặc khả năng vào lệnh của một coin. KHÔNG dùng khi người dùng muốn tìm cơ hội trên toàn thị trường (dùng scan_market).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Ví dụ BTCUSDT hoặc btc"}}, "required": ["symbol"]}}},
     {"type": "function", "function": {"name": "get_price", "description": "Tra giá realtime + % thay đổi 24h của một hoặc nhiều coin bất kỳ trên Binance Futures.", "parameters": {"type": "object", "properties": {"symbols": {"type": "array", "items": {"type": "string"}, "description": "Danh sách symbol, ví dụ ['SOLUSDT', 'DOGEUSDT']"}}, "required": ["symbols"]}}},
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
@@ -3363,6 +3413,7 @@ ASK_TOOLS = [
 ]
 
 TOOL_EXECUTORS = {
+    'analyze_coin': tool_analyze_coin,
     'get_price': tool_get_price,
     'scan_market': tool_scan_market,
     'get_account_summary': tool_get_account_summary,
@@ -3492,6 +3543,12 @@ async def handle_ai_command(session, chat_id, question=None):
             "(3) trình bày chi tiết lệnh và nhắc người dùng trả lời 'xác nhận' hoặc 'hủy' — hệ thống chỉ thực thi sau khi xác nhận. "
             "Chỉ soạn lệnh khi người dùng thể hiện ý định rõ ràng (đặt/close/hủy). "
             "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
+            "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
+            "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
+            "câu hỏi về tài khoản -> các tool get_account/get_positions/get_open_orders/get_order_history/get_income_history. "
+            "MỖI lần gọi công cụ, luôn kèm trong phần nội dung trả lời MỘT câu ngắn tiếng Việt (dưới 120 ký tự) mô tả "
+            "việc bạn đang làm và lý do (vd: 'BTC hỏi lâu rồi, để t tra giá và phân tích đã') — câu này hiển thị cho người dùng "
+            "như tiến trình công việc, viết tự nhiên như người thật nói. "
             "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
             "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
             "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
@@ -3510,6 +3567,7 @@ async def handle_ai_command(session, chat_id, question=None):
 
         final_text = None
         TOOL_LABELS = {
+            'analyze_coin': '📊 đang phân tích coin',
             'get_price': '📈 đang tra giá coin',
             'scan_market': '🔍 đang quét thị trường tìm cơ hội tốt nhất',
             'get_account_summary': '💳 đang kiểm tra số dư tài khoản',
@@ -3529,12 +3587,16 @@ async def handle_ai_command(session, chat_id, question=None):
             tool_calls = msg.get('tool_calls')
             if tool_calls:
                 step += 1
-                labels = [TOOL_LABELS.get((tc.get('function') or {}).get('name', ''), 'dữ liệu')
-                          for tc in tool_calls]
+                # Ưu tiên câu AI tự mô tả việc đang làm; fallback về nhãn gán sẵn theo tên tool
+                ai_note = (msg.get('content') or '').strip().split('\n')[0][:150]
+                if not ai_note:
+                    labels = [TOOL_LABELS.get((tc.get('function') or {}).get('name', ''), 'dữ liệu')
+                              for tc in tool_calls]
+                    ai_note = ", ".join(labels)
                 if loading_msg_id:
                     loading_msg_id = await edit_telegram_message(
                         session, chat_id, loading_msg_id,
-                        f"🤖 *[Bước {step}]* " + ", ".join(labels) + "..."
+                        f"🤖 *[Bước {step}]* {ai_note}"
                     )
                 messages.append(msg)
                 for tc in tool_calls:
