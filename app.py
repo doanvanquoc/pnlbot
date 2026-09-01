@@ -304,8 +304,8 @@ def _extract_json(text):
     except Exception:
         return None
 
-async def get_ai_analysis(session, digest):
-    """Gọi LLM phân tích digest chỉ báo. Trả về {direction, confidence, reason} hoặc None."""
+async def get_ai_analysis(session, digest, lessons=None):
+    """Gọi LLM phân tích digest chỉ báo. Trả về {direction, confidence, reason, analysis} hoặc None."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key or not digest:
         return None
@@ -316,9 +316,19 @@ async def get_ai_analysis(session, digest):
         "Bạn là một phân tích viên giao dịch crypto futures chuyên nghiệp, kỷ luật và thận trọng. "
         "Dựa trên các số liệu chỉ báo kỹ thuật đa khung thời gian (nến đã đóng) được cung cấp, hãy đánh giá hướng đi ngắn hạn. "
         "Ưu tiên bảo toàn vốn: khi tín hiệu mâu thuẫn, xu hướng chưa rõ hoặc biến động quá mạnh, hãy chọn NEUTRAL. "
+        "Phần analysis viết như nhận định của trader thực dụng: nêu cấu trúc xu hướng theo từng khung, động lượng, "
+        "vùng giá quan trọng (dùng số giá cụ thể có trong dữ liệu), kịch bản phù hợp cùng điều kiện xác nhận, và rủi ro cần tránh. "
+        "Tránh nói chung chung kiểu sách vở, tránh liệt kê lại nguyên văn chỉ báo, không khuyên về đòn bẩy hay khối lượng. "
         "Chỉ trả lời bằng MỘT JSON hợp lệ duy nhất, không thêm bất kỳ chữ nào, đúng định dạng: "
-        '{"direction": "LONG" | "SHORT" | "NEUTRAL", "confidence": "cao" | "trung bình" | "thấp", "reason": "lý do ngắn gọn bằng tiếng Việt, dưới 200 ký tự"}'
+        '{"direction": "LONG" | "SHORT" | "NEUTRAL", "confidence": "cao" | "trung bình" | "thấp", '
+        '"reason": "tóm tắt một câu bằng tiếng Việt, dưới 200 ký tự", '
+        '"analysis": ["3-5 gạch đầu dòng tiếng Việt tự nhiên, mỗi dòng dưới 200 ký tự, nêu số giá cụ thể khi cần"]}'
     )
+    if lessons:
+        system_prompt += (
+            "\n\nBài học rút ra từ kết quả tín hiệu thực tế gần đây của hệ thống (ưu tiên áp dụng khi đánh giá):\n"
+            f"{lessons}"
+        )
     payload = {
         "model": model,
         "messages": [
@@ -343,6 +353,11 @@ async def get_ai_analysis(session, digest):
             if verdict and verdict.get('direction') in ('LONG', 'SHORT', 'NEUTRAL'):
                 verdict['confidence'] = verdict.get('confidence', 'trung bình')
                 verdict['reason'] = str(verdict.get('reason', ''))[:250]
+                analysis = verdict.get('analysis')
+                if isinstance(analysis, list):
+                    verdict['analysis'] = [str(x).strip()[:200] for x in analysis if str(x).strip()][:6]
+                else:
+                    verdict['analysis'] = []
                 return verdict
             # glm-5.3-flash là thinking model: nếu max_tokens quá nhỏ, phần suy luận
             # (reasoning_content) ăn hết budget và content trả về rỗng
@@ -352,7 +367,7 @@ async def get_ai_analysis(session, digest):
         logger.warning(f"Lỗi gọi AI analysis: {e}")
         return None
 
-def build_ai_digest(symbol, timeframe_results, oi_change=None, taker_ratio=None, funding_rate=None):
+def build_ai_digest(symbol, timeframe_results, oi_change=None, taker_ratio=None, funding_rate=None, orderbook=None, btc_dominance=None):
     """Dựng text digest chỉ báo đa khung (số liệu, không phải giá thô) để gửi cho AI."""
     lines = [f"Phân tích kỹ thuật {symbol} — Binance Futures, nến đã đóng, điểm Rule engine (thang 10):"]
     for tf_name, res in timeframe_results:
@@ -376,6 +391,12 @@ def build_ai_digest(symbol, timeframe_results, oi_change=None, taker_ratio=None,
         lines.append(f"- Taker buy/sell ratio: {taker_ratio:.2f}")
     if funding_rate is not None:
         lines.append(f"- Funding rate: {funding_rate * 100:+.4f}%")
+    if orderbook:
+        imb = orderbook['imbalance'] * 100
+        ob_desc = "đa số bid 🟢" if imb > 5 else ("đa số ask 🔴" if imb < -5 else "cân bằng")
+        lines.append(f"- Order book (top 20 mức): bid/ask imbalance {imb:+.1f}% ({ob_desc}), spread {orderbook['spread_pct']:.3f}%")
+    if btc_dominance is not None:
+        lines.append(f"- BTC dominance: {btc_dominance:.1f}%")
     lines.append("Hãy kết luận hướng đi ngắn hạn theo đúng JSON yêu cầu.")
     return "\n".join(lines)
 
@@ -385,10 +406,222 @@ async def get_ai_verdict_cached(session, cache_key, digest):
     cached = ai_verdict_cache.get(cache_key)
     if cached and now - cached['ts'] < AI_CACHE_TTL:
         return cached['verdict']
-    verdict = await get_ai_analysis(session, digest)
+    lessons = await get_ai_lessons(session)
+    verdict = await get_ai_analysis(session, digest, lessons=lessons)
     if verdict:
         ai_verdict_cache[cache_key] = {'verdict': verdict, 'ts': now}
     return verdict
+
+
+# ─── AI tự học từ kết quả tín hiệu thực tế (feedback loop) ───
+AI_LESSONS_TTL = 12 * 3600
+ai_lessons_state = {'text': None, 'ts': 0, 'resolved_count': -1}
+ai_lessons_lock = asyncio.Lock()
+
+def build_signal_lessons_digest():
+    """Dựng digest từ lịch sử tín hiệu đã kết thúc (win/loss) để AI rút bài học."""
+    resolved = [s for s in signal_history if s.get('status') in ('win', 'loss')]
+    if len(resolved) < 5:
+        return None
+    wins = sum(1 for s in resolved if s['status'] == 'win')
+    lines = [
+        f"Thống kê {len(resolved)} tín hiệu gần nhất của hệ thống (TP chạm trước = win, SL chạm trước = loss):",
+        f"- Tổng: {wins} win / {len(resolved) - wins} loss ({wins / len(resolved) * 100:.0f}%)"
+    ]
+    for side in ('LONG', 'SHORT'):
+        sub = [s for s in resolved if s.get('side') == side]
+        if sub:
+            w = sum(1 for s in sub if s['status'] == 'win')
+            lines.append(f"- {side}: {w}/{len(sub)} win ({w / len(sub) * 100:.0f}%)")
+    for band in ('Mạnh', 'Rất mạnh'):
+        sub = [s for s in resolved if s.get('confidence') == band]
+        if sub:
+            w = sum(1 for s in sub if s['status'] == 'win')
+            lines.append(f"- Độ tin cậy '{band}': {w}/{len(sub)} win ({w / len(sub) * 100:.0f}%)")
+    lines.append("- 15 tín hiệu gần nhất:")
+    for s in resolved[-15:]:
+        ai_note = f", AI nhận định lúc đó: {s.get('ai')}" if s.get('ai') else ", AI lúc đó: không có"
+        lines.append(
+            f"  · {s['symbol']} {s['side']} ({s.get('confidence')}, điểm {s.get('score', 0):.1f}) -> {s['status']}{ai_note}"
+        )
+    lines.append(
+        "Hãy rút ra 3-5 bài học ngắn gọn về pattern nào đang hiệu quả/kém hiệu quả (side, band điểm, đặc điểm thị trường) "
+        "để cải thiện chất lượng chấm điểm tương lai. Trả lời bằng tiếng Việt, không dùng ký tự markdown (*, _, `). "
+        "Chỉ trả lời bằng MỘT JSON hợp lệ: {\"lessons\": [\"gạch đầu dòng, mỗi dòng dưới 200 ký tự\"]}"
+    )
+    return "\n".join(lines)
+
+
+async def get_ai_lessons(session):
+    """Bài học AI rút từ lịch sử tín hiệu. Cache 12h, chỉ refresh khi có tín hiệu mới kết thúc."""
+    resolved_count = sum(1 for s in signal_history if s.get('status') in ('win', 'loss'))
+    st = ai_lessons_state
+    if st['text'] and resolved_count == st['resolved_count'] and time.time() - st['ts'] < AI_LESSONS_TTL:
+        return st['text']
+    async with ai_lessons_lock:
+        resolved_count = sum(1 for s in signal_history if s.get('status') in ('win', 'loss'))
+        if st['text'] and resolved_count == st['resolved_count'] and time.time() - st['ts'] < AI_LESSONS_TTL:
+            return st['text']
+        digest = build_signal_lessons_digest()
+        if not digest or not os.getenv("DASH_TOKEN"):
+            return st['text']
+        model = os.getenv("DASH_MODEL", "glm-5.3-flash")
+        url = "https://opencode.ai/zen/go/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {os.getenv('DASH_TOKEN')}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Bạn là quản trị rủi ro giao dịch crypto, rút kinh nghiệm khách quan từ kết quả tín hiệu thực tế."},
+                {"role": "user", "content": digest}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2000
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    lessons = _extract_json(content)
+                    if lessons and isinstance(lessons.get('lessons'), list) and lessons['lessons']:
+                        st['text'] = "\n".join(f"- {str(x).strip()[:200]}" for x in lessons['lessons'][:5])
+                        st['ts'] = time.time()
+                        st['resolved_count'] = resolved_count
+                        logger.info("Đã cập nhật bài học AI từ lịch sử tín hiệu.")
+        except Exception as e:
+            logger.warning(f"Lỗi gọi AI lessons: {e}")
+        return st['text']
+
+
+# ─── Dữ liệu bổ trợ cho AI: order book + BTC dominance ───
+orderbook_cache = {}
+btc_dominance_cache = {'value': None, 'ts': 0}
+
+async def get_orderbook_summary(session, symbol, ttl=120):
+    """Tóm tắt order book futures (top 20 mức): mất cân bằng bid/ask + spread. Cache TTL ngắn."""
+    cache = orderbook_cache.setdefault(symbol, {'data': None, 'ts': 0})
+    now = time.time()
+    if cache['data'] is not None and now - cache['ts'] < ttl:
+        return cache['data']
+    try:
+        async with session.get(f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=20") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                bid_vol = sum(float(b[1]) for b in data.get('bids', []))
+                ask_vol = sum(float(a[1]) for a in data.get('asks', []))
+                total = bid_vol + ask_vol
+                if total > 0:
+                    best_bid = float(data['bids'][0][0])
+                    best_ask = float(data['asks'][0][0])
+                    summary = {
+                        'imbalance': (bid_vol - ask_vol) / total,
+                        'spread_pct': (best_ask - best_bid) / best_bid * 100 if best_bid > 0 else 0.0
+                    }
+                    cache.update({'data': summary, 'ts': now})
+                    return summary
+    except Exception as e:
+        logger.warning(f"Lỗi lấy order book {symbol}: {e}")
+    return cache['data']
+
+
+async def get_btc_dominance(session, ttl=3600):
+    """BTC dominance từ CoinGecko (free). Cache 1h. Trả về float hoặc None."""
+    now = time.time()
+    if btc_dominance_cache['value'] is not None and now - btc_dominance_cache['ts'] < ttl:
+        return btc_dominance_cache['value']
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get("https://api.coingecko.com/api/v3/global", headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                dom = data.get('data', {}).get('market_cap_percentage', {}).get('btc')
+                if dom is not None:
+                    btc_dominance_cache.update({'value': float(dom), 'ts': now})
+                    return float(dom)
+    except Exception as e:
+        logger.warning(f"Lỗi lấy BTC dominance: {e}")
+    return btc_dominance_cache['value']
+
+
+async def get_ai_review(session, digest):
+    """Gọi AI tổng quan rủi ro các vị thế đang mở. Trả về text hoặc None."""
+    api_key = os.getenv("DASH_TOKEN")
+    if not api_key or not digest:
+        return None
+    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
+    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    system_prompt = (
+        "Bạn là quản trị rủi ro giao dịch crypto futures. Dựa trên danh sách vị thế đang mở của khách hàng "
+        "(entry, giá mark, PnL, đòn bẩy, khoảng cách tới giá thanh lý, funding), hãy đánh giá tổng quan rủi ro danh mục "
+        "và đưa khuyến nghị hành động cụ thể cho từng vị thế (GIỮ / CHỐT MỘT PHẦN / DCA / CẮT LỖ). "
+        "Ưu tiên bảo toàn vốn, cảnh báo rõ vị thế gần thanh lý, đòn bẩy cao hoặc đi ngược động lượng. "
+        "Trả lời bằng tiếng Việt, tối đa 12 dòng, mỗi dòng một nhận định hoặc khuyến nghị, "
+        "bắt đầu mỗi khuyến nghị bằng tên coin. Không dùng các ký tự markdown (*, _, `). Không trả JSON."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": digest}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=90)
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"AI review trả lỗi HTTP {resp.status}: {body[:200]}")
+                return None
+            data = await resp.json()
+            content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            content = (content or '').strip()
+            return content[:3000] if content else None
+    except Exception as e:
+        logger.warning(f"Lỗi gọi AI review: {e}")
+        return None
+
+
+async def get_ai_chat(session, question, context_text):
+    """Chat tự do với AI (lệnh /ask). Trả về text hoặc None."""
+    api_key = os.getenv("DASH_TOKEN")
+    if not api_key or not question:
+        return None
+    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
+    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    system_prompt = (
+        "Bạn là trợ lý phân tích crypto futures, trả lời ngắn gọn, thực dụng, khách quan bằng tiếng Việt. "
+        "Dùng số liệu thị trường realtime được cung cấp nếu liên quan đến câu hỏi. "
+        "Không đưa khuyến nghị đòn bẩy cụ thể, nhắc quản trị rủi ro khi phù hợp. "
+        "Không dùng các ký tự markdown (*, _, `) trong câu trả lời."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Thông tin thị trường hiện tại:\n{context_text}\n\nCâu hỏi: {question}"}
+        ],
+        "temperature": 0.4,
+        "max_tokens": 3000
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=90)
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"AI chat trả lỗi HTTP {resp.status}: {body[:200]}")
+                return None
+            data = await resp.json()
+            content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            content = (content or '').strip()
+            return content[:3500] if content else None
+    except Exception as e:
+        logger.warning(f"Lỗi gọi AI chat: {e}")
+        return None
 
 
 # Hàm tạo chữ ký HMAC-SHA256 cho Binance API
@@ -2667,8 +2900,13 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             # AI phân tích độc lập (nếu cấu hình DASH_TOKEN)
             ai_verdict = None
             if os.getenv("DASH_TOKEN"):
+                ob_task = asyncio.create_task(get_orderbook_summary(session, symbol))
+                dom_task = asyncio.create_task(get_btc_dominance(session))
+                orderbook = await ob_task
+                btc_dominance = await dom_task
                 digest = build_ai_digest(symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
-                                          oi_change=oi_change, taker_ratio=taker_ratio, funding_rate=funding_rate)
+                                          oi_change=oi_change, taker_ratio=taker_ratio, funding_rate=funding_rate,
+                                          orderbook=orderbook, btc_dominance=btc_dominance)
                 ai_verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
                 if ai_verdict:
                     ai_dir = ai_verdict.get('direction', 'NEUTRAL')
@@ -2678,6 +2916,8 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                         f"👉 AI khuyến nghị: *{ai_emoji}* _({ai_verdict.get('confidence', 'trung bình')})_\n"
                         f"💬 _{ai_verdict.get('reason', '')}_\n"
                     )
+                    for bullet in ai_verdict.get('analysis', [])[:4]:
+                        msg += f"• _{bullet}_\n"
                     if res['signal'] != 'NEUTRAL' and ai_dir != 'NEUTRAL' and ai_dir != res['signal']:
                         msg += "⚠️ _AI mâu thuẫn với rule engine — cân nhắc bỏ qua tín hiệu này._\n"
                 else:
@@ -2784,11 +3024,15 @@ async def handle_ai_command(session, chat_id, coin_name=None):
         res_1h_task = asyncio.create_task(analyze_market(session, symbol, interval='1h'))
         res_4h_task = asyncio.create_task(analyze_market(session, symbol, interval='4h', fetch_extras=False))
         res_1d_task = asyncio.create_task(analyze_market(session, symbol, interval='1d', fetch_extras=False))
+        ob_task = asyncio.create_task(get_orderbook_summary(session, symbol))
+        dom_task = asyncio.create_task(get_btc_dominance(session))
 
         res_15m = await res_15m_task
         res = await res_1h_task
         res_4h = await res_4h_task
         res_1d = await res_1d_task
+        orderbook = await ob_task
+        btc_dominance = await dom_task
 
         if not res:
             if loading_msg_id:
@@ -2804,7 +3048,8 @@ async def handle_ai_command(session, chat_id, coin_name=None):
 
         digest = build_ai_digest(
             symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
-            oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'), funding_rate=funding_rate
+            oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'), funding_rate=funding_rate,
+            orderbook=orderbook, btc_dominance=btc_dominance
         )
         ai_verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
 
@@ -2828,8 +3073,11 @@ async def handle_ai_command(session, chat_id, coin_name=None):
             f"👉 *AI khuyến nghị: {ai_emoji}*\n"
             f"🔥 Độ tin cậy: _{ai_verdict.get('confidence', 'trung bình')}_\n"
             f"💬 _{ai_verdict.get('reason', '')}_\n"
-            f"\n📊 *Rule engine đối chiếu:*\n"
+            f"\n📝 *Nhận định chi tiết:*\n"
         )
+        for bullet in ai_verdict.get('analysis', []):
+            msg += f"• {bullet}\n"
+        msg += f"\n📊 *Rule engine đối chiếu:*\n"
         for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)]:
             if tf_res:
                 tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
@@ -2846,6 +3094,118 @@ async def handle_ai_command(session, chat_id, coin_name=None):
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi phân tích AI: {e}")
+
+
+async def handle_review_command(session, chat_id):
+    """Lệnh /review: AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ."""
+    if not os.getenv("DASH_TOKEN"):
+        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
+        return
+    if not positions:
+        await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
+        return
+
+    loading_msg_id = await send_telegram_message(session, chat_id, "🤖 Đang yêu cầu AI soi lại các vị thế đang mở...")
+    try:
+        api_key = os.getenv("BINANCE_API_KEY")
+        api_secret = os.getenv("BINANCE_API_SECRET")
+        timestamp = int(time.time() * 1000)
+        query_string = f"timestamp={timestamp}"
+        signature = get_binance_signature(query_string, api_secret)
+        url = f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}"
+        headers = {"X-MBX-APIKEY": api_key}
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error(f"Lỗi lấy positionRisk cho /review: HTTP {resp.status} - {body}")
+                if loading_msg_id:
+                    await delete_telegram_message(session, chat_id, loading_msg_id)
+                await send_telegram_message(session, chat_id, "❌ Lỗi khi lấy dữ liệu vị thế từ Binance.")
+                return
+            data = await resp.json()
+
+        open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
+        if not open_positions:
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+            await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
+            return
+
+        lines = ["Danh sách vị thế đang mở của tài khoản (Futures):"]
+        for p in open_positions:
+            amount = float(p.get('positionAmt', 0))
+            entry = float(p.get('entryPrice', 0))
+            mark = float(p.get('markPrice', 0))
+            pnl_pct = ((mark - entry) / entry * 100) if entry > 0 else 0.0
+            if amount < 0:
+                pnl_pct = -pnl_pct
+            liq = float(p.get('liquidationPrice', 0))
+            liq_dist = abs(mark - liq) / mark * 100 if mark > 0 and liq > 0 else None
+            funding_rate = positions.get(f"{p.get('symbol')}_{p.get('positionSide')}", {}).get('fundingRate', 0.0)
+
+            line = (
+                f"- {p.get('symbol')} {pos_side_display(p.get('positionSide'), amount)}: "
+                f"entry {format_price(entry)}, mark {format_price(mark)}, PnL {pnl_pct:+.2f}%, "
+                f"đòn bẩy {p.get('leverage')}x"
+            )
+            if liq_dist is not None:
+                line += f", cách giá thanh lý {liq_dist:.1f}% (liq {format_price(liq)})"
+            if abs(funding_rate) >= 0.005:
+                line += f", funding {funding_rate * 100:+.4f}%"
+            lines.append(line)
+        lines.append("Hãy đánh giá tổng quan rủi ro danh mục và khuyến nghị hành động cho từng vị thế.")
+
+        review = await get_ai_review(session, "\n".join(lines))
+
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+        if review:
+            await send_telegram_message(
+                session, chat_id,
+                f"🤖 *AI REVIEW VỊ THẾ ĐANG MỞ*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{review}"
+            )
+        else:
+            await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.")
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý lệnh review: {e}")
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi review vị thế: {e}")
+
+
+async def handle_ask_command(session, chat_id, question=None):
+    """Lệnh /ask: hỏi AI tự do về thị trường, kèm ngữ cảnh giá realtime."""
+    if not question:
+        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ask <câu hỏi>` (ví dụ: `/ask eth có nên mua lúc này không`)")
+        return
+    if not os.getenv("DASH_TOKEN"):
+        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
+        return
+
+    question = question.strip()[:1000]
+    loading_msg_id = await send_telegram_message(session, chat_id, "🤖 Đang hỏi AI...")
+    try:
+        tickers_map, _ = await get_market_snapshot(session)
+        context_lines = []
+        for sym in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'):
+            info = tickers_map.get(sym)
+            if info:
+                context_lines.append(f"- {sym}: {format_price(info['price'])} USDT, 24h {info.get('change', 0):+.2f}%")
+        context_text = "\n".join(context_lines) if context_lines else "Không lấy được dữ liệu giá realtime."
+
+        answer = await get_ai_chat(session, question, context_text)
+
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+        if answer:
+            await send_telegram_message(session, chat_id, f"🤖 {answer}")
+        else:
+            await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.")
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý lệnh ask: {e}")
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}")
 
 
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
@@ -4104,7 +4464,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/tracking', '/t', '/ct', '/canceltracking'
+            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ask'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -4176,6 +4536,8 @@ async def process_telegram_message(request, chat_id, text):
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
+            "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
+            "💬 `/ask <câu hỏi>` - Hỏi AI tự do về thị trường (ví dụ: `/ask eth có nên mua lúc này không`).\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
@@ -4406,6 +4768,13 @@ async def process_telegram_message(request, chat_id, text):
         parts = text.split()
         coin_name = parts[1] if len(parts) > 1 else None
         await handle_ai_command(request.app['session'], chat_id, coin_name)
+
+    elif command_base == '/review':
+        await handle_review_command(request.app['session'], chat_id)
+
+    elif command_base == '/ask':
+        question = text[len('/ask'):].strip()
+        await handle_ask_command(request.app['session'], chat_id, question)
         
     elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
