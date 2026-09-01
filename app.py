@@ -4360,6 +4360,54 @@ async def log_server_ip(session):
         logger.error(f"Lỗi khi lấy IP public của server: {e}")
 
 
+# Request giả lập cho chế độ polling (process_telegram_message cần request.app['session'])
+class FakeRequest:
+    def __init__(self, app, data):
+        self.app = app
+        self._data = data
+
+    async def json(self):
+        return self._data
+
+# Long polling Telegram: chủ động lấy update từ Telegram, không cần webhook/IP public
+async def telegram_polling_loop(app):
+    session = app['session']
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    base_url = f"https://api.telegram.org/bot{token}"
+
+    # Gỡ webhook cũ (nếu có) vì getUpdates xung đột với webhook
+    try:
+        async with session.post(f"{base_url}/deleteWebhook") as resp:
+            data = await resp.json()
+            if data.get('ok'):
+                logger.info("Đã gỡ webhook cũ, chuyển sang chế độ long polling.")
+    except Exception as e:
+        logger.warning(f"Không gỡ được webhook cũ: {e}")
+
+    offset = 0
+    logger.info("Bắt đầu long polling Telegram updates...")
+    while True:
+        try:
+            params = {"offset": offset, "timeout": 50}
+            async with session.post(f"{base_url}/getUpdates", json=params) as resp:
+                data = await resp.json()
+
+            if not data.get('ok'):
+                logger.error(f"getUpdates trả về lỗi: {data}")
+                await asyncio.sleep(5)
+                continue
+
+            for update in data.get('result', []):
+                offset = update['update_id'] + 1
+                if 'message' not in update:
+                    continue
+                await telegram_webhook_handler(FakeRequest(app, update))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi long polling Telegram: {e}")
+            await asyncio.sleep(5)
+
 # Lifecycle hooks của aiohttp
 async def on_startup(app):
     load_active_chats()
@@ -4374,8 +4422,10 @@ async def on_startup(app):
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
     
-    # 1. Tự động setWebhook Telegram
-    await setup_telegram_webhook(app['session'])
+    # 1. Chạy long polling Telegram (không cần webhook/IP public)
+    app['polling_task'] = asyncio.create_task(
+        telegram_polling_loop(app)
+    )
     
     # 2. Kiểm tra Position Mode (Hedge hay One-way) và lấy snapshot vị thế ban đầu từ Binance REST API
     try:
@@ -4404,6 +4454,8 @@ async def on_startup(app):
 
 async def on_cleanup(app):
     logger.info("Đang giải phóng tài nguyên...")
+    if 'polling_task' in app:
+        app['polling_task'].cancel()
     if 'user_data_task' in app:
         app['user_data_task'].cancel()
     if 'mark_price_task' in app:
