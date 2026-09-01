@@ -1,6 +1,7 @@
 import asyncio
 import math
 import hmac
+import base64
 import hashlib
 import time
 import os
@@ -595,7 +596,7 @@ def get_binance_signature(query_string, secret_key):
     ).hexdigest()
 
 # Gửi tin nhắn Telegram
-async def send_telegram_message(session, chat_id, text, is_auto=False):
+async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=None):
     if not is_auto:
         has_new_activity[chat_id] = True
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -603,8 +604,11 @@ async def send_telegram_message(session, chat_id, text, is_auto=False):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown"
+        "parse_mode": "Markdown",
+        "allow_sending_without_reply": True
     }
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
@@ -3098,13 +3102,71 @@ async def build_account_context(session):
     return "\n".join(lines) if lines else None
 
 
+async def download_telegram_photo(session, photo_sizes, max_bytes=4 * 1024 * 1024):
+    """Tải ảnh từ Telegram (chọn size lớn nhất <= max_bytes), trả về (data_url_base64, None) hoặc (None, err)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return None, "Chưa cấu hình TELEGRAM_BOT_TOKEN."
+    chosen = None
+    for p in reversed(photo_sizes or []):
+        if (p.get('file_size') or 0) <= max_bytes:
+            chosen = p
+            break
+    if not chosen:
+        return None, "Ảnh quá lớn (giới hạn 4MB cho tính năng AI)."
+    try:
+        async with session.get(f"https://api.telegram.org/bot{token}/getFile?file_id={chosen['file_id']}") as resp:
+            data = await resp.json()
+        file_path = (data.get('result') or {}).get('file_path')
+        if not file_path:
+            return None, "Không lấy được thông tin ảnh từ Telegram."
+        async with session.get(f"https://api.telegram.org/file/bot{token}/{file_path}") as resp:
+            if resp.status != 200:
+                return None, "Không tải được nội dung ảnh từ Telegram."
+            raw = await resp.read()
+        return f"data:image/jpeg;base64,{base64.b64encode(raw).decode()}", None
+    except Exception as e:
+        logger.warning(f"Lỗi tải ảnh Telegram: {e}")
+        return None, "Lỗi khi tải ảnh."
+
+
+async def handle_photo_message(session, chat_id, photo_sizes, caption, reply_to=None):
+    """Xử lý tin nhắn ảnh (kèm/không kèm caption): tải ảnh rồi đưa cho AI agent phân tích."""
+    question = (caption or '').strip()[:1000] or "Phân tích hình ảnh này trong bối cảnh giao dịch crypto của tôi."
+    image_url, err = await download_telegram_photo(session, photo_sizes)
+    if err:
+        await send_telegram_message(session, chat_id, f"❌ {err}", reply_to=reply_to)
+        return
+    await handle_ai_command(session, chat_id, question, reply_to=reply_to, image_data_url=image_url)
+
+
 # ─── Agent tools cho /ai: đọc dữ liệu tài khoản + soạn lệnh (có bước xác nhận) ───
 pending_orders = {}  # chat_id -> {'type': 'place_order'|'cancel_order', 'params': {...}, 'desc': str, 'ts': float}
 PENDING_ORDER_TTL = 600
 ai_chat_history = {}  # chat_id -> list message (user/assistant) gần nhất: bộ nhớ hội thoại của agent
 AI_HISTORY_MAX_MSGS = 16
-CONFIRM_WORDS = {'xác nhận', 'xac nhan', 'xác nhận!', 'xacnhan', 'ok', 'yes', 'y', 'confirm', 'okê', 'oke'}
-CANCEL_WORDS = {'hủy', 'huy', 'no', 'không', 'khong', 'cancel', 'hủy đi', 'huy di'}
+# Nhận diện xác nhận/hủy linh hoạt: tin nhắn ngắn (< 40 ký tự) có chứa từ khóa
+CONFIRM_RE = re.compile(
+    r'\b(xac nhan|xác nhận|xacnhan|ok|oke|okê|yes|y|confirm|dong y|đồng ý|dat di|đặt đi|'
+    r'chot di|chốt đi|lam di|làm đi|ap dung|áp dụng|do it|dzo|zo)\b', re.IGNORECASE)
+CANCEL_RE = re.compile(
+    r'\b(hủy|huy|hủy bỏ|hủy đi|huy di|huy bo|cancel|bỏ qua|bo qua|dừng lại|dung lai|đừng|no)\b',
+    re.IGNORECASE)
+
+
+def _is_confirmation(text):
+    t = text.strip().lower()
+    if len(t) > 40:
+        return False
+    # Có dấu hiệu câu hỏi (dấu ?, hỏi giá, hỏi thế nào...) -> không phải xác nhận, để AI xử lý
+    if re.search(r'\?|giá|gia |bao nhiêu|bao nhieu|thế nào|the nao|sao|vì sao|vi sao|không\b|ko\b|nhỉ|chứ', t):
+        return False
+    return bool(CONFIRM_RE.search(t))
+
+
+def _is_cancellation(text):
+    t = text.strip().lower()
+    return len(t) <= 40 and bool(CANCEL_RE.search(t))
 
 
 async def binance_signed_request(session, method, path, params=None):
@@ -3221,10 +3283,15 @@ async def tool_get_income_history(session, chat_id, args):
 
 
 async def _stage_order(session, chat_id, order_type, params, desc):
-    """Soạn lệnh ghi vào trạng thái chờ xác nhận, không thực thi ngay."""
-    pending_orders[chat_id] = {'type': order_type, 'params': params, 'desc': desc, 'ts': time.time()}
-    return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + desc +
-            "\nHãy trình bày lại chi tiết lệnh cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy' qua /ai. "
+    """Soạn lệnh ghi vào hàng chờ xác nhận (hỗ trợ NHIỀU lệnh cùng lúc), không thực thi ngay."""
+    entry = pending_orders.get(chat_id)
+    if not entry or time.time() - entry.get('ts', 0) > PENDING_ORDER_TTL:
+        entry = {'items': [], 'ts': time.time()}
+    entry['items'].append({'type': order_type, 'params': params, 'desc': desc})
+    entry['ts'] = time.time()
+    pending_orders[chat_id] = entry
+    return (f"NEEDS_CONFIRMATION: Lệnh đã được soạn (hiện có {len(entry['items'])} lệnh chờ xác nhận):\n" + desc +
+            "\nHãy trình bày lại chi tiết lệnh cho người dùng và nhắc họ trả lời 'xác nhận' để hệ thống đặt TẤT CẢ các lệnh đã soạn, hoặc 'hủy' để bỏ. "
             "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
 
 
@@ -3279,7 +3346,6 @@ async def tool_close_position(session, chat_id, args):
         return f"Không có vị thế nào đang mở cho {symbol}."
     qty_p, _, _ = await get_symbol_precisions(session, symbol)
     descs = []
-    params_staged = None
     for p in open_positions:
         amount = float(p.get('positionAmt', 0))
         p_side = pos_side_display(p.get('positionSide'), amount)
@@ -3292,10 +3358,9 @@ async def tool_close_position(session, chat_id, args):
             params['reduceOnly'] = 'true'
         desc = f"ĐÓNG vị thế {symbol} {p_side} (MARKET, qty {round(abs(amount), qty_p)}) — Lệnh THẬT."
         descs.append(desc)
-        params_staged = params
-    pending_orders[chat_id] = {'type': 'place_order', 'params': params_staged, 'desc': "\n".join(descs), 'ts': time.time()}
+        await _stage_order(session, chat_id, 'place_order', params, desc)
     return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + "\n".join(descs) +
-            "\nHãy trình bày lại chi tiết cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy' qua /ai. "
+            "\nHãy trình bày lại chi tiết cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy'. "
             "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
 
 
@@ -3457,35 +3522,42 @@ async def get_ai_agent_response(session, messages, tools):
 
 
 async def execute_pending_order(session, chat_id):
-    """Thực thi lệnh đã được xác nhận. Trả về text kết quả."""
+    """Thực thi TẤT CẢ lệnh đã soạn khi người dùng xác nhận. Trả về text kết quả."""
     pending = pending_orders.pop(chat_id, None)
-    if not pending:
+    if not pending or not pending.get('items'):
         return "Không có lệnh nào đang chờ xác nhận."
-    if pending['type'] == 'place_order':
-        data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', pending['params'])
-    elif pending['type'] == 'cancel_order':
-        data, err = await binance_signed_request(session, 'DELETE', '/fapi/v1/order', pending['params'])
-    else:
-        return "❌ Không hiểu loại lệnh đang chờ."
-    if err:
-        return f"❌ Thực thi lệnh THẤT BẠI: {err}"
-    if pending['type'] == 'place_order':
-        return (f"✅ *Đã đặt lệnh thành công!*\n"
-                f"{pending['desc']}\n"
-                f"OrderId: `{data.get('orderId')}` | Status: {data.get('status')}")
-    return f"✅ Đã hủy lệnh #{pending['params'].get('orderId')} trên {pending['params'].get('symbol')}."
+    results = []
+    ok_count = 0
+    for item in pending['items']:
+        if item['type'] == 'place_order':
+            data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', item['params'])
+        elif item['type'] == 'cancel_order':
+            data, err = await binance_signed_request(session, 'DELETE', '/fapi/v1/order', item['params'])
+        else:
+            results.append(f"❌ Không hiểu loại lệnh: {item['type']}")
+            continue
+        if err:
+            results.append(f"❌ {item['desc']}\n→ THẤT BẠI: {err}")
+        elif item['type'] == 'place_order':
+            ok_count += 1
+            results.append(f"✅ {item['desc']}\n→ OrderId: `{data.get('orderId')}` | Status: {data.get('status')}")
+        else:
+            ok_count += 1
+            results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId')} trên {item['params'].get('symbol')}.")
+    header = f"🚀 *Đã thực thi {ok_count}/{len(pending['items'])} lệnh:*\n" if len(pending['items']) > 1 else ""
+    return header + "\n\n".join(results)
 
 
-async def handle_ai_command(session, chat_id, question=None):
-    """Lệnh /ai: agent AI tự do - đọc mọi dữ liệu tài khoản, phân tích coin và soạn lệnh (có bước xác nhận)."""
-    if not question:
-        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <câu hỏi hoặc tên coin>` (ví dụ: `/ai btc`, `/ai xem vị thế của tôi`, `/ai đặt long btc 0.01`)")
+async def handle_ai_command(session, chat_id, question=None, reply_to=None, image_data_url=None, photo_sizes=None):
+    """Lệnh /ai: agent AI tự do - đọc mọi dữ liệu tài khoản, phân tích coin, đọc ảnh và soạn lệnh (có bước xác nhận)."""
+    if not question and not image_data_url and not photo_sizes:
+        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <câu hỏi hoặc tên coin>` (ví dụ: `/ai btc`, `/ai xem vị thế của tôi`, `/ai đặt long btc 0.01`)", reply_to=reply_to)
         return
     if not os.getenv("DASH_TOKEN"):
-        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
+        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.", reply_to=reply_to)
         return
 
-    question = question.strip()[:1000]
+    question = (question or "Phân tích hình ảnh này trong bối cảnh giao dịch crypto của tôi.").strip()[:1000]
 
     # Nếu người dùng chỉ gõ tên coin (vd: /ai btc) -> chuyển thành câu hỏi phân tích coin
     if re.fullmatch(r'[a-z0-9]{2,10}', question.lower()):
@@ -3494,7 +3566,7 @@ async def handle_ai_command(session, chat_id, question=None):
     # Reset bộ nhớ hội thoại nếu người dùng yêu cầu
     if question.lower() in ('reset', 'làm mới', 'làm mới hội thoại', 'xóa hội thoại', 'xoá hội thoại'):
         ai_chat_history.pop(chat_id, None)
-        await send_telegram_message(session, chat_id, "🧹 Đã xóa bộ nhớ hội thoại. Bắt đầu cuộc trò chuyện mới.")
+        await send_telegram_message(session, chat_id, "🧹 Đã xóa bộ nhớ hội thoại. Bắt đầu cuộc trò chuyện mới.", reply_to=reply_to)
         return
 
     # 2. Xử lý xác nhận/hủy lệnh đang chờ
@@ -3503,18 +3575,26 @@ async def handle_ai_command(session, chat_id, question=None):
         del pending_orders[chat_id]
         pending = None
     if pending:
-        text_low = question.lower().strip()
-        if text_low in CONFIRM_WORDS:
+        if _is_confirmation(question):
             result = await execute_pending_order(session, chat_id)
-            await send_telegram_message(session, chat_id, result)
+            await send_telegram_message(session, chat_id, result, reply_to=reply_to)
             return
-        if text_low in CANCEL_WORDS:
+        if _is_cancellation(question):
             del pending_orders[chat_id]
-            await send_telegram_message(session, chat_id, "🚫 Đã hủy lệnh đang chờ xác nhận.")
+            await send_telegram_message(session, chat_id, "🚫 Đã hủy lệnh đang chờ xác nhận.", reply_to=reply_to)
             return
 
-    loading_msg_id = await send_telegram_message(session, chat_id, "⏳ *[1/2]* Đang lấy dữ liệu thị trường + tài khoản...")
+    loading_msg_id = await send_telegram_message(session, chat_id, "🤖 AI đang xử lý câu hỏi...", reply_to=reply_to)
     try:
+        if photo_sizes and not image_data_url:
+            image_url, img_err = await download_telegram_photo(session, photo_sizes)
+            if img_err:
+                if loading_msg_id:
+                    await delete_telegram_message(session, chat_id, loading_msg_id)
+                await send_telegram_message(session, chat_id, f"❌ {img_err}", reply_to=reply_to)
+                return
+            image_data_url = image_url
+
         tickers_map, _ = await get_market_snapshot(session)
         context_lines = []
         for sym in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'):
@@ -3526,11 +3606,6 @@ async def handle_ai_command(session, chat_id, question=None):
         account_text = await build_account_context(session)
         if account_text:
             context_text += f"\n\nTài khoản Binance Futures của người dùng (có thể đã cũ — dùng công cụ để lấy dữ liệu mới nhất):\n{account_text}"
-
-        if loading_msg_id:
-            loading_msg_id = await edit_telegram_message(
-                session, chat_id, loading_msg_id, "🤖 *[2/2]* Đã có dữ liệu. Đang nhờ AI xử lý..."
-            )
 
         system_prompt = (
             "Bạn là trợ lý giao dịch crypto futures có quyền truy cập dữ liệu tài khoản Binance của người dùng qua các công cụ. "
@@ -3552,11 +3627,25 @@ async def handle_ai_command(session, chat_id, question=None):
             "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
             "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
             "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
+            "Nếu người dùng gửi kèm hình ảnh, hãy mô tả/phân tích nó (chart, giao dịch, thông báo lỗi, tin tức...) "
+            "kết hợp với dữ liệu thị trường và tài khoản nếu liên quan. "
             "Trả lời tiếng Việt, ngắn gọn, thực dụng, không dùng ký tự markdown (*, _, `)."
         )
         user_content = f"Thông tin thị trường hiện tại:\n{context_text}\n\nCâu hỏi: {question}"
         if pending:
-            user_content += f"\n\n(Lưu ý: đang có lệnh chờ xác nhận: {pending['desc']} — nhắc người dùng 'xác nhận' hoặc 'hủy'.)"
+            pending_desc = "\n".join(f"- {it['desc']}" for it in pending['items'])
+            user_content += (
+                f"\n\n(QUAN TRỌNG: đang có {len(pending['items'])} lệnh đã soạn chờ người dùng xác nhận:\n{pending_desc}\n"
+                f"Tin nhắn người dùng vừa gửi: '{question}'. Nếu đây là lời đồng ý/chỉnh sửa/hủy liên quan đến các lệnh trên, "
+                f"hãy xử lý theo ý họ (chỉnh sửa = soạn lại lệnh bằng công cụ). "
+                f"KHÔNG diễn giải các từ đồng ý chung như 'oke', 'ok', 'được' thành tên coin hay mã nào đó. "
+                f"Lệnh CHỈ được hệ thống đặt khi người dùng gõ 'xác nhận'.)"
+            )
+        if image_data_url:
+            user_content = [
+                {"type": "text", "text": user_content},
+                {"type": "image_url", "image_url": {"url": image_data_url}}
+            ]
 
         history = ai_chat_history.get(chat_id, [])
         messages = (
@@ -3579,14 +3668,12 @@ async def handle_ai_command(session, chat_id, question=None):
             'cancel_order': '🚫 đang soạn hủy lệnh',
             'close_position': '🔒 đang soạn lệnh đóng vị thế',
         }
-        step = 0
         for _ in range(8):
             msg = await get_ai_agent_response(session, messages, ASK_TOOLS)
             if not msg:
                 break
             tool_calls = msg.get('tool_calls')
             if tool_calls:
-                step += 1
                 # Ưu tiên câu AI tự mô tả việc đang làm; fallback về nhãn gán sẵn theo tên tool
                 ai_note = (msg.get('content') or '').strip().split('\n')[0][:150]
                 if not ai_note:
@@ -3596,7 +3683,7 @@ async def handle_ai_command(session, chat_id, question=None):
                 if loading_msg_id:
                     loading_msg_id = await edit_telegram_message(
                         session, chat_id, loading_msg_id,
-                        f"🤖 *[Bước {step}]* {ai_note}"
+                        f"🤖 {ai_note}"
                     )
                 messages.append(msg)
                 for tc in tool_calls:
@@ -3623,14 +3710,14 @@ async def handle_ai_command(session, chat_id, question=None):
             history.append({"role": "user", "content": question})
             history.append({"role": "assistant", "content": final_text[:1500]})
             ai_chat_history[chat_id] = history[-AI_HISTORY_MAX_MSGS:]
-            await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}")
+            await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}", reply_to=reply_to)
         else:
-            await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.")
+            await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.", reply_to=reply_to)
     except Exception as e:
         logger.error(f"Lỗi khi xử lý lệnh AI: {e}")
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
-        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}")
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}", reply_to=reply_to)
 
 
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
@@ -4872,14 +4959,27 @@ async def telegram_webhook_handler(request):
         save_active_chats()
         
     text = message.get('text', '').strip()
-    
+
     if not text:
+        # Tin nhắn ảnh (kèm/không kèm caption): giữ lại tin nhắn, đưa cho AI agent phân tích
+        photos = message.get('photo')
+        if photos:
+            message_id = message.get('message_id')
+            caption = (message.get('caption') or '').strip()
+            asyncio.create_task(handle_photo_message(
+                request.app['session'], chat_id, photos, caption, reply_to=message_id
+            ))
         return web.Response(status=200)
         
-    # Xóa tin nhắn của user nếu là command hoặc tin nhắn tra cứu giá coin được hỗ trợ
+    # Xóa tin nhắn của user nếu là command hoặc tin nhắn tra cứu giá coin.
+    # Câu hỏi gửi cho AI agent thì GIỮ LẠI và bot sẽ reply vào tin nhắn đó.
     should_delete = False
+    ai_reply_to = None
     if not text.startswith('/'):
-        should_delete = True
+        if is_coin_price_query(text):
+            should_delete = True
+        else:
+            ai_reply_to = message.get('message_id')
     else:
         command = text.split()[0].lower()
         command_base = command.split('@')[0]
@@ -4893,19 +4993,21 @@ async def telegram_webhook_handler(request):
         }
         if command_base in supported_commands:
             should_delete = True
-            
+            if command_base == '/ai':
+                ai_reply_to = None  # lệnh /ai vẫn xóa như cũ
+
     if should_delete:
         message_id = message.get('message_id')
         if message_id:
             asyncio.create_task(delete_telegram_message(request.app['session'], chat_id, message_id))
-            
+
     # Xử lý lệnh ở nền để trả 200 ngay, tránh Telegram timeout rồi gửi lại webhook gây trùng lặp
     async def run_command():
         try:
-            await process_telegram_message(request, chat_id, text)
+            await process_telegram_message(request, chat_id, text, ai_reply_to)
         except Exception as e:
             logger.error(f"Lỗi xử lý tin nhắn từ {chat_id}: {e}")
-            
+
     asyncio.create_task(run_command())
     return web.Response(status=200)
 
@@ -4929,7 +5031,7 @@ def is_coin_price_query(text):
     return True
 
 
-async def process_telegram_message(request, chat_id, text):
+async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
     # Nếu tin nhắn không bắt đầu bằng '/': tên coin thuần -> tra giá nhanh, còn lại -> AI agent
     if not text.startswith('/'):
         if is_coin_price_query(text):
@@ -4954,7 +5056,7 @@ async def process_telegram_message(request, chat_id, text):
                 if response_lines:
                     await send_telegram_message(request.app['session'], chat_id, "\n".join(response_lines))
         else:
-            await handle_ai_command(request.app['session'], chat_id, text)
+            await handle_ai_command(request.app['session'], chat_id, text, reply_to=ai_reply_to)
         return web.Response(status=200)
         
     command = text.split()[0].lower()
