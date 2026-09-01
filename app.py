@@ -2763,6 +2763,91 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             await send_telegram_message(session, chat_id, f"❌ Lỗi khi quét tín hiệu thị trường: {e}")
 
 
+async def handle_ai_command(session, chat_id, coin_name=None):
+    """Lệnh /ai <coin>: yêu cầu AI phân tích coin trực tiếp từ số liệu chỉ báo đa khung."""
+    if not coin_name:
+        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <coin>` (ví dụ: `/ai btc`, `/ai eth`)")
+        return
+
+    if not os.getenv("DASH_TOKEN"):
+        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
+        return
+
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+
+    loading_msg_id = await send_telegram_message(
+        session, chat_id, f"🤖 Đang yêu cầu AI phân tích *{symbol}*..."
+    )
+    try:
+        res_15m_task = asyncio.create_task(analyze_market(session, symbol, interval='15m', fetch_extras=False))
+        res_1h_task = asyncio.create_task(analyze_market(session, symbol, interval='1h'))
+        res_4h_task = asyncio.create_task(analyze_market(session, symbol, interval='4h', fetch_extras=False))
+        res_1d_task = asyncio.create_task(analyze_market(session, symbol, interval='1d', fetch_extras=False))
+
+        res_15m = await res_15m_task
+        res = await res_1h_task
+        res_4h = await res_4h_task
+        res_1d = await res_1d_task
+
+        if not res:
+            if loading_msg_id:
+                await delete_telegram_message(session, chat_id, loading_msg_id)
+            await send_telegram_message(
+                session, chat_id, f"❌ Không thể lấy dữ liệu cho *{symbol}*. Vui lòng kiểm tra lại tên coin."
+            )
+            return
+
+        funding_rate = res.get('funding_rate')
+        if funding_rate is None:
+            funding_rate = await get_single_funding_rate(session, symbol)
+
+        digest = build_ai_digest(
+            symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
+            oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'), funding_rate=funding_rate
+        )
+        ai_verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
+
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+
+        if not ai_verdict:
+            await send_telegram_message(
+                session, chat_id, f"🤖 AI không phản hồi hoặc lỗi khi phân tích *{symbol}*. Vui lòng thử lại sau."
+            )
+            return
+
+        ai_dir = ai_verdict.get('direction', 'NEUTRAL')
+        ai_emoji = "🟩 LONG" if ai_dir == 'LONG' else ("🟥 SHORT" if ai_dir == 'SHORT' else "⬜ NEUTRAL")
+        sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL")
+
+        msg = (
+            f"🤖 *AI PHÂN TÍCH: {symbol}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 Giá: `{format_price(res['close'])} USDT`\n\n"
+            f"👉 *AI khuyến nghị: {ai_emoji}*\n"
+            f"🔥 Độ tin cậy: _{ai_verdict.get('confidence', 'trung bình')}_\n"
+            f"💬 _{ai_verdict.get('reason', '')}_\n"
+            f"\n📊 *Rule engine đối chiếu:*\n"
+        )
+        for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)]:
+            if tf_res:
+                tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
+                msg += f"• *{tf_name}:* {tf_sig} (L:`{tf_res['long_score']:.1f}`/S:`{tf_res['short_score']:.1f}`)\n"
+        msg += f"👉 Rule 1h: {sig_emoji}"
+
+        if ai_dir != 'NEUTRAL' and res['signal'] != 'NEUTRAL' and ai_dir != res['signal']:
+            msg += "\n\n⚠️ _AI mâu thuẫn với rule engine — cân nhắc kỹ trước khi vào lệnh._"
+
+        await send_telegram_message(session, chat_id, msg)
+
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý lệnh AI cho {symbol}: {e}")
+        if loading_msg_id:
+            await delete_telegram_message(session, chat_id, loading_msg_id)
+        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi phân tích AI: {e}")
+
+
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
 async def check_position_mode(session, api_key, api_secret):
     global hedge_mode
@@ -4018,7 +4103,7 @@ async def telegram_webhook_handler(request):
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
-            '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
+            '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
             '/tracking', '/t', '/ct', '/canceltracking'
         }
         if command_base in supported_commands:
@@ -4090,6 +4175,7 @@ async def process_telegram_message(request, chat_id, text):
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
+            "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
@@ -4315,6 +4401,11 @@ async def process_telegram_message(request, chat_id, text):
         parts = text.split()
         coin_name = parts[1] if len(parts) > 1 else None
         await handle_analyze_command(request.app['session'], chat_id, coin_name)
+
+    elif command_base == '/ai':
+        parts = text.split()
+        coin_name = parts[1] if len(parts) > 1 else None
+        await handle_ai_command(request.app['session'], chat_id, coin_name)
         
     elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
