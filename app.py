@@ -3322,6 +3322,11 @@ async def tool_get_positions(session, chat_id, args):
     if err:
         return f"LỖI: {err}"
     open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
+    try:
+        logger.info(f"[DIAG] positionRisk: {len(open_positions)} vị thế | "
+                    + " | ".join(f"{p.get('symbol')} tp={p.get('tpPrice')} sl={p.get('slPrice')}" for p in open_positions[:10]))
+    except Exception:
+        pass
     if not open_positions:
         return "Không có vị thế nào đang mở."
     lines = []
@@ -3349,6 +3354,10 @@ async def tool_get_open_orders(session, chat_id, args):
     data, err = await binance_signed_request(session, 'GET', '/fapi/v1/openOrders', params)
     if err:
         return f"LỖI: {err}"
+    try:
+        logger.info(f"[DIAG] openOrders ({params}): {len(data)} lệnh | types: {[o.get('type') for o in data[:10]]}")
+    except Exception:
+        pass
     if not data:
         return "Không có lệnh nào đang chờ (kể cả lệnh điều kiện)."
     lines = []
@@ -3642,7 +3651,7 @@ TOOL_EXECUTORS = {
 }
 
 
-async def get_ai_agent_response(session, messages, tools):
+async def get_ai_agent_response(session, messages, tools, max_tokens=3000):
     """Một lượt gọi LLM hỗ trợ tool calling. Trả về (message_dict, None) khi OK hoặc (None, error_detail) khi lỗi."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
@@ -3655,7 +3664,7 @@ async def get_ai_agent_response(session, messages, tools):
         "messages": messages,
         "tools": tools,
         "temperature": 0.3,
-        "max_tokens": 3000
+        "max_tokens": max_tokens
     }
     try:
         timeout = aiohttp.ClientTimeout(total=90)
@@ -3956,6 +3965,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
 
         final_text = None
         error_detail = None
+        retried_long = False
         TOOL_LABELS = {
             'analyze_coin': '📊 đang phân tích coin',
             'get_price': '📈 đang tra giá coin',
@@ -3971,6 +3981,11 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         }
         for _ in range(8):
             msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS)
+            if err and 'finish_reason=length' in err and not retried_long:
+                # Thinking model tiêu hết budget: thử lại 1 lần với max_tokens lớn hơn
+                retried_long = True
+                logger.warning("Agent bị cắt ngắn (finish_reason=length) — retry với max_tokens=8000.")
+                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, max_tokens=8000)
             if err:
                 error_detail = err
                 logger.warning(f"Agent dừng với lỗi: {err}")
