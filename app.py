@@ -3355,31 +3355,34 @@ async def tool_get_open_orders(session, chat_id, args):
     if err:
         return f"LỖI: {err}"
     orders = list(data or [])
-    # Lệnh điều kiện TP/SL đặt từ app Binance nằm ở hệ thống Portfolio Margin,
-    # KHÔNG xuất hiện trong /fapi/v1/openOrders — phải query papi riêng
-    cond, cond_err = await binance_signed_request(
-        session, 'GET', '/papi/v1/um/conditional/openOrders', None, base_url="https://papi.binance.com")
-    if cond_err:
-        logger.info(f"[DIAG] papi conditional/openOrders lỗi (có thể tài khoản không phải PM): {cond_err}")
+    # Lệnh điều kiện TP/SL (đặt từ app Binance hoặc từ bot) đã migrated sang Algo Service (12/2025):
+    # nằm ở /fapi/v1/openAlgoOrders, KHÔNG nằm trong openOrders thường
+    algo, algo_err = await binance_signed_request(session, 'GET', '/fapi/v1/openAlgoOrders', params or None)
+    if algo_err:
+        logger.info(f"[DIAG] openAlgoOrders lỗi: {algo_err}")
     else:
-        logger.info(f"[DIAG] papi conditional: {len(cond or [])} lệnh")
-        orders = orders + list(cond or [])
+        logger.info(f"[DIAG] openAlgoOrders: {len(algo or [])} lệnh")
+        orders = orders + list(algo or [])
     try:
-        logger.info(f"[DIAG] openOrders ({params}): {len(data or [])} lệnh fapi + "
-                    f"{len(orders) - len(data or [])} lệnh điều kiện | types: {[o.get('type') or o.get('strategyType') for o in orders[:10]]}")
+        logger.info(f"[DIAG] openOrders ({params}): {len(data or [])} lệnh thường + {len(orders) - len(data or [])} lệnh algo")
     except Exception:
         pass
     if not orders:
-        return "Không có lệnh nào đang chờ (kể cả lệnh điều kiện)."
+        return "Không có lệnh nào đang chờ (kể cả TP/SL điều kiện)."
     lines = []
     for o in orders[:20]:
-        is_app_cond = 'strategyId' in o
-        otype = o.get('origStrategyType') or o.get('strategyType') or o.get('type', '')
-        line = (f"{o.get('symbol')} #{o.get('strategyId') or o.get('orderId')} {o.get('side')} {otype} "
-                f"qty {o.get('origQty')}")
-        stop_price = float(o.get('stopPrice') or 0)
-        if stop_price > 0:
-            line += f" | kích hoạt khi chạm {format_price(stop_price)}"
+        is_algo = 'algoId' in o
+        otype = o.get('orderType') if is_algo else o.get('type', '')
+        oid = o.get('algoId') if is_algo else o.get('orderId')
+        line = (f"{o.get('symbol')} #{oid} {o.get('side')} {otype} qty {o.get('quantity') or o.get('origQty')}")
+        if is_algo and o.get('algoStatus') and o.get('algoStatus') != 'NEW':
+            line += f" (algoStatus={o.get('algoStatus')}, đã thành lệnh thường #{o.get('actualOrderId')})"
+        try:
+            trigger = float(o.get('triggerPrice') or o.get('stopPrice') or 0)
+        except (TypeError, ValueError):
+            trigger = 0
+        if trigger > 0:
+            line += f" | kích hoạt khi chạm {format_price(trigger)}"
             wt = o.get('workingType')
             if wt:
                 line += f" (theo {wt})"
@@ -3387,8 +3390,8 @@ async def tool_get_open_orders(session, chat_id, args):
             line += f" @ {o.get('price')}"
         if o.get('reduceOnly') or o.get('closePosition'):
             line += " (reduceOnly - chỉ đóng vị thế)"
-        if is_app_cond:
-            line += " [lệnh điều kiện app — hủy bằng strategyId, conditional=true]"
+        if is_algo:
+            line += " [lệnh TP/SL điều kiện — hủy bằng algoId với conditional=true]"
         lines.append(line)
     return "\n".join(lines)
 
@@ -3477,20 +3480,36 @@ async def tool_place_order(session, chat_id, args):
         return "LỖI: lệnh điều kiện cần stop_price (giá kích hoạt)."
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
     quantity = round(quantity, qty_p)
-    params = {'symbol': symbol, 'side': side, 'type': otype, 'quantity': f"{quantity:.{qty_p}f}"}
     desc = f"{symbol} {side} {otype} quantity {quantity}"
+
+    if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
+        # Conditional orders đã migrated sang Algo Service: /fapi/v1/order trả -4120
+        stop_price = round_price_step(float(args['stop_price']), tick_size, price_p)
+        algo_params = {
+            'algoType': 'CONDITIONAL',
+            'symbol': symbol, 'side': side, 'type': otype,
+            'triggerPrice': f"{stop_price:.{price_p}f}",
+            'quantity': f"{quantity:.{qty_p}f}",
+        }
+        if args.get('working_type'):
+            wt = str(args['working_type']).upper()
+            if wt in ('MARK_PRICE', 'CONTRACT_PRICE'):
+                algo_params['workingType'] = wt
+        if hedge_mode:
+            algo_params['positionSide'] = str(args.get('position_side') or ('LONG' if side == 'BUY' else 'SHORT')).upper()
+        else:
+            algo_params['reduceOnly'] = 'true'
+        desc += f" | kích hoạt khi chạm {stop_price}"
+        if algo_params.get('reduceOnly'):
+            desc += " (reduceOnly)"
+        desc += " — Lệnh THẬT sẽ khớp trên tài khoản của người dùng."
+        return await _stage_order(session, chat_id, 'place_algo_order', algo_params, desc)
+
+    params = {'symbol': symbol, 'side': side, 'type': otype, 'quantity': f"{quantity:.{qty_p}f}"}
     if otype == 'LIMIT':
         price = round_price_step(float(args['price']), tick_size, price_p)
         params.update({'price': f"{price:.{price_p}f}", 'timeInForce': 'GTC'})
         desc += f" @ {price}"
-    elif otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
-        stop_price = round_price_step(float(args['stop_price']), tick_size, price_p)
-        params['stopPrice'] = f"{stop_price:.{price_p}f}"
-        if args.get('working_type'):
-            wt = str(args['working_type']).upper()
-            if wt in ('MARK_PRICE', 'CONTRACT_PRICE'):
-                params['workingType'] = wt
-        desc += f" | kích hoạt khi chạm {stop_price}"
     if hedge_mode:
         params['positionSide'] = str(args.get('position_side') or ('LONG' if side == 'BUY' else 'SHORT')).upper()
     elif args.get('reduce_only'):
@@ -3505,10 +3524,10 @@ async def tool_cancel_order(session, chat_id, args):
         return "LỖI: cần order_id."
     symbol = _norm_symbol(args)
     if args.get('conditional'):
-        # Lệnh điều kiện đặt từ app: hủy qua papi bằng strategyId
-        params = {'symbol': symbol, 'strategyId': str(args['order_id'])}
-        desc = f"Hủy lệnh điều kiện #{args['order_id']} trên {symbol}"
-        return await _stage_order(session, chat_id, 'cancel_conditional', params, desc)
+        # Lệnh TP/SL điều kiện (algo service): hủy bằng algoId
+        params = {'symbol': symbol, 'algoId': str(args['order_id'])}
+        desc = f"Hủy lệnh TP/SL điều kiện #{args['order_id']} trên {symbol}"
+        return await _stage_order(session, chat_id, 'cancel_algo', params, desc)
     params = {'symbol': symbol, 'orderId': str(args['order_id'])}
     desc = f"Hủy lệnh #{args['order_id']} trên {symbol}"
     return await _stage_order(session, chat_id, 'cancel_order', params, desc)
@@ -3647,11 +3666,11 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_positions", "description": "Danh sách vị thế futures đang mở: entry, mark, PnL, đòn bẩy, giá thanh lý.", "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {"name": "get_open_orders", "description": "Các lệnh đang chờ, gồm cả LIMIT/STOP_MARKET lẫn lệnh điều kiện TP/SL đặt từ app Binance (đánh dấu [lệnh điều kiện app]). Lệnh điều kiện app hủy bằng strategyId + conditional=true.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Tùy chọn, ví dụ BTCUSDT"}}}}},
+    {"type": "function", "function": {"name": "get_open_orders", "description": "Các lệnh đang chờ: lệnh thường (LIMIT/MARKET) + lệnh TP/SL điều kiện (STOP_MARKET/TAKE_PROFIT_MARKET, đánh dấu [lệnh TP/SL điều kiện] — gồm cả lệnh đặt từ app Binance). Lệnh điều kiện hủy bằng algoId + conditional=true.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Tùy chọn, ví dụ BTCUSDT"}}}}},
     {"type": "function", "function": {"name": "get_order_history", "description": "Lịch sử lệnh của một symbol.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "limit": {"type": "integer"}}}, "required": ["symbol"]}},
     {"type": "function", "function": {"name": "get_income_history", "description": "Lịch sử thu nhập tài khoản: REALIZED_PNL, FUNDING_FEE, COMMISSION.", "parameters": {"type": "object", "properties": {"income_type": {"type": "string"}, "limit": {"type": "integer"}}}}},
     {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế hoặc lệnh điều kiện TP/SL (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. LIMIT bắt buộc có price. STOP_MARKET/TAKE_PROFIT_MARKET bắt buộc có stop_price (giá kích hoạt); dùng reduce_only=true để làm TP/SL cho vị thế hiện có.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "stop_price": {"type": "number", "description": "Giá kích hoạt, bắt buộc với STOP_MARKET/TAKE_PROFIT_MARKET"}, "working_type": {"type": "string", "enum": ["MARK_PRICE", "CONTRACT_PRICE"], "description": "Cơ sở kích hoạt, mặc định MARK_PRICE"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
-    {"type": "function", "function": {"name": "cancel_order", "description": "Soạn hủy một lệnh đang chờ (cần xác nhận). Lệnh điều kiện đặt từ app Binance (đánh dấu [lệnh điều kiện app] trong get_open_orders) phải hủy bằng strategyId với conditional=true.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "order_id": {"type": "string"}, "conditional": {"type": "boolean", "description": "true nếu là lệnh điều kiện app (hủy theo strategyId qua papi)"}}, "required": ["symbol", "order_id"]}}},
+    {"type": "function", "function": {"name": "cancel_order", "description": "Soạn hủy một lệnh đang chờ (cần xác nhận). Lệnh TP/SL điều kiện (đánh dấu [lệnh TP/SL điều kiện] trong get_open_orders, kể cả lệnh đặt từ app Binance) phải hủy bằng algoId với conditional=true.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "order_id": {"type": "string"}, "conditional": {"type": "boolean", "description": "true nếu là lệnh TP/SL điều kiện (hủy theo algoId qua algo service)"}}, "required": ["symbol", "order_id"]}}},
     {"type": "function", "function": {"name": "close_position", "description": "Soạn đóng TOÀN BỘ vị thế của một symbol bằng lệnh market (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}}},
 ]
 
@@ -3719,23 +3738,23 @@ async def _execute_items(session, items):
     for item in items:
         if item['type'] == 'place_order':
             data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', item['params'])
+        elif item['type'] == 'place_algo_order':
+            data, err = await binance_signed_request(session, 'POST', '/fapi/v1/algoOrder', item['params'])
         elif item['type'] == 'cancel_order':
             data, err = await binance_signed_request(session, 'DELETE', '/fapi/v1/order', item['params'])
-        elif item['type'] == 'cancel_conditional':
-            data, err = await binance_signed_request(
-                session, 'DELETE', '/papi/v1/um/conditional/order', item['params'],
-                base_url="https://papi.binance.com")
+        elif item['type'] == 'cancel_algo':
+            data, err = await binance_signed_request(session, 'DELETE', '/fapi/v1/algoOrder', item['params'])
         else:
             results.append(f"❌ Không hiểu loại lệnh: {item['type']}")
             continue
         if err:
             results.append(f"❌ {item['desc']}\n→ THẤT BẠI: {err}")
-        elif item['type'] == 'place_order':
+        elif item['type'] in ('place_order', 'place_algo_order'):
             ok_count += 1
-            results.append(f"✅ {item['desc']}\n→ OrderId: `{data.get('orderId')}` | Status: {data.get('status')}")
+            results.append(f"✅ {item['desc']}\n→ ID: `{data.get('orderId') or data.get('algoId')}` | Status: {data.get('status') or data.get('algoStatus')}")
         else:
             ok_count += 1
-            results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId')} trên {item['params'].get('symbol')}.")
+            results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId') or item['params'].get('algoId')} trên {item['params'].get('symbol')}.")
     header = f"🚀 *Đã thực thi {ok_count}/{len(items)} lệnh:*\n" if len(items) > 1 else ""
     return header + "\n\n".join(results)
 
