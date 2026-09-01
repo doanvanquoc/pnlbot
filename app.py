@@ -42,6 +42,8 @@ symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPre
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
 symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
+ai_active_until = {}    # chat_id -> timestamp: /auto tạm im lặng tới thời điểm này để không chen ngang chat AI
+AI_QUIET_SECONDS = 120  # Thời gian im lặng của /auto sau mỗi lượt tương tác AI
 tracking_coins = {}     # Lưu danh sách coin đang tracking giá: {symbol: {'ref_price': float, 'chat_ids': set()}}
 
 # Cache cho kết quả quét thị trường của lệnh /analyze
@@ -1206,6 +1208,9 @@ async def auto_pos_sender_loop(app):
                 
                 # Gửi hoặc sửa tin nhắn cho tất cả các chat_id đã đăng ký (song song)
                 async def update_auto_chat(chat_id):
+                    # Đang chat với AI (hoặc mới chat xong): tạm im lặng, không chen ngang
+                    if ai_active_until.get(chat_id, 0) > time.time():
+                        return
                     old_msg_id = last_auto_messages.get(chat_id)
                     
                     # Nếu có hoạt động mới trong chat, xóa tin nhắn PnL cũ và gửi tin mới xuống dưới cùng
@@ -3183,13 +3188,19 @@ def _fmt_usage_window(name_vn, window):
             reset_dt = datetime.fromisoformat(str(resets_at).replace('Z', '+00:00'))
             remaining = reset_dt - datetime.now(timezone.utc)
             total_sec = max(0, int(remaining.total_seconds()))
-            h, rem = divmod(total_sec, 3600)
-            m, _ = divmod(rem, 60)
-            reset_str = f" (reset sau {h}h{m:02d}p)" if h > 0 else f" (reset sau {m}p)"
+            d, rem = divmod(total_sec, 86400)
+            h, rem2 = divmod(rem, 3600)
+            m, _ = divmod(rem2, 60)
+            if d > 0:
+                reset_str = f" (reset sau {d} ngày {h}h)"
+            elif h > 0:
+                reset_str = f" (reset sau {h}h{m:02d}p)"
+            else:
+                reset_str = f" (reset sau {m}p)"
         except Exception:
             reset_str = ""
     warn = " ⛔ BỊ CHẶN" if status == 'rate-limited' else ""
-    return f"{emoji} {name_vn}: [{bar}] {percent:.0f}%{reset_str}{warn}"
+    return f"{emoji} {name_vn}: [{bar}] còn {100 - percent:.0f}%{reset_str}{warn}"
 
 
 async def handle_usage_command(session, chat_id):
@@ -3272,9 +3283,11 @@ def _norm_symbol(args):
 async def get_position_risk(session, params=None):
     """Lấy positionRisk: ưu tiên v3 (có tpPrice/slPrice - TP/SL gắn trên vị thế đặt từ app), fallback v2."""
     data, err = await binance_signed_request(session, 'GET', '/fapi/v3/positionRisk', params)
-    if err:
-        data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', params)
-    return data, err
+    if not err:
+        return data, None
+    logger.warning(f"positionRisk v3 lỗi ({err}) — fallback v2, sẽ KHÔNG thấy TP/SL gắn trên vị thế.")
+    data2, err2 = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', params)
+    return data2, err2
 
 
 def format_position_tpsl(p):
@@ -3826,6 +3839,8 @@ async def handle_order_callback(session, cb):
                 edited = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=reply_kb)
                 if not edited:
                     await send_telegram_message(session, chat_id, new_text, reply_markup=reply_kb)
+        # Bấm nút cũng là tương tác AI: /auto tạm im lặng
+        ai_active_until[chat_id] = time.time() + AI_QUIET_SECONDS
     except Exception as e:
         logger.error(f"Lỗi xử lý callback nút xác nhận: {e}")
 
@@ -3866,6 +3881,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             await send_telegram_message(session, chat_id, "🚫 Đã hủy lệnh đang chờ xác nhận.", reply_to=reply_to)
             return
 
+    ai_active_until[chat_id] = time.time() + AI_QUIET_SECONDS
     loading_msg_id = await send_telegram_message(session, chat_id, "🤖 AI đang xử lý câu hỏi...", reply_to=reply_to)
     try:
         if photo_sizes and not image_data_url:
@@ -4006,12 +4022,14 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.", reply_to=reply_to)
         # Nếu AI đã soạn lệnh, gửi kèm nút Xác nhận/Hủy
         await send_pending_confirmation_buttons(session, chat_id, reply_to=reply_to)
+        ai_active_until[chat_id] = time.time() + AI_QUIET_SECONDS
     except Exception as e:
         logger.error(f"Lỗi khi xử lý lệnh AI: {e}")
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}", reply_to=reply_to)
         await send_pending_confirmation_buttons(session, chat_id, reply_to=reply_to)
+        ai_active_until[chat_id] = time.time() + AI_QUIET_SECONDS
 
 
 # Kiểm tra Position Mode (Hedge hay One-way) của tài khoản
@@ -5707,8 +5725,7 @@ async def telegram_polling_loop(app):
 
             for update in data.get('result', []):
                 offset = update['update_id'] + 1
-                if 'message' not in update:
-                    continue
+                # Xử lý MỌI loại update (message + callback_query của nút inline)
                 await telegram_webhook_handler(FakeRequest(app, update))
         except asyncio.CancelledError:
             raise
