@@ -3145,6 +3145,70 @@ async def handle_photo_message(session, chat_id, photo_sizes, caption, reply_to=
     await handle_ai_command(session, chat_id, question, reply_to=reply_to, image_data_url=image_url)
 
 
+# ─── Usage API của OpenCode Go (quota 5h/tuần/tháng) ───
+async def get_go_usage(session):
+    """Gọi usage API của OpenCode Go. Trả về (usage_dict, None) hoặc (None, err)."""
+    api_key = os.getenv("DASH_TOKEN")
+    if not api_key:
+        return None, "Chưa cấu hình DASH_TOKEN."
+    url = "https://opencode.ai/zen/go/v1/usage"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.get(url, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                return None, f"HTTP {resp.status}: {body[:150]}"
+            data = await resp.json()
+            return data.get('usage') or {}, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _fmt_usage_window(name_vn, window):
+    if not isinstance(window, dict):
+        return f"{name_vn}: ❓ không có dữ liệu"
+    try:
+        percent = float(window.get('percent', 0))
+    except (TypeError, ValueError):
+        percent = 0
+    filled = max(0, min(5, round(percent / 20)))
+    bar = "█" * filled + "░" * (5 - filled)
+    status = window.get('status', '')
+    emoji = "🔴" if status == 'rate-limited' or percent >= 90 else ("🟡" if percent >= 70 else "🟢")
+    reset_str = ""
+    resets_at = window.get('resetsAt')
+    if resets_at:
+        try:
+            reset_dt = datetime.fromisoformat(str(resets_at).replace('Z', '+00:00'))
+            remaining = reset_dt - datetime.now(timezone.utc)
+            total_sec = max(0, int(remaining.total_seconds()))
+            h, rem = divmod(total_sec, 3600)
+            m, _ = divmod(rem, 60)
+            reset_str = f" (reset sau {h}h{m:02d}p)" if h > 0 else f" (reset sau {m}p)"
+        except Exception:
+            reset_str = ""
+    warn = " ⛔ BỊ CHẶN" if status == 'rate-limited' else ""
+    return f"{emoji} {name_vn}: [{bar}] {percent:.0f}%{reset_str}{warn}"
+
+
+async def handle_usage_command(session, chat_id):
+    usage, err = await get_go_usage(session)
+    if err:
+        await send_telegram_message(session, chat_id, f"❌ Không lấy được usage: {err}")
+        return
+    msg = (
+        "📊 *Usage OpenCode Go*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join([
+            _fmt_usage_window("5 giờ", usage.get('rolling')),
+            _fmt_usage_window("Tuần", usage.get('weekly')),
+            _fmt_usage_window("Tháng", usage.get('monthly')),
+        ])
+    )
+    await send_telegram_message(session, chat_id, msg)
+
+
 # ─── Agent tools cho /ai: đọc dữ liệu tài khoản + soạn lệnh (có bước xác nhận) ───
 pending_orders = {}  # chat_id -> {'type': 'place_order'|'cancel_order', 'params': {...}, 'desc': str, 'ts': float}
 PENDING_ORDER_TTL = 600
@@ -5225,7 +5289,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ai'
+            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ai', '/usage'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -5321,6 +5385,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
+            "📊 `/usage` - Xem mức dùng quota AI (5 giờ/tuần/tháng) và thời gian reset.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
@@ -5555,6 +5620,9 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
 
     elif command_base == '/review':
         await handle_review_command(request.app['session'], chat_id)
+
+    elif command_base == '/usage':
+        await handle_usage_command(request.app['session'], chat_id)
 
     elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
