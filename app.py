@@ -8,6 +8,7 @@ import random
 import re
 import json
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 import logging
 import aiohttp
 from aiohttp import web
@@ -582,45 +583,6 @@ async def get_ai_review(session, digest):
             return content[:3000] if content else None
     except Exception as e:
         logger.warning(f"Lỗi gọi AI review: {e}")
-        return None
-
-
-async def get_ai_chat(session, question, context_text):
-    """Chat tự do với AI (lệnh /ask). Trả về text hoặc None."""
-    api_key = os.getenv("DASH_TOKEN")
-    if not api_key or not question:
-        return None
-    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
-    url = "https://opencode.ai/zen/go/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    system_prompt = (
-        "Bạn là trợ lý phân tích crypto futures, trả lời ngắn gọn, thực dụng, khách quan bằng tiếng Việt. "
-        "Dùng số liệu thị trường realtime được cung cấp nếu liên quan đến câu hỏi. "
-        "Không đưa khuyến nghị đòn bẩy cụ thể, nhắc quản trị rủi ro khi phù hợp. "
-        "Không dùng các ký tự markdown (*, _, `) trong câu trả lời."
-    )
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Thông tin thị trường hiện tại:\n{context_text}\n\nCâu hỏi: {question}"}
-        ],
-        "temperature": 0.4,
-        "max_tokens": 3000
-    }
-    try:
-        timeout = aiohttp.ClientTimeout(total=90)
-        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"AI chat trả lỗi HTTP {resp.status}: {body[:200]}")
-                return None
-            data = await resp.json()
-            content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
-            content = (content or '').strip()
-            return content[:3500] if content else None
-    except Exception as e:
-        logger.warning(f"Lỗi gọi AI chat: {e}")
         return None
 
 
@@ -3003,99 +2965,6 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             await send_telegram_message(session, chat_id, f"❌ Lỗi khi quét tín hiệu thị trường: {e}")
 
 
-async def handle_ai_command(session, chat_id, coin_name=None):
-    """Lệnh /ai <coin>: yêu cầu AI phân tích coin trực tiếp từ số liệu chỉ báo đa khung."""
-    if not coin_name:
-        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <coin>` (ví dụ: `/ai btc`, `/ai eth`)")
-        return
-
-    if not os.getenv("DASH_TOKEN"):
-        await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
-        return
-
-    coin_name = coin_name.upper()
-    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
-
-    loading_msg_id = await send_telegram_message(
-        session, chat_id, f"🤖 Đang yêu cầu AI phân tích *{symbol}*..."
-    )
-    try:
-        res_15m_task = asyncio.create_task(analyze_market(session, symbol, interval='15m', fetch_extras=False))
-        res_1h_task = asyncio.create_task(analyze_market(session, symbol, interval='1h'))
-        res_4h_task = asyncio.create_task(analyze_market(session, symbol, interval='4h', fetch_extras=False))
-        res_1d_task = asyncio.create_task(analyze_market(session, symbol, interval='1d', fetch_extras=False))
-        ob_task = asyncio.create_task(get_orderbook_summary(session, symbol))
-        dom_task = asyncio.create_task(get_btc_dominance(session))
-
-        res_15m = await res_15m_task
-        res = await res_1h_task
-        res_4h = await res_4h_task
-        res_1d = await res_1d_task
-        orderbook = await ob_task
-        btc_dominance = await dom_task
-
-        if not res:
-            if loading_msg_id:
-                await delete_telegram_message(session, chat_id, loading_msg_id)
-            await send_telegram_message(
-                session, chat_id, f"❌ Không thể lấy dữ liệu cho *{symbol}*. Vui lòng kiểm tra lại tên coin."
-            )
-            return
-
-        funding_rate = res.get('funding_rate')
-        if funding_rate is None:
-            funding_rate = await get_single_funding_rate(session, symbol)
-
-        digest = build_ai_digest(
-            symbol, [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)],
-            oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'), funding_rate=funding_rate,
-            orderbook=orderbook, btc_dominance=btc_dominance
-        )
-        ai_verdict = await get_ai_verdict_cached(session, f"ai_{symbol}", digest)
-
-        if loading_msg_id:
-            await delete_telegram_message(session, chat_id, loading_msg_id)
-
-        if not ai_verdict:
-            await send_telegram_message(
-                session, chat_id, f"🤖 AI không phản hồi hoặc lỗi khi phân tích *{symbol}*. Vui lòng thử lại sau."
-            )
-            return
-
-        ai_dir = ai_verdict.get('direction', 'NEUTRAL')
-        ai_emoji = "🟩 LONG" if ai_dir == 'LONG' else ("🟥 SHORT" if ai_dir == 'SHORT' else "⬜ NEUTRAL")
-        sig_emoji = "🟩 LONG" if res['signal'] == 'LONG' else ("🟥 SHORT" if res['signal'] == 'SHORT' else "⬜ NEUTRAL")
-
-        msg = (
-            f"🤖 *AI PHÂN TÍCH: {symbol}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 Giá: `{format_price(res['close'])} USDT`\n\n"
-            f"👉 *AI khuyến nghị: {ai_emoji}*\n"
-            f"🔥 Độ tin cậy: _{ai_verdict.get('confidence', 'trung bình')}_\n"
-            f"💬 _{ai_verdict.get('reason', '')}_\n"
-            f"\n📝 *Nhận định chi tiết:*\n"
-        )
-        for bullet in ai_verdict.get('analysis', []):
-            msg += f"• {bullet}\n"
-        msg += f"\n📊 *Rule engine đối chiếu:*\n"
-        for tf_name, tf_res in [("15m", res_15m), ("1h", res), ("4h", res_4h), ("1d", res_1d)]:
-            if tf_res:
-                tf_sig = "🟩L" if tf_res['signal'] == 'LONG' else ("🟥S" if tf_res['signal'] == 'SHORT' else "⬜N")
-                msg += f"• *{tf_name}:* {tf_sig} (L:`{tf_res['long_score']:.1f}`/S:`{tf_res['short_score']:.1f}`)\n"
-        msg += f"👉 Rule 1h: {sig_emoji}"
-
-        if ai_dir != 'NEUTRAL' and res['signal'] != 'NEUTRAL' and ai_dir != res['signal']:
-            msg += "\n\n⚠️ _AI mâu thuẫn với rule engine — cân nhắc kỹ trước khi vào lệnh._"
-
-        await send_telegram_message(session, chat_id, msg)
-
-    except Exception as e:
-        logger.error(f"Lỗi khi xử lý lệnh AI cho {symbol}: {e}")
-        if loading_msg_id:
-            await delete_telegram_message(session, chat_id, loading_msg_id)
-        await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi phân tích AI: {e}")
-
-
 async def handle_review_command(session, chat_id):
     """Lệnh /review: AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ."""
     if not os.getenv("DASH_TOKEN"):
@@ -3105,7 +2974,7 @@ async def handle_review_command(session, chat_id):
         await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
         return
 
-    loading_msg_id = await send_telegram_message(session, chat_id, "🤖 Đang yêu cầu AI soi lại các vị thế đang mở...")
+    loading_msg_id = await send_telegram_message(session, chat_id, "⏳ *[1/2]* Đang lấy dữ liệu vị thế từ Binance...")
     try:
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET")
@@ -3155,6 +3024,11 @@ async def handle_review_command(session, chat_id):
             lines.append(line)
         lines.append("Hãy đánh giá tổng quan rủi ro danh mục và khuyến nghị hành động cho từng vị thế.")
 
+        if loading_msg_id:
+            loading_msg_id = await edit_telegram_message(
+                session, chat_id, loading_msg_id, f"🤖 *[2/2]* Đã có dữ liệu {len(open_positions)} vị thế. Đang nhờ AI đánh giá..."
+            )
+
         review = await get_ai_review(session, "\n".join(lines))
 
         if loading_msg_id:
@@ -3173,17 +3047,422 @@ async def handle_review_command(session, chat_id):
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi review vị thế: {e}")
 
 
-async def handle_ask_command(session, chat_id, question=None):
-    """Lệnh /ask: hỏi AI tự do về thị trường, kèm ngữ cảnh giá realtime."""
+async def build_account_context(session):
+    """Lấy snapshot read-only tài khoản Futures (số dư + vị thế đang mở) làm ngữ cảnh cho /ai."""
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    if not api_key or not api_secret:
+        return None
+    headers = {"X-MBX-APIKEY": api_key}
+    lines = []
+    try:
+        ts = int(time.time() * 1000)
+        qs = f"timestamp={ts}"
+        sig = get_binance_signature(qs, api_secret)
+        async with session.get(f"https://fapi.binance.com/fapi/v2/account?{qs}&signature={sig}", headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                lines.append(
+                    f"- Số dư ví: {float(data.get('totalWalletBalance', 0)):,.2f} USDT, "
+                    f"PnL chưa thực hiện: {float(data.get('totalUnrealizedProfit', 0)):+,.2f} USDT, "
+                    f"Khả dụng: {float(data.get('availableBalance', 0)):,.2f} USDT"
+                )
+        ts2 = int(time.time() * 1000)
+        qs2 = f"timestamp={ts2}"
+        sig2 = get_binance_signature(qs2, api_secret)
+        async with session.get(f"https://fapi.binance.com/fapi/v2/positionRisk?{qs2}&signature={sig2}", headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
+                if open_positions:
+                    lines.append("- Vị thế đang mở:")
+                    for p in open_positions[:15]:
+                        amount = float(p.get('positionAmt', 0))
+                        entry = float(p.get('entryPrice', 0))
+                        mark = float(p.get('markPrice', 0))
+                        pnl = float(p.get('unRealizedProfit', p.get('unrealizedProfit', 0)))
+                        liq = float(p.get('liquidationPrice', 0))
+                        line = (
+                            f"  · {p.get('symbol')} {pos_side_display(p.get('positionSide'), amount)}: "
+                            f"entry {format_price(entry)}, mark {format_price(mark)}, "
+                            f"PnL {fmt_signed(pnl)} USDT, đòn bẩy {p.get('leverage')}x"
+                        )
+                        if liq > 0:
+                            line += f", giá thanh lý {format_price(liq)}"
+                        lines.append(line)
+                else:
+                    lines.append("- Không có vị thế nào đang mở.")
+    except Exception as e:
+        logger.warning(f"Lỗi lấy ngữ cảnh tài khoản cho /ai: {e}")
+        return None
+    return "\n".join(lines) if lines else None
+
+
+# ─── Agent tools cho /ai: đọc dữ liệu tài khoản + soạn lệnh (có bước xác nhận) ───
+pending_orders = {}  # chat_id -> {'type': 'place_order'|'cancel_order', 'params': {...}, 'desc': str, 'ts': float}
+PENDING_ORDER_TTL = 600
+ai_chat_history = {}  # chat_id -> list message (user/assistant) gần nhất: bộ nhớ hội thoại của agent
+AI_HISTORY_MAX_MSGS = 16
+CONFIRM_WORDS = {'xác nhận', 'xac nhan', 'xác nhận!', 'xacnhan', 'ok', 'yes', 'y', 'confirm', 'okê', 'oke'}
+CANCEL_WORDS = {'hủy', 'huy', 'no', 'không', 'khong', 'cancel', 'hủy đi', 'huy di'}
+
+
+async def binance_signed_request(session, method, path, params=None):
+    """Gọi API Binance Futures có ký HMAC. Trả về (data, None) hoặc (None, error_msg)."""
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    if not api_key or not api_secret:
+        return None, "Chưa cấu hình BINANCE_API_KEY/BINANCE_API_SECRET."
+    params = dict(params or {})
+    params['timestamp'] = int(time.time() * 1000)
+    params['recvWindow'] = 10000
+    query = urlencode(params)
+    signature = get_binance_signature(query, api_secret)
+    url = f"https://fapi.binance.com{path}?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        async with session.request(method, url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                msg = data.get('msg', f"HTTP {resp.status}") if isinstance(data, dict) else f"HTTP {resp.status}"
+                return None, msg
+            return data, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _norm_symbol(args):
+    symbol = (args.get('symbol') or '').upper().strip()
+    if not symbol.endswith('USDT'):
+        symbol += 'USDT'
+    return symbol
+
+
+async def tool_get_account_summary(session, chat_id, args):
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/account')
+    if err:
+        return f"LỖI: {err}"
+    return (f"Số dư ví: {float(data.get('totalWalletBalance', 0)):,.2f} USDT | "
+            f"PnL chưa thực hiện: {float(data.get('totalUnrealizedProfit', 0)):+,.2f} USDT | "
+            f"Margin balance: {float(data.get('totalMarginBalance', 0)):,.2f} USDT | "
+            f"Khả dụng: {float(data.get('availableBalance', 0)):,.2f} USDT")
+
+
+async def tool_get_positions(session, chat_id, args):
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk')
+    if err:
+        return f"LỖI: {err}"
+    open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
+    if not open_positions:
+        return "Không có vị thế nào đang mở."
+    lines = []
+    for p in open_positions[:20]:
+        amount = float(p.get('positionAmt', 0))
+        entry = float(p.get('entryPrice', 0))
+        mark = float(p.get('markPrice', 0))
+        pnl = float(p.get('unRealizedProfit', p.get('unrealizedProfit', 0)))
+        liq = float(p.get('liquidationPrice', 0))
+        line = (f"{p.get('symbol')} {pos_side_display(p.get('positionSide'), amount)}: "
+                f"entry {format_price(entry)}, mark {format_price(mark)}, "
+                f"PnL {fmt_signed(pnl)} USDT, đòn bẩy {p.get('leverage')}x")
+        if liq > 0:
+            line += f", giá thanh lý {format_price(liq)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def tool_get_open_orders(session, chat_id, args):
+    params = {}
+    if args.get('symbol'):
+        params['symbol'] = _norm_symbol(args)
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v1/openOrders', params)
+    if err:
+        return f"LỖI: {err}"
+    if not data:
+        return "Không có lệnh nào đang chờ khớp."
+    lines = []
+    for o in data[:20]:
+        lines.append(f"{o.get('symbol')} #{o.get('orderId')} {o.get('side')} {o.get('type')} "
+                     f"qty {o.get('origQty')} @ {o.get('price')}"
+                     + (" (reduceOnly)" if o.get('reduceOnly') else ""))
+    return "\n".join(lines)
+
+
+async def tool_get_order_history(session, chat_id, args):
+    if not args.get('symbol'):
+        return "LỖI: cần tham số symbol (ví dụ BTCUSDT)."
+    limit = min(int(args.get('limit', 10) or 10), 20)
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v1/allOrders',
+                                             {'symbol': _norm_symbol(args), 'limit': limit})
+    if err:
+        return f"LỖI: {err}"
+    if not data:
+        return "Không có lệnh nào cho symbol này."
+    lines = []
+    for o in data[-limit:]:
+        lines.append(f"#{o.get('orderId')} {o.get('side')} {o.get('type')} "
+                     f"qty {o.get('executedQty')}/{o.get('origQty')} @ {o.get('price')} status: {o.get('status')}")
+    return "\n".join(lines)
+
+
+async def tool_get_income_history(session, chat_id, args):
+    params = {'limit': min(int(args.get('limit', 15) or 15), 30)}
+    if args.get('income_type'):
+        params['incomeType'] = str(args['income_type']).upper()
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v1/income', params)
+    if err:
+        return f"LỖI: {err}"
+    if not data:
+        return "Không có bản ghi thu nhập nào."
+    lines = []
+    for rec in data:
+        lines.append(f"{rec.get('symbol', '')} {rec.get('incomeType')}: {rec.get('income')} USDT")
+    return "\n".join(lines)
+
+
+async def _stage_order(session, chat_id, order_type, params, desc):
+    """Soạn lệnh ghi vào trạng thái chờ xác nhận, không thực thi ngay."""
+    pending_orders[chat_id] = {'type': order_type, 'params': params, 'desc': desc, 'ts': time.time()}
+    return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + desc +
+            "\nHãy trình bày lại chi tiết lệnh cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy' qua /ai. "
+            "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
+
+
+async def tool_place_order(session, chat_id, args):
+    symbol = _norm_symbol(args)
+    side = str(args.get('side') or '').upper()
+    otype = str(args.get('type') or 'MARKET').upper()
+    try:
+        quantity = float(args.get('quantity', 0))
+    except (TypeError, ValueError):
+        return "LỖI: quantity không hợp lệ."
+    if side not in ('BUY', 'SELL'):
+        return "LỖI: side phải là BUY hoặc SELL."
+    if otype not in ('MARKET', 'LIMIT'):
+        return "LỖI: chỉ hỗ trợ MARKET hoặc LIMIT."
+    if quantity <= 0:
+        return "LỖI: quantity phải > 0."
+    if otype == 'LIMIT' and not args.get('price'):
+        return "LỖI: lệnh LIMIT cần price."
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+    quantity = round(quantity, qty_p)
+    params = {'symbol': symbol, 'side': side, 'type': otype, 'quantity': f"{quantity:.{qty_p}f}"}
+    desc = f"{symbol} {side} {otype} quantity {quantity}"
+    if otype == 'LIMIT':
+        price = round_price_step(float(args['price']), tick_size, price_p)
+        params.update({'price': f"{price:.{price_p}f}", 'timeInForce': 'GTC'})
+        desc += f" @ {price}"
+    if hedge_mode:
+        params['positionSide'] = str(args.get('position_side') or ('LONG' if side == 'BUY' else 'SHORT')).upper()
+    elif args.get('reduce_only'):
+        params['reduceOnly'] = 'true'
+        desc += " (reduceOnly)"
+    desc += " — Lệnh THẬT sẽ khớp trên tài khoản của người dùng."
+    return await _stage_order(session, chat_id, 'place_order', params, desc)
+
+
+async def tool_cancel_order(session, chat_id, args):
+    if not args.get('order_id'):
+        return "LỖI: cần order_id."
+    params = {'symbol': _norm_symbol(args), 'orderId': str(args['order_id'])}
+    desc = f"Hủy lệnh #{args['order_id']} trên {params['symbol']}"
+    return await _stage_order(session, chat_id, 'cancel_order', params, desc)
+
+
+async def tool_close_position(session, chat_id, args):
+    symbol = _norm_symbol(args)
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', {'symbol': symbol})
+    if err:
+        return f"LỖI: {err}"
+    open_positions = [p for p in data if float(p.get('positionAmt', 0)) != 0.0]
+    if not open_positions:
+        return f"Không có vị thế nào đang mở cho {symbol}."
+    qty_p, _, _ = await get_symbol_precisions(session, symbol)
+    descs = []
+    params_staged = None
+    for p in open_positions:
+        amount = float(p.get('positionAmt', 0))
+        p_side = pos_side_display(p.get('positionSide'), amount)
+        close_side = 'SELL' if p_side == 'LONG' else 'BUY'
+        params = {'symbol': symbol, 'side': close_side, 'type': 'MARKET',
+                  'quantity': f"{round(abs(amount), qty_p):.{qty_p}f}"}
+        if hedge_mode:
+            params['positionSide'] = 'LONG' if p_side == 'LONG' else 'SHORT'
+        else:
+            params['reduceOnly'] = 'true'
+        desc = f"ĐÓNG vị thế {symbol} {p_side} (MARKET, qty {round(abs(amount), qty_p)}) — Lệnh THẬT."
+        descs.append(desc)
+        params_staged = params
+    pending_orders[chat_id] = {'type': 'place_order', 'params': params_staged, 'desc': "\n".join(descs), 'ts': time.time()}
+    return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + "\n".join(descs) +
+            "\nHãy trình bày lại chi tiết cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy' qua /ai. "
+            "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
+
+
+async def tool_scan_market(session, chat_id, args):
+    """Quét toàn thị trường tìm tín hiệu LONG/SHORT mạnh nhất (dùng lại cache quét của /analyze nếu còn hạn)."""
+    now = time.time()
+    if (market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < 300):
+        long_signals, short_signals = market_scan_cache["signals"]
+    else:
+        async with market_scan_cache["lock"]:
+            now = time.time()
+            if (market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < 300):
+                long_signals, short_signals = market_scan_cache["signals"]
+            else:
+                long_signals, short_signals = await scan_market_signals(session)
+                market_scan_cache["signals"] = (long_signals, short_signals)
+                market_scan_cache["timestamp"] = time.time()
+
+    lines = []
+    for signals in (long_signals, short_signals):
+        for res in signals[:5]:
+            score = res.get('long_score') if res['signal'] == 'LONG' else res.get('short_score')
+            rr = abs(res['tp'] - res['close']) / (abs(res['close'] - res['sl']) + 1e-10)
+            lines.append(
+                f"{res['symbol']} {res['signal']} ({res['confidence']}, điểm {score:.1f}): "
+                f"entry {format_price(res['close'])}, TP {format_price(res['tp'])}, "
+                f"SL {format_price(res['sl'])}, R:R 1:{rr:.1f}"
+            )
+    if not lines:
+        return "Hiện không có tín hiệu LONG/SHORT nào đạt chuẩn 4-5 sao. Thị trường chưa có cơ hội rõ ràng."
+    return ("Các tín hiệu mạnh nhất hiện tại (đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế):\n"
+            + "\n".join(lines))
+
+
+async def tool_get_price(session, chat_id, args):
+    """Tra giá realtime của một hoặc nhiều coin bất kỳ trên Binance Futures."""
+    symbols = args.get('symbols') or []
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if not symbols:
+        return "LỖI: cần tham số symbols (danh sách, ví dụ ['SOLUSDT'])."
+    tickers_map, _ = await get_market_snapshot(session)
+    lines = []
+    for s in symbols[:8]:
+        sym = _norm_symbol({'symbol': str(s)})
+        info = tickers_map.get(sym)
+        if info:
+            lines.append(f"{sym}: {format_price(info['price'])} USDT, 24h {info.get('change', 0):+.2f}%")
+        else:
+            lines.append(f"{sym}: không tìm thấy trên Binance Futures.")
+    return "\n".join(lines)
+
+
+ASK_TOOLS = [
+    {"type": "function", "function": {"name": "get_price", "description": "Tra giá realtime + % thay đổi 24h của một hoặc nhiều coin bất kỳ trên Binance Futures.", "parameters": {"type": "object", "properties": {"symbols": {"type": "array", "items": {"type": "string"}, "description": "Danh sách symbol, ví dụ ['SOLUSDT', 'DOGEUSDT']"}}, "required": ["symbols"]}}},
+    {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "get_positions", "description": "Danh sách vị thế futures đang mở: entry, mark, PnL, đòn bẩy, giá thanh lý.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "get_open_orders", "description": "Các lệnh đang chờ khớp.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Tùy chọn, ví dụ BTCUSDT"}}}}},
+    {"type": "function", "function": {"name": "get_order_history", "description": "Lịch sử lệnh của một symbol.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "limit": {"type": "integer"}}}, "required": ["symbol"]}},
+    {"type": "function", "function": {"name": "get_income_history", "description": "Lịch sử thu nhập tài khoản: REALIZED_PNL, FUNDING_FEE, COMMISSION.", "parameters": {"type": "object", "properties": {"income_type": {"type": "string"}, "limit": {"type": "integer"}}}}},
+    {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. LIMIT bắt buộc có price.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
+    {"type": "function", "function": {"name": "cancel_order", "description": "Soạn hủy một lệnh đang chờ (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "order_id": {"type": "string"}}, "required": ["symbol", "order_id"]}}},
+    {"type": "function", "function": {"name": "close_position", "description": "Soạn đóng TOÀN BỘ vị thế của một symbol bằng lệnh market (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}}},
+]
+
+TOOL_EXECUTORS = {
+    'get_price': tool_get_price,
+    'scan_market': tool_scan_market,
+    'get_account_summary': tool_get_account_summary,
+    'get_positions': tool_get_positions,
+    'get_open_orders': tool_get_open_orders,
+    'get_order_history': tool_get_order_history,
+    'get_income_history': tool_get_income_history,
+    'place_order': tool_place_order,
+    'cancel_order': tool_cancel_order,
+    'close_position': tool_close_position,
+}
+
+
+async def get_ai_agent_response(session, messages, tools):
+    """Một lượt gọi LLM hỗ trợ tool calling. Trả về message dict hoặc None."""
+    api_key = os.getenv("DASH_TOKEN")
+    if not api_key:
+        return None
+    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
+    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "temperature": 0.3,
+        "max_tokens": 3000
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=90)
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"AI agent trả lỗi HTTP {resp.status}: {body[:200]}")
+                return None
+            data = await resp.json()
+            return data.get('choices', [{}])[0].get('message')
+    except Exception as e:
+        logger.warning(f"Lỗi gọi AI agent: {e}")
+        return None
+
+
+async def execute_pending_order(session, chat_id):
+    """Thực thi lệnh đã được xác nhận. Trả về text kết quả."""
+    pending = pending_orders.pop(chat_id, None)
+    if not pending:
+        return "Không có lệnh nào đang chờ xác nhận."
+    if pending['type'] == 'place_order':
+        data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', pending['params'])
+    elif pending['type'] == 'cancel_order':
+        data, err = await binance_signed_request(session, 'DELETE', '/fapi/v1/order', pending['params'])
+    else:
+        return "❌ Không hiểu loại lệnh đang chờ."
+    if err:
+        return f"❌ Thực thi lệnh THẤT BẠI: {err}"
+    if pending['type'] == 'place_order':
+        return (f"✅ *Đã đặt lệnh thành công!*\n"
+                f"{pending['desc']}\n"
+                f"OrderId: `{data.get('orderId')}` | Status: {data.get('status')}")
+    return f"✅ Đã hủy lệnh #{pending['params'].get('orderId')} trên {pending['params'].get('symbol')}."
+
+
+async def handle_ai_command(session, chat_id, question=None):
+    """Lệnh /ai: agent AI tự do - đọc mọi dữ liệu tài khoản, phân tích coin và soạn lệnh (có bước xác nhận)."""
     if not question:
-        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ask <câu hỏi>` (ví dụ: `/ask eth có nên mua lúc này không`)")
+        await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <câu hỏi hoặc tên coin>` (ví dụ: `/ai btc`, `/ai xem vị thế của tôi`, `/ai đặt long btc 0.01`)")
         return
     if not os.getenv("DASH_TOKEN"):
         await send_telegram_message(session, chat_id, "⚠️ Chưa cấu hình DASH_TOKEN trong .env — tính năng AI chưa khả dụng.")
         return
 
     question = question.strip()[:1000]
-    loading_msg_id = await send_telegram_message(session, chat_id, "🤖 Đang hỏi AI...")
+
+    # Nếu người dùng chỉ gõ tên coin (vd: /ai btc) -> chuyển thành câu hỏi phân tích coin
+    if re.fullmatch(r'[a-z0-9]{2,10}', question.lower()):
+        question = f"Phân tích giúp tôi coin {question.upper()} trong tương quan tài khoản của tôi: xu hướng hiện tại, có nên vào lệnh không, rủi ro gì?"
+
+    # Reset bộ nhớ hội thoại nếu người dùng yêu cầu
+    if question.lower() in ('reset', 'làm mới', 'làm mới hội thoại', 'xóa hội thoại', 'xoá hội thoại'):
+        ai_chat_history.pop(chat_id, None)
+        await send_telegram_message(session, chat_id, "🧹 Đã xóa bộ nhớ hội thoại. Bắt đầu cuộc trò chuyện mới.")
+        return
+
+    # 2. Xử lý xác nhận/hủy lệnh đang chờ
+    pending = pending_orders.get(chat_id)
+    if pending and time.time() - pending['ts'] > PENDING_ORDER_TTL:
+        del pending_orders[chat_id]
+        pending = None
+    if pending:
+        text_low = question.lower().strip()
+        if text_low in CONFIRM_WORDS:
+            result = await execute_pending_order(session, chat_id)
+            await send_telegram_message(session, chat_id, result)
+            return
+        if text_low in CANCEL_WORDS:
+            del pending_orders[chat_id]
+            await send_telegram_message(session, chat_id, "🚫 Đã hủy lệnh đang chờ xác nhận.")
+            return
+
+    loading_msg_id = await send_telegram_message(session, chat_id, "⏳ *[1/2]* Đang lấy dữ liệu thị trường + tài khoản...")
     try:
         tickers_map, _ = await get_market_snapshot(session)
         context_lines = []
@@ -3193,16 +3472,100 @@ async def handle_ask_command(session, chat_id, question=None):
                 context_lines.append(f"- {sym}: {format_price(info['price'])} USDT, 24h {info.get('change', 0):+.2f}%")
         context_text = "\n".join(context_lines) if context_lines else "Không lấy được dữ liệu giá realtime."
 
-        answer = await get_ai_chat(session, question, context_text)
+        account_text = await build_account_context(session)
+        if account_text:
+            context_text += f"\n\nTài khoản Binance Futures của người dùng (có thể đã cũ — dùng công cụ để lấy dữ liệu mới nhất):\n{account_text}"
+
+        if loading_msg_id:
+            loading_msg_id = await edit_telegram_message(
+                session, chat_id, loading_msg_id, "🤖 *[2/2]* Đã có dữ liệu. Đang nhờ AI xử lý..."
+            )
+
+        system_prompt = (
+            "Bạn là trợ lý giao dịch crypto futures có quyền truy cập dữ liệu tài khoản Binance của người dùng qua các công cụ. "
+            "Hãy chủ động dùng công cụ khi cần dữ liệu mới nhất (số dư, vị thế, lệnh, thu nhập) thay vì đoán. "
+            "Khi người dùng muốn tìm cơ hội/coin tốt: gọi scan_market, chọn tín hiệu tốt nhất (ưu tiên confidence cao, R:R tốt, "
+            "khớp với tài khoản hiện có) và trình bày lý do lựa chọn. "
+            "Khi người dùng nói lệnh theo giá trị USDT (vd 'long 400u'): tính quantity = giá trị / giá entry lấy từ scan_market "
+            "hoặc giá mark từ get_positions, và ghi rõ phép tính trong câu trả lời. "
+            "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ đọc, (2) gọi công cụ soạn lệnh, "
+            "(3) trình bày chi tiết lệnh và nhắc người dùng trả lời 'xác nhận' hoặc 'hủy' — hệ thống chỉ thực thi sau khi xác nhận. "
+            "Chỉ soạn lệnh khi người dùng thể hiện ý định rõ ràng (đặt/close/hủy). "
+            "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
+            "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
+            "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
+            "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
+            "Trả lời tiếng Việt, ngắn gọn, thực dụng, không dùng ký tự markdown (*, _, `)."
+        )
+        user_content = f"Thông tin thị trường hiện tại:\n{context_text}\n\nCâu hỏi: {question}"
+        if pending:
+            user_content += f"\n\n(Lưu ý: đang có lệnh chờ xác nhận: {pending['desc']} — nhắc người dùng 'xác nhận' hoặc 'hủy'.)"
+
+        history = ai_chat_history.get(chat_id, [])
+        messages = (
+            [{"role": "system", "content": system_prompt}]
+            + history
+            + [{"role": "user", "content": user_content}]
+        )
+
+        final_text = None
+        TOOL_LABELS = {
+            'get_price': '📈 đang tra giá coin',
+            'scan_market': '🔍 đang quét thị trường tìm cơ hội tốt nhất',
+            'get_account_summary': '💳 đang kiểm tra số dư tài khoản',
+            'get_positions': '📊 đang kiểm tra vị thế đang mở',
+            'get_open_orders': '📋 đang kiểm tra lệnh đang chờ',
+            'get_order_history': '📜 đang xem lịch sử lệnh',
+            'get_income_history': '💰 đang xem lịch sử PnL/thu nhập',
+            'place_order': '🛒 đang soạn lệnh giao dịch',
+            'cancel_order': '🚫 đang soạn hủy lệnh',
+            'close_position': '🔒 đang soạn lệnh đóng vị thế',
+        }
+        step = 0
+        for _ in range(8):
+            msg = await get_ai_agent_response(session, messages, ASK_TOOLS)
+            if not msg:
+                break
+            tool_calls = msg.get('tool_calls')
+            if tool_calls:
+                step += 1
+                labels = [TOOL_LABELS.get((tc.get('function') or {}).get('name', ''), 'dữ liệu')
+                          for tc in tool_calls]
+                if loading_msg_id:
+                    loading_msg_id = await edit_telegram_message(
+                        session, chat_id, loading_msg_id,
+                        f"🤖 *[Bước {step}]* " + ", ".join(labels) + "..."
+                    )
+                messages.append(msg)
+                for tc in tool_calls:
+                    fn = tc.get('function') or {}
+                    name = fn.get('name', '')
+                    try:
+                        args = json.loads(fn.get('arguments') or '{}')
+                    except Exception:
+                        args = {}
+                    executor = TOOL_EXECUTORS.get(name)
+                    if executor:
+                        tool_result = await executor(session, chat_id, args)
+                    else:
+                        tool_result = f"LỖI: công cụ '{name}' không tồn tại."
+                    messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(tool_result)[:2000]})
+                continue
+            final_text = (msg.get('content') or '').strip()
+            break
 
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
-        if answer:
-            await send_telegram_message(session, chat_id, f"🤖 {answer}")
+        if final_text:
+            # Lưu bộ nhớ hội thoại (chỉ lưu câu hỏi + câu trả lời cuối, không lưu tool traffic)
+            history.append({"role": "user", "content": question})
+            history.append({"role": "assistant", "content": final_text[:1500]})
+            ai_chat_history[chat_id] = history[-AI_HISTORY_MAX_MSGS:]
+            await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}")
         else:
             await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.")
     except Exception as e:
-        logger.error(f"Lỗi khi xử lý lệnh ask: {e}")
+        logger.error(f"Lỗi khi xử lý lệnh AI: {e}")
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
         await send_telegram_message(session, chat_id, f"❌ Đã xảy ra lỗi khi hỏi AI: {e}")
@@ -4464,7 +4827,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ask'
+            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ai'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -4537,7 +4900,7 @@ async def process_telegram_message(request, chat_id, text):
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
-            "💬 `/ask <câu hỏi>` - Hỏi AI tự do về thị trường (ví dụ: `/ask eth có nên mua lúc này không`).\n"
+            "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
             "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
             "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
@@ -4765,17 +5128,12 @@ async def process_telegram_message(request, chat_id, text):
         await handle_analyze_command(request.app['session'], chat_id, coin_name)
 
     elif command_base == '/ai':
-        parts = text.split()
-        coin_name = parts[1] if len(parts) > 1 else None
-        await handle_ai_command(request.app['session'], chat_id, coin_name)
+        question = text[len('/ai'):].strip()
+        await handle_ai_command(request.app['session'], chat_id, question)
 
     elif command_base == '/review':
         await handle_review_command(request.app['session'], chat_id)
 
-    elif command_base == '/ask':
-        question = text[len('/ask'):].strip()
-        await handle_ask_command(request.app['session'], chat_id, question)
-        
     elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
         coin_name = parts[1] if len(parts) > 1 else None
