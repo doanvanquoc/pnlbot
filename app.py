@@ -3516,6 +3516,7 @@ async def tool_close_position(session, chat_id, args):
         desc = f"ĐÓNG vị thế {symbol} {p_side} (MARKET, qty {round(abs(amount), qty_p)}) — Lệnh THẬT."
         descs.append(desc)
         await _stage_order(session, chat_id, 'place_order', params, desc)
+        pending_orders[chat_id]['items'][-1]['is_close'] = True
     return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + "\n".join(descs) +
             "\nHãy trình bày lại chi tiết cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy'. "
             "KHÔNG gọi công cụ này lần nữa cho đến khi người dùng phản hồi.")
@@ -3724,6 +3725,13 @@ async def _execute_items(session, items):
         elif item['type'] in ('place_order', 'place_algo_order'):
             ok_count += 1
             results.append(f"✅ {item['desc']}\n→ ID: `{data.get('orderId') or data.get('algoId')}` | Status: {data.get('status') or data.get('algoStatus')}")
+            # Lệnh đóng vị thế: hủy nốt TP/SL điều kiện + lệnh giảm vốn còn treo
+            if item.get('is_close') and item['type'] == 'place_order':
+                try:
+                    await cancel_existing_tpsl(session, os.getenv("BINANCE_API_KEY"),
+                                               os.getenv("BINANCE_API_SECRET"), item['params'].get('symbol'))
+                except Exception as tpsl_e:
+                    logger.warning(f"Không hủy được TP/SL sau khi đóng: {tpsl_e}")
         else:
             ok_count += 1
             results.append(f"✅ Đã hủy lệnh #{item['params'].get('orderId') or item['params'].get('algoId')} trên {item['params'].get('symbol')}.")
@@ -5267,9 +5275,11 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
             data = await resp.json()
             if resp.status == 200:
                 logger.info(f"Đã gửi lệnh đóng vị thế thành công cho {symbol}")
-                
+
                 # Tự động hủy toàn bộ các lệnh DCA đang mở của symbol đó
                 await cancel_dca_orders(session, api_key, api_secret, symbol)
+                # Hủy TP/SL điều kiện (algo) + lệnh giảm vốn còn treo của symbol
+                await cancel_existing_tpsl(session, api_key, api_secret, symbol, position_side=pos_side)
             else:
                 msg_err = data.get('msg', 'Lỗi không xác định')
                 code_err = data.get('code', -1)
