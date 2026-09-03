@@ -3139,18 +3139,15 @@ async def ai_auto_trader_loop(app):
                                                 algo_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
                                             else:
                                                 algo_params['reduceOnly'] = 'true'
-                                            aq = urlencode(algo_params)
-                                            asig = get_binance_signature(aq, api_secret)
-                                            aurl = f"https://fapi.binance.com/fapi/v1/algoOrder?{aq}&signature={asig}"
-                                            async with session.post(aurl, headers=headers) as aresp:
-                                                adata = await aresp.json()
-                                            if aresp.status == 200:
+                                            adata, aerr = await binance_signed_request(
+                                                session, 'POST', '/fapi/v1/algoOrder', algo_params)
+                                            if not aerr:
                                                 tpsl_results.append(
                                                     f"✅ {label}: {otype} kích hoạt {format_price(trig)} "
                                                     f"(algoId `{adata.get('algoId')}`)"
                                                 )
                                             else:
-                                                tpsl_results.append(f"❌ {label}: {adata.get('msg', f'HTTP {aresp.status}')}")
+                                                tpsl_results.append(f"❌ {label}: {aerr}")
                                         except Exception as tpsl_e:
                                             tpsl_results.append(f"❌ {label}: {tpsl_e}")
                                     tpsl_block = "\n🛡️ *TP/SL tự đặt:*\n" + "\n".join(tpsl_results) if tpsl_results else ""
