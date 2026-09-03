@@ -3041,6 +3041,7 @@ def _clamp_stop_for_liquidation(is_long, entry_price, stop_price, max_lev):
 
 # ─── AI tự động vào lệnh mỗi 5 giờ ───
 AI_AUTO_TRADER_INTERVAL = 5 * 3600
+AI_AUTO_MIN_SCORE = 6.0  # Chỉ tự vào lệnh khi tín hiệu 5 sao + điểm ≥ ngưỡng này (≥ 6.0 = mức 'Rất mạnh' trở lên)
 
 
 async def get_available_balance(session):
@@ -3074,12 +3075,34 @@ async def ai_auto_trader_loop(app):
                 market_scan_cache["signals"] = (long_signals, short_signals)
                 market_scan_cache["timestamp"] = time.time()
 
-            # 2. Lọc tín hiệu "quá ngon": 4-5 sao + nhóm tín hiệu có win-rate OK, chọn điểm cao nhất
-            candidates = [s for s in (list(long_signals) + list(short_signals))
-                          if s.get('confidence') in ('Mạnh', 'Rất mạnh')
-                          and band_winrate_ok(s.get('confidence'))]
+            # 2. Lọc tín hiệu "CỰC LỚN": CHỈ 5 sao (Rất mạnh) + điểm ≥ AI_AUTO_MIN_SCORE + nhóm có win-rate OK.
+            #    Tín hiệu 4 sao "thấy nó bay" (kiểu HEMI 4.8) không đủ tư cách.
+            quasi = [s for s in (list(long_signals) + list(short_signals))
+                     if s.get('confidence') in ('Mạnh', 'Rất mạnh') and band_winrate_ok(s.get('confidence'))]
+            def _auto_score(s):
+                return s.get('long_score') if s.get('signal') == 'LONG' else s.get('short_score')
+            candidates = [s for s in quasi
+                          if s.get('confidence') == 'Rất mạnh' and _auto_score(s) >= AI_AUTO_MIN_SCORE]
+            if quasi and not candidates:
+                logger.info(f"[AI-AUTO] Có {len(quasi)} tín hiệu 4-5 sao nhưng không đạt ngưỡng "
+                            f"(phải 5⭐ + điểm ≥ {AI_AUTO_MIN_SCORE}) — bỏ qua tất cả.")
+                # Báo Telegram để người dùng biết AI thấy gì nhưng tự nhịn (ai muốn vào thì hỏi)
+                quasi_lines = []
+                for s in sorted(quasi, key=_auto_score, reverse=True)[:5]:
+                    sc = _auto_score(s)
+                    quasi_lines.append(
+                        f"• {s['symbol']} {s['signal']} ({s['confidence']}, điểm {sc:.1f}) "
+                        f"— entry ~{format_price(s['close'])}, TP {format_price(s['tp'])}, SL {format_price(s['sl'])}"
+                    )
+                await _notify_all_chats(
+                    session,
+                    f"🤖👀 *AI thấy {len(quasi)} tín hiệu 4-5 sao* nhưng chưa đạt ngưỡng tự vào lệnh "
+                    f"(cần 5⭐ + điểm ≥ {AI_AUTO_MIN_SCORE}):\n"
+                    + "\n".join(quasi_lines)
+                    + "\n→ T tự nhịn. Muốn vào lệnh nào thì hỏi t nhé."
+                )
             for s in candidates:
-                s['_score'] = s.get('long_score') if s.get('signal') == 'LONG' else s.get('short_score')
+                s['_score'] = _auto_score(s)
             candidates.sort(key=lambda s: s.get('_score', 0), reverse=True)
 
             if candidates:
@@ -3099,30 +3122,37 @@ async def ai_auto_trader_loop(app):
                         max_lev = await get_max_leverage(session, api_key, api_secret, symbol)
                         await set_leverage(session, api_key, api_secret, symbol, max_lev)
 
-                        # 3. Chọn volume theo thang 200/400/1000, margin dùng tối đa 60% khả dụng
+                        # 3. Sizing theo rủi ro THỰC (bài học sau vụ thanh lý): không phải thấy margin vừa là vã mức to nhất
+                        #    - lỗ khi SL khớp ≤ 20% số dư khả dụng (SL xa thì giảm size, SL đã được clamp tối đa 0.5/max_lev)
+                        #    - margin chiếm ≤ 20% số dư khả dụng (chừa buffer cho biến động + các vị thế khác)
+                        price_ref = await get_single_price(session, symbol)
                         chosen_notional = None
-                        for notional in (200, 400, 1000):
-                            if notional / max_lev <= available * 0.6:
-                                chosen_notional = notional
+                        if price_ref and price_ref > 0:
+                            sl_dist = abs(price_ref - float(best['sl'])) / price_ref
+                            max_loss_per_notional = min(sl_dist, 0.5 / max_lev) if max_lev > 1 else sl_dist
+                            risk_cap = (0.20 * available) / max_loss_per_notional if max_loss_per_notional > 0 else None
+                            margin_cap = 0.20 * available * max_lev
+                            for notional in (200, 400, 1000):
+                                if (risk_cap is None or notional <= risk_cap) and notional / max_lev <= margin_cap:
+                                    chosen_notional = notional
                         signal_desc = (f"{best['symbol']} {best['signal']} ({best['confidence']}, "
                                        f"điểm {best.get('_score', 0):.1f})\n"
                                        f"Entry ~{format_price(best['close'])}, "
                                        f"TP {format_price(best['tp'])}, SL {format_price(best['sl'])}")
 
                         if chosen_notional is None:
-                            logger.info("[AI-AUTO] Số dư không đủ cho cả 200u — thông báo người dùng.")
+                            logger.info("[AI-AUTO] Không mức volume nào đạt ngưỡng an toàn — thông báo người dùng.")
                             await _notify_all_chats(
                                 session,
-                                f"🤖⚡ *AI tìm được lệnh ngon* nhưng số dư khả dụng không đủ ({available:,.2f} USDT):\n"
+                                f"🤖⚡ *AI tìm được lệnh ngon* nhưng rủi ro/margin vượt ngưỡng an toàn với số dư "
+                                f"({available:,.2f} USDT):\n"
                                 f"{signal_desc}\n"
-                                f"→ Cần tối thiểu ~{200 / max_lev:,.2f} USDT margin (đòn bẩy {max_lev}x). "
+                                f"→ Ngưỡng: lỗ khi SL khớp ≤ 20% và margin ≤ 20% số dư khả dụng. "
                                 f"Nạp thêm hoặc đóng bớt vị thế rồi hỏi t đặt lại nhé."
                             )
                         else:
-                            # 4. Tự đặt lệnh MARKET, không cần xác nhận
                             qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
-                            price = await get_single_price(session, symbol)
-                            quantity = round_down(chosen_notional / price, qty_p) if price > 0 else 0
+                            quantity = round_down(chosen_notional / price_ref, qty_p)
                             if quantity <= 0:
                                 logger.warning("[AI-AUTO] Quantity tính ra 0 — bỏ qua.")
                             else:
@@ -3142,31 +3172,44 @@ async def ai_auto_trader_loop(app):
                                     data = await resp.json()
                                 if resp.status == 200:
                                     record_signal(best, best.get('ai'))
-                                    # 5. Tự đặt TP/SL điều kiện (algo service) theo tín hiệu
+                                    # 5. Tự đặt TP/SL điều kiện (algo service) — SL theo thanh lý + số dư, TP theo R:R
                                     close_side = 'SELL' if side == 'BUY' else 'BUY'
+                                    is_long_pos = (close_side == 'SELL')
+                                    # 5a. SL: clamp thanh lý + giới hạn lỗ ≤ ~20% số dư khả dụng
+                                    sl_trig = round_price_step(float(best['sl']), tick_size, price_p)
+                                    sl_trig, liq_clamped = _clamp_stop_for_liquidation(is_long_pos, price_ref, sl_trig, max_lev)
+                                    avail_now = await get_available_balance(session)
+                                    if avail_now and avail_now > 0 and quantity > 0:
+                                        max_loss_dist = (0.20 * avail_now) / quantity
+                                        if is_long_pos and sl_trig < price_ref - max_loss_dist:
+                                            sl_trig = price_ref - max_loss_dist
+                                            liq_clamped = True
+                                        elif not is_long_pos and sl_trig > price_ref + max_loss_dist:
+                                            sl_trig = price_ref + max_loss_dist
+                                            liq_clamped = True
+                                    sl_trig = round_price_step(sl_trig, tick_size, price_p)
+                                    sl_dist = abs(price_ref - sl_trig)
+                                    if liq_clamped:
+                                        logger.warning(f"[AI-AUTO] SL gốc {format_price(best['sl'])} không hợp lý "
+                                                       f"({max_lev}x/số dư) — điều chỉnh về {format_price(sl_trig)}")
+                                    # 5b. TP: khoảng cách tối đa 2x khoảng cách SL (R:R hợp lý, không để TP viển vông)
+                                    tp_trig = float(best['tp'])
+                                    if tp_trig and tp_trig > 0 and abs(tp_trig - price_ref) > 2 * sl_dist:
+                                        tp_trig = price_ref + (2 * sl_dist if is_long_pos else -2 * sl_dist)
+                                        tp_capped = True
+                                    else:
+                                        tp_capped = False
+                                    tp_trig = round_price_step(tp_trig, tick_size, price_p)
                                     tpsl_results = []
                                     for label, otype, trigger in (
-                                        ("TP", 'TAKE_PROFIT_MARKET', best['tp']),
-                                        ("SL", 'STOP_MARKET', best['sl']),
+                                        ("TP", 'TAKE_PROFIT_MARKET', tp_trig),
+                                        ("SL", 'STOP_MARKET', sl_trig),
                                     ):
                                         try:
-                                            trig = round_price_step(float(trigger), tick_size, price_p)
-                                            # SL không được nằm sau vùng thanh lý (chỉ xảy ra với SL, không phải TP)
-                                            is_long_pos = (close_side == 'SELL')
-                                            if label == 'SL':
-                                                orig_trig = trig
-                                                trig, clamped = _clamp_stop_for_liquidation(is_long_pos, price, trig, max_lev)
-                                                if clamped:
-                                                    trig = round_price_step(trig, tick_size, price_p)
-                                                    logger.warning(
-                                                        f"[AI-AUTO] SL gốc {format_price(orig_trig)} vượt vùng thanh lý "
-                                                        f"({max_lev}x) — clamp về {format_price(trig)}")
-                                            else:
-                                                clamped = False
                                             algo_params = {
                                                 'algoType': 'CONDITIONAL',
                                                 'symbol': symbol, 'side': close_side, 'type': otype,
-                                                'triggerPrice': f"{trig:.{price_p}f}",
+                                                'triggerPrice': f"{trigger:.{price_p}f}",
                                                 'quantity': f"{quantity:.{qty_p}f}",
                                                 'workingType': 'MARK_PRICE',
                                             }
@@ -3177,11 +3220,13 @@ async def ai_auto_trader_loop(app):
                                             adata, aerr = await binance_signed_request(
                                                 session, 'POST', '/fapi/v1/algoOrder', algo_params)
                                             if not aerr:
-                                                line = (f"✅ {label}: {otype} kích hoạt {format_price(trig)} "
+                                                line = (f"✅ {label}: {otype} kích hoạt {format_price(trigger)} "
                                                         f"(algoId `{adata.get('algoId')}`)")
-                                                if clamped:
-                                                    line += (f"\n⚠️ SL gốc {format_price(orig_trig)} nằm sau vùng thanh lý "
-                                                             f"({max_lev}x) — đã điều chỉnh về mức an toàn")
+                                                if label == 'SL' and liq_clamped:
+                                                    line += (f"\n⚠️ SL gốc {format_price(best['sl'])} không hợp lý "
+                                                             f"(vượt thanh lý/lỗ >20% số dư) — đã điều chỉnh")
+                                                if label == 'TP' and tp_capped:
+                                                    line += "\nℹ️ TP đã hạ về 2x khoảng cách SL cho R:R hợp lý"
                                                 tpsl_results.append(line)
                                             else:
                                                 tpsl_results.append(f"❌ {label}: {aerr}")
@@ -3209,7 +3254,7 @@ async def ai_auto_trader_loop(app):
                                         f"→ Lỗi từ Binance: `{err_msg}`"
                                     )
             else:
-                logger.info("[AI-AUTO] Lượt này không có tín hiệu nào đạt 4-5 sao.")
+                logger.info("[AI-AUTO] Lượt này không có tín hiệu nào đạt ngưỡng.")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3489,12 +3534,22 @@ async def tool_place_order(session, chat_id, args):
                 lev_now = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
                                                  os.getenv("BINANCE_API_SECRET"), symbol)
                 stop_price, clamped = _clamp_stop_for_liquidation(side == 'SELL', entry_ref, stop_price, lev_now)
+                # SL phải hợp lý theo số dư: lỗ khi SL khớp ≤ ~20% khả dụng
+                avail_now = await get_available_balance(session)
+                if avail_now and avail_now > 0 and quantity > 0:
+                    max_loss_dist = (0.20 * avail_now) / quantity
+                    if side == 'SELL' and stop_price < entry_ref - max_loss_dist:
+                        stop_price = entry_ref - max_loss_dist
+                        clamped = True
+                    elif side == 'BUY' and stop_price > entry_ref + max_loss_dist:
+                        stop_price = entry_ref + max_loss_dist
+                        clamped = True
                 if clamped:
                     stop_price = round_price_step(stop_price, tick_size, price_p)
-                    logger.warning(f"[AI-TOOL] SL gốc {args['stop_price']} vượt vùng thanh lý ({lev_now}x) — "
+                    logger.warning(f"[AI-TOOL] SL gốc {args['stop_price']} không hợp lý (thanh lý/số dư) — "
                                    f"clamp về {stop_price} cho {symbol}")
             except Exception as clamp_e:
-                logger.warning(f"Lỗi clamp SL theo thanh lý: {clamp_e}")
+                logger.warning(f"Lỗi clamp SL theo thanh lý/số dư: {clamp_e}")
         algo_params = {
             'algoType': 'CONDITIONAL',
             'symbol': symbol, 'side': side, 'type': otype,
@@ -3997,9 +4052,13 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
             "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy "
             "(hệ thống tự set đòn bẩy max cho symbol khi thực thi) — nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
-            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional mặc định chỉ được chọn 1 trong 3 mức: 200, 400 hoặc 1000 USDT — "
-            "tự suy đoán mức hợp lý nhất dựa trên số dư khả dụng, đòn bẩy và số vị thế đang mở "
-            "(ưu tiên 200 khi tài khoản mỏng hoặc đã nhiều vị thế; 1000 chỉ khi dư dả). Ghi rõ mức đã chọn và lý do trong câu trả lời. "
+            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional chỉ được chọn 1 trong 3 mức: 200, 400 hoặc 1000 USDT — "
+            "và phải TÍNH TOÁN RỦI RO THẬT, tuyệt đối không thấy số dư đủ là chọn mức to nhất: "
+            "lỗ khi SL khớp = notional × (khoảng cách SL so với entry) và không được vượt ~20% số dư khả dụng; "
+            "margin cần = notional / đòn bẩy và không được vượt ~25% số dư khả dụng (đòn bẩy cao thì thanh lý đến rất sớm — "
+            "khoảng cách thanh lý ≈ 100%/đòn bẩy, ví dụ 20x chỉ chịu được ~5%). "
+            "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo người dùng rõ lý do. "
+            "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
             "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
             "QUAN TRỌNG: khi câu trả lời có đề xuất lệnh cụ thể (coin, hướng, giá entry/TP/SL, quantity), hãy SOẠN NGAY các lệnh đó bằng "
             "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
@@ -5499,7 +5558,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
             "📊 `/usage` - Xem mức dùng quota AI (5 giờ/tuần/tháng) và thời gian reset.\n"
-            "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, thấy tín hiệu 4-5 sao + đủ margin thì tự vào lệnh (200/400/1000u) và báo vào đây; không đủ margin thì báo để bạn xử lý.\n"
+            "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
             "💡 *Mẹo*:\n"
