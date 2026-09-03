@@ -3266,7 +3266,7 @@ async def ai_auto_trader_loop(app):
 pending_orders = {}  # chat_id -> {'type': 'place_order'|'cancel_order', 'params': {...}, 'desc': str, 'ts': float}
 PENDING_ORDER_TTL = 600
 ai_chat_history = {}  # chat_id -> list message (user/assistant) gần nhất: bộ nhớ hội thoại của agent
-AI_HISTORY_MAX_MSGS = 16
+AI_HISTORY_MAX_MSGS = 8  # Giữ ngắn để mỗi lượt gọi LLM không chở context khổng lồ (AI trả lời nhanh hơn)
 # Nhận diện xác nhận/hủy linh hoạt: tin nhắn ngắn (< 40 ký tự) có chứa từ khóa
 CONFIRM_RE = re.compile(
     r'\b(xac nhan|xác nhận|xacnhan|ok|oke|okê|yes|y|confirm|dong y|đồng ý|dat di|đặt đi|'
@@ -3755,7 +3755,7 @@ TOOL_EXECUTORS = {
 }
 
 
-async def get_ai_agent_response(session, messages, tools, max_tokens=3000):
+async def get_ai_agent_response(session, messages, tools, max_tokens=3000, timeout_s=150):
     """Một lượt gọi LLM hỗ trợ tool calling. Trả về (message_dict, None) khi OK hoặc (None, error_detail) khi lỗi."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
@@ -3771,7 +3771,7 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=3000):
         "max_tokens": max_tokens
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=90)
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -3790,8 +3790,8 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=3000):
                 return None, f"AI trả về nội dung rỗng (finish_reason={fr}) — có thể bị cắt ngắn do hết token."
             return msg, None
     except asyncio.TimeoutError:
-        logger.warning("AI agent timeout sau 90s.")
-        return None, "AI phản hồi quá lâu (timeout 90s)."
+        logger.warning(f"AI agent timeout sau {timeout_s}s.")
+        return None, f"AI phản hồi quá lâu (timeout {timeout_s}s)."
     except Exception as e:
         logger.warning(f"Lỗi gọi AI agent: {e}")
         return None, str(e)
@@ -4073,6 +4073,9 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
             "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
             "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
+            "QUAN TRỌNG - TRẢ LỜI NHANH: gộp các công cụ độc lập vào CÙNG MỘT lượt gọi; "
+            "chỉ dùng nhiều nhất 2-3 lượt gọi công cụ cho mỗi câu hỏi — dữ liệu ban đầu (giá, số dư, vị thế, lệnh chờ) "
+            "đã có sẵn trong ngữ cảnh, đừng gọi lại tool nếu câu trả lời có thể dựa vào đó. "
             "Nếu người dùng gửi kèm hình ảnh, hãy mô tả/phân tích nó (chart, giao dịch, thông báo lỗi, tin tức...) "
             "kết hợp với dữ liệu thị trường và tài khoản nếu liên quan. "
             "Trả lời tiếng Việt, ngắn gọn, thực dụng, không dùng ký tự markdown (*, _, `)."
@@ -4103,6 +4106,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         final_text = None
         error_detail = None
         retried_long = False
+        retried_timeout = False
         TOOL_LABELS = {
             'analyze_coin': '📊 đang phân tích coin',
             'get_price': '📈 đang tra giá coin',
@@ -4116,8 +4120,13 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             'cancel_order': '🚫 đang soạn hủy lệnh',
             'close_position': '🔒 đang soạn lệnh đóng vị thế',
         }
-        for _ in range(8):
+        for _ in range(5):
             msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS)
+            if err and 'timeout' in err.lower() and not retried_timeout:
+                # Timeout thường gặp khi context nặng (ảnh, history dài): thử lại 1 lần
+                retried_timeout = True
+                logger.warning("Agent timeout — retry 1 lần với timeout 240s.")
+                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, timeout_s=240)
             if err and 'finish_reason=length' in err and not retried_long:
                 # Thinking model tiêu hết budget: thử lại 1 lần với max_tokens lớn hơn
                 retried_long = True
@@ -4158,14 +4167,14 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             final_text = (msg.get('content') or '').strip()
             break
         else:
-            error_detail = "AI xử lý quá nhiều bước liên tiếp (trên 8 bước) mà chưa kết luận — thử hỏi cụ thể hơn nhé."
+            error_detail = "AI xử lý quá nhiều bước liên tiếp (trên 5 bước) mà chưa kết luận — thử hỏi cụ thể hơn nhé."
 
         if loading_msg_id:
             await delete_telegram_message(session, chat_id, loading_msg_id)
         if final_text:
             # Lưu bộ nhớ hội thoại (chỉ lưu câu hỏi + câu trả lời cuối, không lưu tool traffic)
-            history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": final_text[:1500]})
+            history.append({"role": "user", "content": question[:500]})
+            history.append({"role": "assistant", "content": final_text[:600]})
             ai_chat_history[chat_id] = history[-AI_HISTORY_MAX_MSGS:]
             await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}", reply_to=reply_to)
         elif error_detail:
