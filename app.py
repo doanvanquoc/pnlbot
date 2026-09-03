@@ -112,6 +112,10 @@ def save_auto_chats():
         logger.error(f"Lỗi khi lưu auto_chats: {e}")
 
 
+SIGNAL_HISTORY_FILE = "signal_history.json"
+SIGNAL_MAX_AGE_DAYS = 30
+SIGNAL_TIMEOUT_HOURS = 72
+signal_history = []
 
 def load_signal_history():
     global signal_history
