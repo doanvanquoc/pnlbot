@@ -35,8 +35,6 @@ mark_price_ws = None    # WS connection cho Mark Price stream
 auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động mỗi 5 phút
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
 has_new_activity = {}   # Đánh dấu có hoạt động mới trong chat (key: chat_id, value: bool)
-notified_thresholds = {} # Các ngưỡng % đã thông báo cho từng vị thế (key: pos_key, value: set)
-PRICE_ALERT_THRESHOLDS = list(range(5, 505, 5)) # Cảnh báo mỗi 5% biến động vị thế (từ 5% đến 500%)
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
 symbol_price_precisions = {}  # Lưu độ chính xác giá (pricePrecision) của từng symbol
@@ -44,7 +42,6 @@ symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
 ai_active_until = {}    # chat_id -> timestamp: /auto tạm im lặng tới thời điểm này để không chen ngang chat AI
 AI_QUIET_SECONDS = 120  # Thời gian im lặng của /auto sau mỗi lượt tương tác AI
-tracking_coins = {}     # Lưu danh sách coin đang tracking giá: {symbol: {'ref_price': float, 'chat_ids': set()}}
 
 # Cache cho kết quả quét thị trường của lệnh /analyze
 market_scan_cache = {
@@ -75,7 +72,6 @@ CONF_MAP = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung 
 
 ACTIVE_CHATS_FILE = "active_chats.json"
 AUTO_CHATS_FILE = "auto_chats.json"
-TRACKING_COINS_FILE = "tracking_coins.json"
 active_chats = set()
 
 def load_active_chats():
@@ -115,39 +111,7 @@ def save_auto_chats():
     except Exception as e:
         logger.error(f"Lỗi khi lưu auto_chats: {e}")
 
-def load_tracking_coins():
-    global tracking_coins
-    try:
-        if os.path.exists(TRACKING_COINS_FILE):
-            with open(TRACKING_COINS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for symbol, info in data.items():
-                    chat_ids = set(int(cid) for cid in info.get('chat_ids', []))
-                    if chat_ids:
-                        tracking_coins[symbol] = {
-                            'ref_price': float(info.get('ref_price', 0)),
-                            'chat_ids': chat_ids
-                        }
-                logger.info(f"Đã tải {len(tracking_coins)} coin đang tracking từ file.")
-    except Exception as e:
-        logger.error(f"Lỗi khi tải tracking_coins: {e}")
 
-def save_tracking_coins():
-    try:
-        data = {
-            symbol: {'ref_price': info['ref_price'], 'chat_ids': list(info['chat_ids'])}
-            for symbol, info in tracking_coins.items()
-        }
-        with open(TRACKING_COINS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logger.error(f"Lỗi khi lưu tracking_coins: {e}")
-
-
-SIGNAL_HISTORY_FILE = "signal_history.json"
-SIGNAL_MAX_AGE_DAYS = 30
-SIGNAL_TIMEOUT_HOURS = 72
-signal_history = []
 
 def load_signal_history():
     global signal_history
@@ -793,7 +757,6 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
                 logger.warning(f"Không có session để hủy DCA cho {symbol}")
             
             del positions[key]
-            notified_thresholds.pop(key, None)
             logger.info(f"Đã đóng vị thế: {key}")
         
         # Kiểm tra xem symbol này còn vị thế nào khác đang mở hay không
@@ -1129,62 +1092,14 @@ async def binance_mark_price_stream(session):
                                 if pos['symbol'] == symbol:
                                     pos['markPrice'] = mark_price
                                     pos['fundingRate'] = float(data.get('r', 0))
-                                    
+
                                     amt = pos['positionAmt']
                                     entry = pos['entryPrice']
                                     side = pos['positionSide']
-                                    
+
                                     side_sign = -1 if (side == 'SHORT' or amt < 0) else 1
                                     pos['unrealizedPnL'] = (mark_price - entry) * abs(amt) * side_sign
-                                    
-                                    # Kiểm tra ngưỡng biến động giá % so với entry
-                                    if entry > 0:
-                                        pct_change = ((mark_price - entry) / entry) * 100 * side_sign
-                                        if key not in notified_thresholds:
-                                            notified_thresholds[key] = set()
-                                        
-                                        for threshold in PRICE_ALERT_THRESHOLDS:
-                                            # Kiểm tra cả chiều lời (+) và lỗ (-)
-                                            for direction in [threshold, -threshold]:
-                                                if direction not in notified_thresholds[key]:
-                                                    if (direction > 0 and pct_change >= direction) or (direction < 0 and pct_change <= direction):
-                                                        # Chỉ đánh dấu đã thông báo khi có active_chats để gửi
-                                                        if not active_chats:
-                                                            continue
-                                                        
-                                                        sym_display = display_symbol(symbol)
-                                                        display_side = 'LONG' if side_sign > 0 else 'SHORT'
-                                                        
-                                                        if direction > 0:
-                                                            alert_msg = (
-                                                                f"📈📈 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📈📈\n"
-                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                                                f"🪙 Cặp: `{sym_display}` ({display_side})\n"
-                                                                f"🟢 Vị thế đã dương *+{pct_change:.1f}%* so với Entry\n"
-                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
-                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
-                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
-                                                            )
-                                                        else:
-                                                            alert_msg = (
-                                                                f"📉📉 *【CẢNH BÁO BIẾN ĐỘNG GIÁ】* 📉📉\n"
-                                                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                                                f"🪙 Cặp: `{sym_display}` ({display_side})\n"
-                                                                f"🔴 Vị thế đã âm *{abs(pct_change):.1f}%* so với Entry\n"
-                                                                f"💵 Entry: `{format_price(entry)} USDT`\n"
-                                                                f"💵 Hiện tại: `{format_price(mark_price)} USDT`\n"
-                                                                f"💰 PnL: `{'+' if pos['unrealizedPnL'] >= 0 else ''}{pos['unrealizedPnL']:,.2f} USDT`"
-                                                            )
-                                                        
-                                                        send_results = await asyncio.gather(
-                                                            *[send_telegram_message(session, cid, alert_msg) for cid in list(active_chats)],
-                                                            return_exceptions=True
-                                                        )
-                                                        
-                                                        # Chỉ đánh dấu đã thông báo nếu gửi thành công ít nhất 1 chat
-                                                        if any(r is not None and not isinstance(r, Exception) for r in send_results):
-                                                            notified_thresholds[key].add(direction)
-                                    
+
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("Mark Price WS bị đóng hoặc lỗi.")
                         break
@@ -2545,144 +2460,6 @@ async def get_single_funding_rate(session, symbol):
     return 0.0
 
 
-async def handle_tracking_command(session, chat_id, coin_name):
-    """Bắt đầu theo dõi biến động giá của coin. Gửi thông báo khi biến động >= 5% so với giá tham chiếu trước đó."""
-    coin_name = coin_name.upper()
-    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
-    
-    # Lấy giá hiện tại làm giá tham chiếu ban đầu
-    url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
-    try:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                await send_telegram_message(session, chat_id, f"❌ Không tìm thấy coin *{symbol}*. Vui lòng kiểm tra lại tên coin.")
-                return
-            data = await resp.json()
-            current_price = float(data.get('price', 0))
-            if current_price <= 0:
-                await send_telegram_message(session, chat_id, f"❌ Không lấy được giá cho *{symbol}*.")
-                return
-    except Exception as e:
-        await send_telegram_message(session, chat_id, f"❌ Lỗi khi lấy giá *{symbol}*: {e}")
-        return
-    
-    if symbol in tracking_coins:
-        tracking_coins[symbol]['chat_ids'].add(chat_id)
-    else:
-        tracking_coins[symbol] = {
-            'ref_price': current_price,
-            'chat_ids': {chat_id}
-        }
-    save_tracking_coins()
-    
-    display = display_symbol(symbol)
-    await send_telegram_message(
-        session, chat_id,
-        f"🔔 *BẮT ĐẦU THEO DÕI: {display}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Giá tham chiếu: `{format_price(current_price)} USDT`\n"
-        f"📊 Sẽ thông báo khi biến động ≥ *5%* so với giá tham chiếu\n"
-        f"❌ Hủy theo dõi: `/ct {display.lower()}`"
-    )
-
-
-async def handle_cancel_tracking_command(session, chat_id, coin_name=None):
-    """Hủy theo dõi coin."""
-    if coin_name:
-        coin_name = coin_name.upper()
-        symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
-        
-        if symbol in tracking_coins and chat_id in tracking_coins[symbol]['chat_ids']:
-            tracking_coins[symbol]['chat_ids'].discard(chat_id)
-            if not tracking_coins[symbol]['chat_ids']:
-                del tracking_coins[symbol]
-            save_tracking_coins()
-            display = display_symbol(symbol)
-            await send_telegram_message(session, chat_id, f"✅ Đã hủy theo dõi *{display}*.")
-        else:
-            await send_telegram_message(session, chat_id, f"❌ Bạn chưa theo dõi coin *{symbol}*.")
-    else:
-        # Hủy tất cả coin đang tracking cho chat_id này
-        removed = []
-        for symbol in list(tracking_coins.keys()):
-            if chat_id in tracking_coins[symbol]['chat_ids']:
-                tracking_coins[symbol]['chat_ids'].discard(chat_id)
-                removed.append(display_symbol(symbol))
-                if not tracking_coins[symbol]['chat_ids']:
-                    del tracking_coins[symbol]
-        
-        if removed:
-            save_tracking_coins()
-            await send_telegram_message(session, chat_id, f"✅ Đã hủy theo dõi: *{', '.join(removed)}*")
-        else:
-            await send_telegram_message(session, chat_id, "❌ Bạn chưa theo dõi coin nào.")
-
-
-async def tracking_price_loop(app):
-    """Background loop kiểm tra giá các coin đang tracking mỗi 30 giây."""
-    await asyncio.sleep(5)  # Chờ khởi tạo
-    while True:
-        try:
-            if not tracking_coins:
-                await asyncio.sleep(15)
-                continue
-            
-            session = app['session']
-            symbols_to_check = list(tracking_coins.keys())
-            
-            for symbol in symbols_to_check:
-                if symbol not in tracking_coins:
-                    continue
-                    
-                url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
-                try:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                        current_price = float(data.get('price', 0))
-                        if current_price <= 0:
-                            continue
-                except Exception:
-                    continue
-                
-                ref_price = tracking_coins[symbol]['ref_price']
-                change_pct = ((current_price - ref_price) / ref_price) * 100
-                
-                if abs(change_pct) >= 5.0:
-                    # Cập nhật giá tham chiếu mới
-                    tracking_coins[symbol]['ref_price'] = current_price
-                    save_tracking_coins()
-                    
-                    display = display_symbol(symbol)
-                    direction = "📈 TĂNG" if change_pct > 0 else "📉 GIẢM"
-                    emoji = "🟢" if change_pct > 0 else "🔴"
-                    
-                    msg = (
-                        f"🔔 *CẢNH BÁO BIẾN ĐỘNG: {display}*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{direction} {emoji} *{change_pct:+.2f}%*\n"
-                        f"💵 Giá hiện tại: `{format_price(current_price)} USDT`\n"
-                        f"📊 Giá tham chiếu cũ: `{format_price(ref_price)} USDT`\n"
-                        f"🔄 Giá tham chiếu mới: `{format_price(current_price)} USDT`"
-                    )
-                    
-                    chat_ids = list(tracking_coins.get(symbol, {}).get('chat_ids', set()))
-                    send_results = await asyncio.gather(
-                        *[send_telegram_message(session, cid, msg) for cid in chat_ids],
-                        return_exceptions=True
-                    )
-                    for cid, send_err in zip(chat_ids, send_results):
-                        if isinstance(send_err, Exception):
-                            logger.error(f"Lỗi gửi tracking alert đến {cid}: {send_err}")
-            
-            await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Lỗi trong tracking_price_loop: {e}")
-            await asyncio.sleep(30)
-
 def format_scan_item(i, res, direction):
     """Dựng 1 khối tín hiệu quét thị trường — thiết kế gọn để xem trên điện thoại."""
     coin = display_symbol(res['symbol'])
@@ -3106,6 +2883,21 @@ async def build_account_context(session):
                     lines.append(line)
                 else:
                     lines.append("- Không có vị thế nào đang mở.")
+        # Lệnh đang chờ: lệnh thường + lệnh TP/SL điều kiện (algo service, gồm cả lệnh đặt từ app)
+        oo_data, oo_err = await binance_signed_request(session, 'GET', '/fapi/v1/openOrders')
+        if not oo_err and oo_data:
+            for o in oo_data[:10]:
+                lines.append(f"- Lệnh chờ thường: {o.get('symbol')} {o.get('side')} {o.get('type')} "
+                             f"qty {o.get('origQty')} @ {o.get('price')} (orderId {o.get('orderId')})")
+        algo_data, algo_err = await binance_signed_request(session, 'GET', '/fapi/v1/openAlgoOrders')
+        if not algo_err and algo_data:
+            for o in algo_data[:10]:
+                lines.append(
+                    f"- TP/SL điều kiện: {o.get('symbol')} {o.get('side')} {o.get('orderType')} "
+                    f"qty {o.get('quantity')} kích hoạt khi chạm {format_price(o.get('triggerPrice'))} "
+                    f"(algoId {o.get('algoId')}, status {o.get('algoStatus')}, "
+                    f"reduceOnly={'có' if o.get('reduceOnly') else 'không'})"
+                )
     except Exception as e:
         logger.warning(f"Lỗi lấy ngữ cảnh tài khoản cho /ai: {e}")
         return None
@@ -3218,6 +3010,173 @@ async def handle_usage_command(session, chat_id):
         ])
     )
     await send_telegram_message(session, chat_id, msg)
+
+
+# ─── AI tự động vào lệnh mỗi 5 giờ ───
+AI_AUTO_TRADER_INTERVAL = 5 * 3600
+
+
+async def get_available_balance(session):
+    """Số dư khả dụng của tài khoản Futures. Trả về float hoặc None nếu lỗi."""
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/account')
+    if err:
+        logger.warning(f"[AI-AUTO] Lỗi lấy số dư khả dụng: {err}")
+        return None
+    try:
+        return float(data.get('availableBalance', 0))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _notify_all_chats(session, text):
+    """Gửi thông báo tới tất cả chat đã biết (auto chats + active chats)."""
+    for cid in list(set(auto_chats) | set(active_chats)):
+        await send_telegram_message(session, cid, text, is_auto=True)
+
+
+async def ai_auto_trader_loop(app):
+    """Mỗi 5h: quét thị trường, có tín hiệu 4-5 sao + đủ margin thì TỰ vào lệnh (không cần xác nhận),
+    xong báo Telegram. Không đủ margin -> báo tìm được lệnh ngon. Không có tín hiệu ngon -> chỉ log."""
+    await asyncio.sleep(90)  # chờ khởi động xong (exchangeInfo, positions...)
+    while True:
+        try:
+            session = app['session']
+            # 1. Quét thị trường tươi (bỏ qua cache)
+            async with market_scan_cache["lock"]:
+                long_signals, short_signals = await scan_market_signals(session)
+                market_scan_cache["signals"] = (long_signals, short_signals)
+                market_scan_cache["timestamp"] = time.time()
+
+            # 2. Lọc tín hiệu "quá ngon": 4-5 sao + nhóm tín hiệu có win-rate OK, chọn điểm cao nhất
+            candidates = [s for s in (list(long_signals) + list(short_signals))
+                          if s.get('confidence') in ('Mạnh', 'Rất mạnh')
+                          and band_winrate_ok(s.get('confidence'))]
+            for s in candidates:
+                s['_score'] = s.get('long_score') if s.get('signal') == 'LONG' else s.get('short_score')
+            candidates.sort(key=lambda s: s.get('_score', 0), reverse=True)
+
+            if candidates:
+                best = candidates[0]
+                symbol = best['symbol']
+                logger.info(f"[AI-AUTO] Tín hiệu tốt nhất: {symbol} {best['signal']} "
+                            f"({best['confidence']}, điểm {best.get('_score', 0):.1f})")
+                if any(p.get('symbol') == symbol for p in positions.values()):
+                    logger.info(f"[AI-AUTO] Đã có vị thế {symbol} — bỏ qua, không chồng lệnh.")
+                else:
+                    available = await get_available_balance(session)
+                    if available is None:
+                        logger.warning("[AI-AUTO] Không lấy được số dư khả dụng — bỏ qua lượt này.")
+                    else:
+                        api_key = os.getenv("BINANCE_API_KEY")
+                        api_secret = os.getenv("BINANCE_API_SECRET")
+                        max_lev = await get_max_leverage(session, api_key, api_secret, symbol)
+                        await set_leverage(session, api_key, api_secret, symbol, max_lev)
+
+                        # 3. Chọn volume theo thang 200/400/1000, margin dùng tối đa 60% khả dụng
+                        chosen_notional = None
+                        for notional in (200, 400, 1000):
+                            if notional / max_lev <= available * 0.6:
+                                chosen_notional = notional
+                        signal_desc = (f"{best['symbol']} {best['signal']} ({best['confidence']}, "
+                                       f"điểm {best.get('_score', 0):.1f})\n"
+                                       f"Entry ~{format_price(best['close'])}, "
+                                       f"TP {format_price(best['tp'])}, SL {format_price(best['sl'])}")
+
+                        if chosen_notional is None:
+                            logger.info("[AI-AUTO] Số dư không đủ cho cả 200u — thông báo người dùng.")
+                            await _notify_all_chats(
+                                session,
+                                f"🤖⚡ *AI tìm được lệnh ngon* nhưng số dư khả dụng không đủ ({available:,.2f} USDT):\n"
+                                f"{signal_desc}\n"
+                                f"→ Cần tối thiểu ~{200 / max_lev:,.2f} USDT margin (đòn bẩy {max_lev}x). "
+                                f"Nạp thêm hoặc đóng bớt vị thế rồi hỏi t đặt lại nhé."
+                            )
+                        else:
+                            # 4. Tự đặt lệnh MARKET, không cần xác nhận
+                            qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+                            price = await get_single_price(session, symbol)
+                            quantity = round_down(chosen_notional / price, qty_p) if price > 0 else 0
+                            if quantity <= 0:
+                                logger.warning("[AI-AUTO] Quantity tính ra 0 — bỏ qua.")
+                            else:
+                                side = 'BUY' if best['signal'] == 'LONG' else 'SELL'
+                                order_params = {
+                                    'symbol': symbol, 'side': side, 'type': 'MARKET',
+                                    'quantity': f"{quantity:.{qty_p}f}",
+                                    'timestamp': int(time.time() * 1000), 'recvWindow': 10000,
+                                }
+                                if hedge_mode:
+                                    order_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
+                                query = urlencode(order_params)
+                                signature = get_binance_signature(query, api_secret)
+                                url = f"https://fapi.binance.com/fapi/v1/order?{query}&signature={signature}"
+                                headers = {"X-MBX-APIKEY": api_key}
+                                async with session.post(url, headers=headers) as resp:
+                                    data = await resp.json()
+                                if resp.status == 200:
+                                    record_signal(best, best.get('ai'))
+                                    # 5. Tự đặt TP/SL điều kiện (algo service) theo tín hiệu
+                                    close_side = 'SELL' if side == 'BUY' else 'BUY'
+                                    tpsl_results = []
+                                    for label, otype, trigger in (
+                                        ("TP", 'TAKE_PROFIT_MARKET', best['tp']),
+                                        ("SL", 'STOP_MARKET', best['sl']),
+                                    ):
+                                        try:
+                                            trig = round_price_step(float(trigger), tick_size, price_p)
+                                            algo_params = {
+                                                'algoType': 'CONDITIONAL',
+                                                'symbol': symbol, 'side': close_side, 'type': otype,
+                                                'triggerPrice': f"{trig:.{price_p}f}",
+                                                'quantity': f"{quantity:.{qty_p}f}",
+                                                'workingType': 'MARK_PRICE',
+                                            }
+                                            if hedge_mode:
+                                                algo_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
+                                            else:
+                                                algo_params['reduceOnly'] = 'true'
+                                            aq = urlencode(algo_params)
+                                            asig = get_binance_signature(aq, api_secret)
+                                            aurl = f"https://fapi.binance.com/fapi/v1/algoOrder?{aq}&signature={asig}"
+                                            async with session.post(aurl, headers=headers) as aresp:
+                                                adata = await aresp.json()
+                                            if aresp.status == 200:
+                                                tpsl_results.append(
+                                                    f"✅ {label}: {otype} kích hoạt {format_price(trig)} "
+                                                    f"(algoId `{adata.get('algoId')}`)"
+                                                )
+                                            else:
+                                                tpsl_results.append(f"❌ {label}: {adata.get('msg', f'HTTP {aresp.status}')}")
+                                        except Exception as tpsl_e:
+                                            tpsl_results.append(f"❌ {label}: {tpsl_e}")
+                                    tpsl_block = "\n🛡️ *TP/SL tự đặt:*\n" + "\n".join(tpsl_results) if tpsl_results else ""
+                                    await _notify_all_chats(
+                                        session,
+                                        f"🤖⚡ *AI TỰ ĐỘNG VÀO LỆNH*\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🪙 {signal_desc}\n"
+                                        f"💵 Volume: {chosen_notional} USDT (đòn bẩy {max_lev}x)\n"
+                                        f"📦 Quantity: {quantity:.{qty_p}f}\n"
+                                        f"OrderId: `{data.get('orderId')}` | Status: {data.get('status')}"
+                                        f"{tpsl_block}"
+                                    )
+                                    logger.info(f"[AI-AUTO] Đã tự vào lệnh {symbol} {best['signal']} "
+                                                f"{chosen_notional}u, orderId={data.get('orderId')}")
+                                else:
+                                    err_msg = data.get('msg', f"HTTP {resp.status}")
+                                    logger.warning(f"[AI-AUTO] Đặt lệnh thất bại: {err_msg}")
+                                    await _notify_all_chats(
+                                        session,
+                                        f"⚠️ AI định tự vào lệnh nhưng THẤT BẠI:\n{signal_desc}\n"
+                                        f"→ Lỗi từ Binance: `{err_msg}`"
+                                    )
+            else:
+                logger.info("[AI-AUTO] Lượt này không có tín hiệu nào đạt 4-5 sao.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi trong ai_auto_trader_loop: {e}")
+        await asyncio.sleep(AI_AUTO_TRADER_INTERVAL)
 
 
 # ─── Agent tools cho /ai: đọc dữ liệu tài khoản + soạn lệnh (có bước xác nhận) ───
@@ -3736,6 +3695,18 @@ async def _execute_items(session, items):
     results = []
     ok_count = 0
     for item in items:
+        if item['type'] in ('place_order', 'place_algo_order'):
+            # Set max đòn bẩy cho symbol trước khi đặt (giống lệnh đặt trực tiếp),
+            # tránh lỗi Margin is insufficient do symbol mới mặc định đòn bẩy thấp
+            try:
+                sym = item['params'].get('symbol')
+                if sym:
+                    max_lev = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
+                                                     os.getenv("BINANCE_API_SECRET"), sym)
+                    await set_leverage(session, os.getenv("BINANCE_API_KEY"),
+                                       os.getenv("BINANCE_API_SECRET"), sym, max_lev)
+            except Exception as e:
+                logger.warning(f"Không set được đòn bẩy cho {item['params'].get('symbol')}: {e}")
         if item['type'] == 'place_order':
             data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', item['params'])
         elif item['type'] == 'place_algo_order':
@@ -3965,6 +3936,12 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "hoặc giá mark từ get_positions, và ghi rõ phép tính trong câu trả lời. "
             "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ đọc, (2) gọi công cụ soạn lệnh, "
             "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
+            "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy "
+            "(hệ thống tự set đòn bẩy max cho symbol khi thực thi) — nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
+            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional mặc định chỉ được chọn 1 trong 3 mức: 200, 400 hoặc 1000 USDT — "
+            "tự suy đoán mức hợp lý nhất dựa trên số dư khả dụng, đòn bẩy và số vị thế đang mở "
+            "(ưu tiên 200 khi tài khoản mỏng hoặc đã nhiều vị thế; 1000 chỉ khi dư dả). Ghi rõ mức đã chọn và lý do trong câu trả lời. "
+            "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
             "QUAN TRỌNG: khi câu trả lời có đề xuất lệnh cụ thể (coin, hướng, giá entry/TP/SL, quantity), hãy SOẠN NGAY các lệnh đó bằng "
             "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
             "người dùng không thích thì bấm Hủy hoặc bỏ qua (tự hết hạn). Chỉ không soạn khi trả lời thuần phân tích/kiến thức, không kèm đề xuất lệnh cụ thể. "
@@ -5364,7 +5341,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/tracking', '/t', '/ct', '/canceltracking', '/review', '/ai', '/usage'
+            '/review', '/ai', '/usage'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -5461,9 +5438,8 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
             "📊 `/usage` - Xem mức dùng quota AI (5 giờ/tuần/tháng) và thời gian reset.\n"
+            "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, thấy tín hiệu 4-5 sao + đủ margin thì tự vào lệnh (200/400/1000u) và báo vào đây; không đủ margin thì báo để bạn xử lý.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
-            "🔔 `/tracking <coin>` (hoặc `/t`) - Theo dõi biến động giá coin tự động mỗi 5%.\n"
-            "🔕 `/canceltracking [coin]` (hoặc `/ct`) - Hủy theo dõi một hoặc toàn bộ coin.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n\n"
             "💡 *Mẹo*:\n"
             "• Nhập trực tiếp tên coin (ví dụ: `btc` hoặc `btc eth sol`) để tra cứu giá nhanh kèm % biến động 24h.\n"
@@ -5706,24 +5682,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
         
     elif command_base == '/liq':
         await handle_liq_command(request.app['session'], chat_id)
-        
-    elif command_base in ('/tracking', '/t'):
-        parts = text.split()
-        if len(parts) < 2:
-            await send_telegram_message(
-                request.app['session'],
-                chat_id,
-                "❌ Sai cú pháp!\nSử dụng: `/t <coin>`\nVí dụ: `/t btc`"
-            )
-        else:
-            coin_name = parts[1]
-            await handle_tracking_command(request.app['session'], chat_id, coin_name)
-    
-    elif command_base in ('/ct', '/canceltracking'):
-        parts = text.split()
-        coin_name = parts[1] if len(parts) > 1 else None
-        await handle_cancel_tracking_command(request.app['session'], chat_id, coin_name)
-        
+
     return web.Response(status=200)
 
 
@@ -5794,7 +5753,6 @@ async def telegram_polling_loop(app):
 async def on_startup(app):
     load_active_chats()
     load_auto_chats()
-    load_tracking_coins()
     load_signal_history()
     app['session'] = aiohttp.ClientSession()
     
@@ -5827,11 +5785,12 @@ async def on_startup(app):
     app['auto_pos_task'] = asyncio.create_task(
         auto_pos_sender_loop(app)
     )
-    app['tracking_price_task'] = asyncio.create_task(
-        tracking_price_loop(app)
-    )
     app['signal_track_task'] = asyncio.create_task(
         signal_tracking_loop(app)
+    )
+    # AI tự động vào lệnh mỗi 5h khi có tín hiệu 4-5 sao
+    app['ai_auto_trader_task'] = asyncio.create_task(
+        ai_auto_trader_loop(app)
     )
 
 async def on_cleanup(app):
@@ -5844,10 +5803,10 @@ async def on_cleanup(app):
         app['mark_price_task'].cancel()
     if 'auto_pos_task' in app:
         app['auto_pos_task'].cancel()
-    if 'tracking_price_task' in app:
-        app['tracking_price_task'].cancel()
     if 'signal_track_task' in app:
         app['signal_track_task'].cancel()
+    if 'ai_auto_trader_task' in app:
+        app['ai_auto_trader_task'].cancel()
         
     if 'session' in app:
         await app['session'].close()
