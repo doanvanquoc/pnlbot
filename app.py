@@ -3016,6 +3016,29 @@ async def handle_usage_command(session, chat_id):
     await send_telegram_message(session, chat_id, msg)
 
 
+def _clamp_stop_for_liquidation(is_long, entry_price, stop_price, max_lev):
+    """Giới hạn SL nằm trong vùng an toàn TRƯỚC thanh lý (chỉ dùng 50% khoảng cách tới thanh lý).
+    Trả về (stop_price_đã_clamp, có_clamp_hay_không). SL từ tín hiệu quét có thể xa hơn thanh lý khi đòn bẩy cao."""
+    try:
+        entry_price = float(entry_price)
+        stop_price = float(stop_price)
+        max_lev = float(max_lev)
+    except (TypeError, ValueError):
+        return stop_price, False
+    if entry_price <= 0 or stop_price <= 0 or max_lev <= 1:
+        return stop_price, False
+    safe_dist = (0.5 / max_lev) * entry_price
+    if is_long:
+        safe_sl = entry_price - safe_dist
+        if stop_price < safe_sl:
+            return safe_sl, True
+    else:
+        safe_sl = entry_price + safe_dist
+        if stop_price > safe_sl:
+            return safe_sl, True
+    return stop_price, False
+
+
 # ─── AI tự động vào lệnh mỗi 5 giờ ───
 AI_AUTO_TRADER_INTERVAL = 5 * 3600
 
@@ -3128,6 +3151,18 @@ async def ai_auto_trader_loop(app):
                                     ):
                                         try:
                                             trig = round_price_step(float(trigger), tick_size, price_p)
+                                            # SL không được nằm sau vùng thanh lý (chỉ xảy ra với SL, không phải TP)
+                                            is_long_pos = (close_side == 'SELL')
+                                            if label == 'SL':
+                                                orig_trig = trig
+                                                trig, clamped = _clamp_stop_for_liquidation(is_long_pos, price, trig, max_lev)
+                                                if clamped:
+                                                    trig = round_price_step(trig, tick_size, price_p)
+                                                    logger.warning(
+                                                        f"[AI-AUTO] SL gốc {format_price(orig_trig)} vượt vùng thanh lý "
+                                                        f"({max_lev}x) — clamp về {format_price(trig)}")
+                                            else:
+                                                clamped = False
                                             algo_params = {
                                                 'algoType': 'CONDITIONAL',
                                                 'symbol': symbol, 'side': close_side, 'type': otype,
@@ -3142,10 +3177,12 @@ async def ai_auto_trader_loop(app):
                                             adata, aerr = await binance_signed_request(
                                                 session, 'POST', '/fapi/v1/algoOrder', algo_params)
                                             if not aerr:
-                                                tpsl_results.append(
-                                                    f"✅ {label}: {otype} kích hoạt {format_price(trig)} "
-                                                    f"(algoId `{adata.get('algoId')}`)"
-                                                )
+                                                line = (f"✅ {label}: {otype} kích hoạt {format_price(trig)} "
+                                                        f"(algoId `{adata.get('algoId')}`)")
+                                                if clamped:
+                                                    line += (f"\n⚠️ SL gốc {format_price(orig_trig)} nằm sau vùng thanh lý "
+                                                             f"({max_lev}x) — đã điều chỉnh về mức an toàn")
+                                                tpsl_results.append(line)
                                             else:
                                                 tpsl_results.append(f"❌ {label}: {aerr}")
                                         except Exception as tpsl_e:
@@ -3445,6 +3482,19 @@ async def tool_place_order(session, chat_id, args):
     if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
         # Conditional orders đã migrated sang Algo Service: /fapi/v1/order trả -4120
         stop_price = round_price_step(float(args['stop_price']), tick_size, price_p)
+        if otype == 'STOP_MARKET':
+            # SL không được nằm sau vùng thanh lý (side SELL = bảo vệ vị thế LONG, BUY = SHORT)
+            try:
+                entry_ref = await get_single_price(session, symbol)
+                lev_now = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
+                                                 os.getenv("BINANCE_API_SECRET"), symbol)
+                stop_price, clamped = _clamp_stop_for_liquidation(side == 'SELL', entry_ref, stop_price, lev_now)
+                if clamped:
+                    stop_price = round_price_step(stop_price, tick_size, price_p)
+                    logger.warning(f"[AI-TOOL] SL gốc {args['stop_price']} vượt vùng thanh lý ({lev_now}x) — "
+                                   f"clamp về {stop_price} cho {symbol}")
+            except Exception as clamp_e:
+                logger.warning(f"Lỗi clamp SL theo thanh lý: {clamp_e}")
         algo_params = {
             'algoType': 'CONDITIONAL',
             'symbol': symbol, 'side': side, 'type': otype,
