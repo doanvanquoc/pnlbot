@@ -2162,36 +2162,40 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
     long_score = 0.0
     short_score = 0.0
     
-    # ── RSI (max 1.5đ) ──
+    # ── RSI (max 1.5đ) — MOMENTUM, thay vì mean-reversion ──
+    # Dữ liệu 246 tín hiệu 15 coin: RSI quá bán/quá mua (mean-reversion) thua
+    # (30-40: 25%, >=70: 33%), RSI đà vừa phải thắng (50-70: 67-73%).
+    # => ĐẢO DẤU: cực đoan = phạt, đà vừa phải = thưởng nhẹ.
     if rsi_val <= 25:
-        long_score += 1.5
+        long_score -= 1.5          # cực oversold = đang rơi, bắt dao
     elif rsi_val <= 35:
-        long_score += 1.0
+        long_score -= 0.8
     elif rsi_val <= 45:
         long_score += 0.3
     elif rsi_val >= 75:
-        short_score += 1.5
+        short_score -= 1.5         # cực overbought = cản tàu
     elif rsi_val >= 65:
-        short_score += 1.0
+        short_score -= 0.8
     elif rsi_val >= 55:
         short_score += 0.3
         
-    # ── Stochastic RSI (max 1.0đ) ──
+    # ── Stochastic RSI (max 1.0đ) — MOMENTUM ──
+    # Dữ liệu: 0-20 (42%), 60-80 (60%), >=80 (56%), 20-40 (64%). Cực oversold yếu.
     if stoch_k <= 20 and stoch_d <= 20:
-        long_score += 1.0
+        long_score -= 1.0
     elif stoch_k <= 30:
-        long_score += 0.4
+        long_score -= 0.4
     elif stoch_k >= 80 and stoch_d >= 80:
-        short_score += 1.0
+        short_score -= 1.0
     elif stoch_k >= 70:
-        short_score += 0.4
-    # Crossover bonus
+        short_score -= 0.4
+    # Crossover bonus (momentum vùng trung bình)
     prev_stoch_k = prev['stoch_k']
     prev_stoch_d = prev['stoch_d']
-    if stoch_k > stoch_d and prev_stoch_k <= prev_stoch_d and stoch_k <= 40:
-        long_score += 0.5  # Bullish cross ở vùng oversold
-    elif stoch_k < stoch_d and prev_stoch_k >= prev_stoch_d and stoch_k >= 60:
-        short_score += 0.5  # Bearish cross ở vùng overbought
+    if stoch_k > stoch_d and prev_stoch_k <= prev_stoch_d and 20 <= stoch_k <= 60:
+        long_score += 0.5  # Bullish cross vùng trung bình (không phải oversold)
+    elif stoch_k < stoch_d and prev_stoch_k >= prev_stoch_d and 40 <= stoch_k <= 80:
+        short_score += 0.5  # Bearish cross vùng trung bình
         
     # ── EMA Trend (max 2.0đ) ──
     if close_price > ema9_val > ema21_val > ema50_val:
@@ -2207,23 +2211,24 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
     elif close_price < ema21_val:
         short_score += 0.5
         
-    # ── Bollinger Bands (max 1.5đ) ──
+    # ── Bollinger Bands (max 1.5đ) — MOMENTUM ──
     bb_width = upper_b - lower_b
     bb_pct = (close_price - lower_b) / (bb_width + 1e-10)  # 0 = lower band, 1 = upper band
+    # Dữ liệu: chạm biên dưới (<0.2) thua 36.5%, giữa-đỉnh (0.6-0.8) thắng 70.6%.
     if bb_pct <= 0.0:
-        long_score += 1.5  # Chạm/phá biên dưới
+        long_score -= 1.5  # Chạm/phá biên dưới = bắt dao rơi
     elif bb_pct <= 0.15:
-        long_score += 0.8
+        long_score -= 0.8
     elif bb_pct >= 1.0:
-        short_score += 1.5  # Chạm/phá biên trên
+        short_score -= 1.5  # Chạm/phá biên trên = cản tàu
     elif bb_pct >= 0.85:
-        short_score += 0.8
-        
-    # ── Confluence Bonus (Sự đồng thuận chỉ báo) ──
+        short_score -= 0.8
+
+    # ── Confluence Penalty (không thưởng bắt đảo chiều cực đoan) ──
     if bb_pct <= 0.05 and rsi_val <= 30:
-        long_score += 0.8  # Quá bán + Chạm biên dưới -> Tăng uy tín đảo chiều tăng
+        long_score -= 0.8  # Quá bán + Chạm biên dưới = bắt dao rơi
     if bb_pct >= 0.95 and rsi_val >= 70:
-        short_score += 0.8  # Quá mua + Chạm biên trên -> Tăng uy tín đảo chiều giảm
+        short_score -= 0.8  # Quá mua + Chạm biên trên = cản tàu
         
     # ── MACD (max 1.5đ) ──
     if hist_val > 0 and prev_hist <= 0:
@@ -2293,13 +2298,11 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         short_score *= 0.85
         
     # ═══ Divergence (tín hiệu đảo chiều) ═══
-    if rsi_div == 'bullish':
-        long_score += 1.0
-    elif rsi_div == 'bearish':
+    # Dữ liệu: bearish divergence thắng 61-65%, bullish chỉ 46-50%.
+    # => chỉ giữ bonus cho bearish, bullish không cộng (yếu, không có edge).
+    if rsi_div == 'bearish':
         short_score += 1.0
-    if macd_div == 'bullish':
-        long_score += 0.7
-    elif macd_div == 'bearish':
+    if macd_div == 'bearish':
         short_score += 0.7
         
     # ═══ Candlestick pattern ═══
@@ -3341,8 +3344,8 @@ def _safe_leverage_for_sl(entry_price, sl_price, max_lev):
 
 # ─── AI tự động vào lệnh mỗi 5 giờ ───
 AI_AUTO_TRADER_INTERVAL = 5 * 3600
-AI_AUTO_MIN_SCORE = 6.0  # Chỉ tự vào lệnh khi tín hiệu 5 sao + điểm ≥ ngưỡng này (≥ 6.0 = mức 'Rất mạnh' trở lên)
-AI_AUTO_AI_MIN_SCORE = 6.0  # AI tự chấm chiều tín hiệu phải ≥ ngưỡng này (điểm AI độc lập, không thể thiếu)
+AI_AUTO_MIN_SCORE = 5.0  # Chỉ tự vào lệnh khi tín hiệu 4-5 sao + điểm ≥ ngưỡng này (backtest: band 5.0-6.0 thắng 55.6%, band ≥6.0 chỉ 45.5%)
+AI_AUTO_AI_MIN_SCORE = 5.0  # AI tự chấm chiều tín hiệu phải ≥ ngưỡng này (điểm AI độc lập, không thể thiếu)
 
 # ─── Rào chắn an toàn cho tự động hoá (giúp AI tự trade nhiều mà không liều) ───
 AUTO_MAX_CONSEC_LOSSES = 3        # Thua N lệnh auto liên tiếp → nghỉ (chống revenge trading)
@@ -3907,16 +3910,17 @@ async def ai_auto_trader_loop(app):
                 if not ai:
                     return None
                 return ai.get('short_score' if s.get('signal') == 'LONG' else 'long_score')
-            # Tự vào lệnh chỉ khi: 5⭐ + rule cao + AI xác nhận cùng chiều + AI chấm cao + cách biệt chiều ngược đủ lớn.
+            # Tự vào lệnh chỉ khi: 4-5 sao + rule cao + AI xác nhận cùng chiều + AI chấm cao + cách biệt chiều ngược đủ lớn.
+            # Backtest: band "Mạnh" (5.0-6.0) thắng 55.6%, band "Rất mạnh" (≥6.0) chỉ 45.5% -> KHÔNG ưu tiên điểm cao mù quáng.
             # AI lỗi/không phản hồi (ai=None) → KHÔNG tự vào lệnh (tiền thật, không liều).
             candidates = [s for s in quasi
-                          if s.get('confidence') == 'Rất mạnh'
+                          if s.get('confidence') in ('Mạnh', 'Rất mạnh')
                           and _auto_score(s) >= AI_AUTO_MIN_SCORE
                           and _ai_score(s) is not None and _ai_score(s) >= AI_AUTO_AI_MIN_SCORE
                           and (_ai_opp(s) is None or (_ai_score(s) - _ai_opp(s)) >= 1.5)]
             if quasi and not candidates:
                 logger.info(f"[AI-AUTO] Có {len(quasi)} tín hiệu 4-5 sao nhưng không đạt ngưỡng "
-                            f"(phải 5⭐ + điểm ≥ {AI_AUTO_MIN_SCORE} + AI tự chấm ≥ {AI_AUTO_AI_MIN_SCORE} "
+                            f"(phải 4-5⭐ + điểm ≥ {AI_AUTO_MIN_SCORE} + AI tự chấm ≥ {AI_AUTO_AI_MIN_SCORE} "
                             f"+ cách biệt ≥ 1.5) — bỏ qua tất cả.")
                 quasi_lines = []
                 for s in sorted(quasi, key=_auto_score, reverse=True)[:5]:
