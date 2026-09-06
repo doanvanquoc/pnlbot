@@ -5345,7 +5345,7 @@ async def handle_order_callback(session, cb):
         logger.error(f"Lỗi xử lý callback nút xác nhận: {e}")
 
 
-async def handle_ai_command(session, chat_id, question=None, reply_to=None, image_data_url=None, photo_sizes=None):
+async def handle_ai_command(session, chat_id, question=None, reply_to=None, image_data_url=None, photo_sizes=None, replied_text=None):
     """Lệnh /ai: agent AI tự do - đọc mọi dữ liệu tài khoản, phân tích coin, đọc ảnh và soạn lệnh (có bước xác nhận)."""
     if not question and not image_data_url and not photo_sizes:
         await send_telegram_message(session, chat_id, "❓ Cú pháp: `/ai <câu hỏi hoặc tên coin>` (ví dụ: `/ai btc`, `/ai xem vị thế của tôi`, `/ai đặt long btc 0.01`)", reply_to=reply_to)
@@ -5513,7 +5513,15 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "kết hợp với dữ liệu thị trường và tài khoản nếu liên quan. "
             "Trả lời tiếng Việt, ngắn gọn, thực dụng, không dùng ký tự markdown (*, _, `)."
         )
+        # Nếu người dùng đang REPLY một tin nhắn của bot, đưa cả nội dung tin đó cho AI đọc
+        # (vd reply tin "🔔 AI QUÉT 30 PHÚT" rồi hỏi "2 coin này" -> AI thấy đúng 2 coin đó)
         user_content = f"Thông tin thị trường hiện tại:\n{context_text}\n\nCâu hỏi: {question}"
+        if replied_text:
+            user_content += (
+                f"\n\n(Đây là tin nhắn bạn đang REPLY tới — nội dung tin gốc:\n{replied_text[:2000]}\n"
+                f"Đây là ngữ cảnh trực tiếp mà người dùng nói tới. Khi họ dùng 'coin này/2 coin này/tin trên', "
+                f"hãy hiểu chúng chỉ các coin/tín hiệu trong tin này.)"
+            )
         if pending:
             pending_desc = "\n".join(f"- {it['desc']}" for it in pending['items'])
             user_content += (
@@ -6873,6 +6881,13 @@ async def telegram_webhook_handler(request):
         
     text = message.get('text', '').strip()
 
+    # Nội dung tin nhắn mà người dùng đang REPLY (nếu có) — để AI đọc được cả tin nhắn gốc
+    # khi người dùng trả lời nối tiếp (vd reply tin "AI QUÉT 30 PHÚT" rồi hỏi "2 coin này")
+    replied_text = None
+    rtm = message.get('reply_to_message')
+    if isinstance(rtm, dict):
+        replied_text = (rtm.get('text') or rtm.get('caption') or '').strip()
+
     if not text:
         # Tin nhắn ảnh (kèm/không kèm caption): giữ lại tin nhắn, đưa cho AI agent phân tích
         photos = message.get('photo')
@@ -6917,7 +6932,7 @@ async def telegram_webhook_handler(request):
     # Xử lý lệnh ở nền để trả 200 ngay, tránh Telegram timeout rồi gửi lại webhook gây trùng lặp
     async def run_command():
         try:
-            await process_telegram_message(request, chat_id, text, ai_reply_to)
+            await process_telegram_message(request, chat_id, text, ai_reply_to, replied_text)
         except Exception as e:
             logger.error(f"Lỗi xử lý tin nhắn từ {chat_id}: {e}")
 
@@ -6944,7 +6959,7 @@ def is_coin_price_query(text):
     return True
 
 
-async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
+async def process_telegram_message(request, chat_id, text, ai_reply_to=None, replied_text=None):
     # Nếu tin nhắn không bắt đầu bằng '/': tên coin thuần -> tra giá nhanh, còn lại -> AI agent
     if not text.startswith('/'):
         if is_coin_price_query(text):
@@ -6969,7 +6984,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None):
                 if response_lines:
                     await send_telegram_message(request.app['session'], chat_id, "\n".join(response_lines))
         else:
-            await handle_ai_command(request.app['session'], chat_id, text, reply_to=ai_reply_to)
+            await handle_ai_command(request.app['session'], chat_id, text, reply_to=ai_reply_to, replied_text=replied_text)
         return web.Response(status=200)
         
     command = text.split()[0].lower()
