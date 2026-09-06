@@ -1,3 +1,5 @@
 .env
 /__pycache__
 /active_chats.json
+/auto_managed.json
+/backtest_cache
