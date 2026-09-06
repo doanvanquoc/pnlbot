@@ -3991,6 +3991,8 @@ AI_ALERT_COOLDOWN_SEC = 4 * 3600  # Không báo lặp lại cùng symbol+hướn
 AI_ALERT_MAX_ITEMS = 5            # Tối đa số tín hiệu báo mỗi lượt
 AI_ALERT_STATE_FILE = "ai_alert_state.json"
 ai_alert_last_notified = {}       # (symbol, signal) -> timestamp lần báo gần nhất
+last_alert_signals = []           # tín hiệu vừa báo trong tin "AI QUÉT MỖI 30 PHÚT" (để AI hiểu "coin này/2 coin này")
+last_alert_ts = 0.0               # timestamp của lần báo gần nhất
 
 def _load_ai_alert_state():
     """Nạp cooldown đã báo từ file để không báo trùng sau khi restart bot."""
@@ -4051,6 +4053,7 @@ async def ai_signal_alert_loop(app):
                 logger.info("[AI-ALERT] Không có tín hiệu ngon ở lượt này.")
             else:
                 lines = []
+                announced = []
                 for s in candidates[:AI_ALERT_MAX_ITEMS]:
                     ai = s.get('ai') or {}
                     ai_txt = ""
@@ -4065,11 +4068,19 @@ async def ai_signal_alert_loop(app):
                         f"  Entry `{format_price(s['close'])}` → TP `{format_price(s['tp'])}` / "
                         f"SL `{format_price(s['sl'])}`"
                     )
+                    announced.append({
+                        'symbol': s['symbol'], 'signal': s['signal'],
+                        'confidence': s['confidence'], 'score': s['_score'],
+                        'entry': s['close'], 'tp': s['tp'], 'sl': s['sl'],
+                    })
                     ai_alert_last_notified[(s['symbol'], s['signal'])] = now
                     # Lưu vào lịch sử (persist qua signal_history.json) để AI rút kinh nghiệm
                     # dù có restart bot — origin='alert' để không tính vào chuỗi thua của auto trade.
                     record_signal(s, s.get('ai'), origin='alert')
                 _save_ai_alert_state()  # persist cooldown để không báo trùng sau restart
+                global last_alert_signals, last_alert_ts
+                last_alert_signals = announced
+                last_alert_ts = now
                 await _notify_all_chats(
                     session,
                     "🔔 *AI QUÉT MỖI 30 PHÚT — TÍN HIỆU NGON:*\n"
@@ -5433,6 +5444,20 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         lessons_txt = ai_lessons_state.get('text')
         if lessons_txt:
             extra_context.append(f"Bài học AI rút từ các tín hiệu gần đây:\n{lessons_txt}")
+        # ─── Tín hiệu vừa báo trong tin "AI QUÉT MỖI 30 PHÚT" gần nhất ───
+        # Để AI hiểu câu nối tiếp như "2 coin này", "vào coin nào", "coin đầu tiên"...
+        global last_alert_signals, last_alert_ts
+        if last_alert_signals and (time.time() - last_alert_ts) < 60 * 60:
+            alert_lines = []
+            for i, al in enumerate(last_alert_signals, 1):
+                alert_lines.append(
+                    f"  {i}. {al['symbol']} {al['signal']} ({al['confidence']}, điểm {al['score']:.1f}) — "
+                    f"entry {format_price(al['entry'])}, TP {format_price(al['tp'])}, SL {format_price(al['sl'])}"
+                )
+            extra_context.append(
+                "Các tín hiệu vừa báo trong tin '🔔 AI QUÉT MỖI 30 PHÚT' gần nhất (đánh số để bạn hiểu "
+                "khi người dùng nói '2 coin này', 'coin thứ nhất', 'vào coin nào'):\n" + "\n".join(alert_lines)
+            )
         if extra_context:
             context_text += "\n\n" + "\n".join(extra_context)
 
@@ -5477,6 +5502,9 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "Nếu cần nhiều công cụ, hãy KỂ TỪNG BƯỚC một (mỗi lượt một câu tiến trình khác nhau) thay vì gộp chung. "
             "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
             "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
+            "Khi người dùng nhắc 'coin này/2 coin này/mấy coin này/coin đầu tiên' mà trong ngữ cảnh có mục "
+            "'Tín hiệu vừa báo trong tin AI QUÉT MỖI 30 PHÚT gần nhất' (có đánh số), hãy hiểu chúng là các coin vừa liệt kê ở đó — "
+            "KHÔNG hỏi lại người dùng 'coin nào' mà hãy phân tích/soạn lệnh ngay cho đúng coin được ám chỉ. "
             "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
             "QUAN TRỌNG - TRẢ LỜI NHANH: gộp các công cụ độc lập vào CÙNG MỘT lượt gọi; "
             "chỉ dùng nhiều nhất 2-3 lượt gọi công cụ cho mỗi câu hỏi — dữ liệu ban đầu (giá, số dư, vị thế, lệnh chờ) "
