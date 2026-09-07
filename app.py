@@ -343,6 +343,18 @@ def _extract_json(text):
     except Exception:
         return None
 
+def _ai_headers(api_key, session_id=None):
+    """Headers cho API OpenCode Go. Go yêu cầu header x-opencode-session với một session ID
+    ổn định cho từng hội thoại để tối ưu routing & prompt caching; thiếu nó sẽ trả HTTP 400 MissingSessionID."""
+    if not session_id:
+        session_id = os.getenv("OPENCODE_SESSION_ID") or "pnlbot-default"
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "x-opencode-session": session_id,
+        "User-Agent": "pnlbot/1.0",
+    }
+
 async def get_ai_analysis(session, digest, lessons=None):
     """Gọi LLM phân tích digest chỉ báo. Trả về {direction, confidence, reason, analysis} hoặc None."""
     api_key = os.getenv("DASH_TOKEN")
@@ -350,7 +362,7 @@ async def get_ai_analysis(session, digest, lessons=None):
         return None
     model = os.getenv("DASH_MODEL", "glm-5.3-flash")
     url = "https://opencode.ai/zen/go/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = _ai_headers(api_key)
     system_prompt = (
         "Bạn là một phân tích viên giao dịch crypto futures chuyên nghiệp, kỷ luật và thận trọng, sống bằng kết quả giao dịch thực tế. "
         "Dữ liệu được cung cấp là số liệu chỉ báo đa khung (nến đã đóng) KHÔNG kèm hướng hay điểm số của hệ thống. "
@@ -619,7 +631,7 @@ async def get_ai_lessons(session, force=False):
             return st['text']
         model = os.getenv("DASH_MODEL", "glm-5.3-flash")
         url = "https://opencode.ai/zen/go/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {os.getenv('DASH_TOKEN')}", "Content-Type": "application/json"}
+        headers = _ai_headers(os.getenv('DASH_TOKEN'))
         payload = {
             "model": model,
             "messages": [
@@ -703,7 +715,7 @@ async def get_ai_review(session, digest):
         return None
     model = os.getenv("DASH_MODEL", "glm-5.3-flash")
     url = "https://opencode.ai/zen/go/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = _ai_headers(api_key)
     system_prompt = (
         "Bạn là quản trị rủi ro giao dịch crypto futures. Dựa trên danh sách vị thế đang mở của khách hàng "
         "(entry, giá mark, PnL, đòn bẩy, khoảng cách tới giá thanh lý, funding), hãy đánh giá tổng quan rủi ro danh mục "
@@ -3238,7 +3250,7 @@ async def get_go_usage(session):
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
     url = "https://opencode.ai/zen/go/v1/usage"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = _ai_headers(api_key)
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with session.get(url, headers=headers, timeout=timeout) as resp:
@@ -5124,14 +5136,14 @@ TOOL_EXECUTORS = {
 }
 
 
-async def get_ai_agent_response(session, messages, tools, max_tokens=3000, timeout_s=150):
+async def get_ai_agent_response(session, messages, tools, max_tokens=3000, timeout_s=150, session_id=None):
     """Một lượt gọi LLM hỗ trợ tool calling. Trả về (message_dict, None) khi OK hoặc (None, error_detail) khi lỗi."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
     model = os.getenv("DASH_MODEL", "glm-5.3-flash")
     url = "https://opencode.ai/zen/go/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = _ai_headers(api_key, session_id=session_id)
     payload = {
         "model": model,
         "messages": messages,
@@ -5590,17 +5602,17 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             )
 
         for _ in range(8):
-            msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS)
+            msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, session_id=f"chat-{chat_id}")
             if err and 'timeout' in err.lower() and not retried_timeout:
                 # Timeout thường gặp khi context nặng (ảnh, history dài): thử lại 1 lần
                 retried_timeout = True
                 logger.warning("Agent timeout — retry 1 lần với timeout 240s.")
-                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, timeout_s=240)
+                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, timeout_s=240, session_id=f"chat-{chat_id}")
             if err and 'finish_reason=length' in err and not retried_long:
                 # Thinking model tiêu hết budget: thử lại 1 lần với max_tokens lớn hơn
                 retried_long = True
                 logger.warning("Agent bị cắt ngắn (finish_reason=length) — retry với max_tokens=8000.")
-                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, max_tokens=8000)
+                msg, err = await get_ai_agent_response(session, messages, ASK_TOOLS, max_tokens=8000, session_id=f"chat-{chat_id}")
             if err:
                 error_detail = err
                 logger.warning(f"Agent dừng với lỗi: {err}")
