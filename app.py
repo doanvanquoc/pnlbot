@@ -221,11 +221,14 @@ def record_scan(kind, coins):
     save_scan_history()
 
 def get_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
-    """Thống kê win/loss theo band độ tin cậy (4⭐/5⭐) trong `days` ngày gần nhất."""
+    """Thống kê win/loss theo band độ tin cậy (4⭐/5⭐) trong `days` ngày gần nhất.
+    Chỉ tính tín hiệu 4-5 sao (Mạnh/Rất mạnh) — bỏ qua tín hiệu yếu (Trung bình/Yếu)
+    phát sinh từ /a <coin> hoặc /ai chat để không làm sai lệch win-rate hiển thị."""
     cutoff = time.time() - days * 86400
     stats = {}
     for s in signal_history:
-        if s.get('status') not in ('win', 'loss') or s.get('ts', 0) < cutoff:
+        if (s.get('status') not in ('win', 'loss') or s.get('ts', 0) < cutoff
+                or s.get('confidence') not in ('Mạnh', 'Rất mạnh')):
             continue
         band = '5⭐' if s.get('confidence') == 'Rất mạnh' else '4⭐'
         st = stats.setdefault(band, {'win': 0, 'loss': 0})
@@ -267,14 +270,16 @@ def band_winrate_ok(confidence, min_samples=10, min_wr=0.5):
 
 def side_winrate_ok(side, min_samples=None, min_wr=0.5):
     """Adaptive gate theo CHIỀU (LONG/SHORT): chặn side có win-rate thực tế < min_wr với đủ mẫu.
-    Bổ sung cho band_winrate_ok — bắt đúng bệnh SHORT thua dù band vẫn tốt (backtest: SHORT 37.5%)."""
+    Bổ sung cho band_winrate_ok — bắt đúng bệnh SHORT thua dù band vẫn tốt (backtest: SHORT 37.5%).
+    Chỉ tính tín hiệu 4-5 sao (Mạnh/Rất mạnh) — khớp đúng population mà auto-trader dùng,
+    không bị nhiễu bởi tín hiệu yếu phát sinh từ /a <coin> hoặc /ai chat."""
     if min_samples is None:
         min_samples = AI_AUTO_SIDE_MIN_SAMPLES
     cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
     wins = losses = 0
     for s in signal_history:
         if (s.get('side') != side or s.get('status') not in ('win', 'loss')
-                or s.get('ts', 0) < cutoff):
+                or s.get('ts', 0) < cutoff or s.get('confidence') not in ('Mạnh', 'Rất mạnh')):
             continue
         if s['status'] == 'win':
             wins += 1
@@ -745,6 +750,63 @@ async def get_ai_review(session, digest):
     except Exception as e:
         logger.warning(f"Lỗi gọi AI review: {e}")
         return None
+
+
+_MD_HEADER_RE = re.compile(r'^\s{0,3}#{1,6}\s+(.*)$')
+_MD_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+_MD_TABLE_SEP_RE = re.compile(r'^\s*\|?[\s:\-]+\|[\s:\-|]*\|?\s*$')
+_MD_HRULE_RE = re.compile(r'^\s*([-_*])\1{2,}\s*$')
+
+
+def sanitize_ai_markdown(text):
+    """Chuẩn hoá Markdown kiểu GFM mà LLM hay trả về (dù đã dặn không dùng) sang dạng
+    Telegram legacy Markdown (parse_mode='Markdown') hiểu được — tránh hiển thị ký tự
+    thô như '###', '|---|---|', '**bold**' ra người dùng.
+    - Heading '#'..'######' -> bold một dòng.
+    - Bảng '| a | b |' + dòng phân cách -> mỗi hàng thành 1 dòng 'header: value · ...'.
+    - Đường kẻ ngang '---'/'___'/'***' -> bỏ.
+    - Bold GFM '**x**'/'__x__' -> bold Telegram '*x*'."""
+    if not text:
+        return text
+    lines = text.split('\n')
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        m = _MD_HEADER_RE.match(line)
+        if m:
+            content = m.group(1).strip()
+            out.append(f"*{content}*" if content else "")
+            i += 1
+            continue
+        if _MD_HRULE_RE.match(line):
+            i += 1
+            continue
+        m_row = _MD_TABLE_ROW_RE.match(line)
+        if m_row and i + 1 < n and _MD_TABLE_SEP_RE.match(lines[i + 1]):
+            header_cells = [c.strip() for c in m_row.group(1).split('|')]
+            i += 2  # bỏ dòng phân cách '|---|---|'
+            while i < n:
+                m_data = _MD_TABLE_ROW_RE.match(lines[i])
+                if not m_data:
+                    break
+                data_cells = [c.strip() for c in m_data.group(1).split('|')]
+                parts = []
+                for h, c in zip(header_cells, data_cells):
+                    if not c:
+                        continue
+                    parts.append(f"{h}: {c}" if h else c)
+                if parts:
+                    out.append("• " + " · ".join(parts))
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    result = "\n".join(out)
+    result = re.sub(r'\*\*(.+?)\*\*', r'*\1*', result)
+    result = re.sub(r'__(.+?)__', r'*\1*', result)
+    return result
 
 
 # Hàm tạo chữ ký HMAC-SHA256 cho Binance API
@@ -3077,7 +3139,7 @@ async def handle_review_command(session, chat_id):
         if review:
             await send_telegram_message(
                 session, chat_id,
-                f"🤖 *AI REVIEW VỊ THẾ ĐANG MỞ*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{review}"
+                f"🤖 *AI REVIEW VỊ THẾ ĐANG MỞ*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n{sanitize_ai_markdown(review)}"
             )
         else:
             await send_telegram_message(session, chat_id, "🤖 AI không phản hồi hoặc lỗi. Vui lòng thử lại sau.")
@@ -3101,7 +3163,7 @@ async def handle_recalib_command(session, chat_id):
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 Bộ nhớ: {len(resolved)} tín hiệu đã kết thúc ({wins} win)."
             + (f"\n{stats_line}" if stats_line else "")
-            + ("\n\n📚 *Bài học AI vừa rút ra (tự áp dụng cho các lần chấm sau):*\n" + lessons if lessons else "\n\n⚠️ Chưa đủ dữ liệu (cần ≥ 5 tín hiệu kết thúc) hoặc AI lỗi — chưa thể đánh giá.")
+            + ("\n\n📚 *Bài học AI vừa rút ra (tự áp dụng cho các lần chấm sau):*\n" + sanitize_ai_markdown(lessons) if lessons else "\n\n⚠️ Chưa đủ dữ liệu (cần ≥ 5 tín hiệu kết thúc) hoặc AI lỗi — chưa thể đánh giá.")
         )
         if loading:
             await delete_telegram_message(session, chat_id, loading)
@@ -5643,7 +5705,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             history.append({"role": "user", "content": question[:500]})
             history.append({"role": "assistant", "content": final_text[:600]})
             ai_chat_history[chat_id] = history[-AI_HISTORY_MAX_MSGS:]
-            await send_telegram_message(session, chat_id, f"🤖 {final_text[:3500]}", reply_to=reply_to)
+            await send_telegram_message(session, chat_id, f"🤖 {sanitize_ai_markdown(final_text[:3500])}", reply_to=reply_to)
         elif error_detail:
             await send_telegram_message(session, chat_id, f"⚠️ AI gặp sự cố: {error_detail[:300]}\nThử lại hoặc hỏi theo cách khác nhé.", reply_to=reply_to)
         else:
