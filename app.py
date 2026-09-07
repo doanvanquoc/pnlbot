@@ -4870,6 +4870,62 @@ def build_pending_keyboard(items):
     return {"inline_keyboard": rows}
 
 
+AI_VOLUME_TIERS = (200, 400, 800)   # Notional USDT cuối cùng (đã tính đòn bẩy) cho lệnh MỞ do AI /ai đặt
+AI_VOLUME_TOL_PCT = 0.02            # Sai số cho phép khi làm tròn quantity so với mức volume
+AI_TP_SL_MIN_DIST = 0.01            # TP/SL không sát entry quá ~1%
+AI_TP_SL_MAX_DIST = 0.20            # TP/SL không xa entry quá ~20%
+
+
+async def _ai_validate_open_notional(session, symbol, otype, quantity, limit_price=None):
+    """Lệnh MỞ vị thế mới do AI /ai soạn phải có notional = 1 trong 3 mức 200/400/800 USDT.
+    Trả về (ok: bool, msg: str, tier: int|None)."""
+    try:
+        if otype == 'LIMIT' and limit_price:
+            ref_price = float(limit_price)
+        else:
+            ref_price = await get_single_price(session, symbol)
+    except Exception as e:
+        return False, f"LỖI lấy giá {symbol}: {e}", None
+    if not ref_price or ref_price <= 0:
+        return False, f"LỖI: không lấy được giá {symbol} để kiểm tra volume.", None
+    notional = quantity * ref_price
+    tier = None
+    for t in AI_VOLUME_TIERS:
+        if abs(notional - t) / t <= AI_VOLUME_TOL_PCT:
+            tier = t
+            break
+    if tier is None:
+        return False, (
+            f"❌ TỪ CHỐI LỆNH: volume {notional:,.1f} USDT ({quantity:g} {symbol} @ {ref_price:,.8g}) "
+            f"không đúng quy tắc. Lệnh MỞ mới CHỈ được dùng 1 trong 3 mức volume: 200, 400, 800 USDT "
+            f"(đã tính đòn bẩy). Tính lại quantity = mức volume / giá rồi soạn lại lệnh."
+        ), None
+    return True, f"volume {tier} USDT", tier
+
+
+async def _ai_validate_tpsl_distance(session, symbol, trigger_price):
+    """Khoảng cách TP/SL tính từ giá hiện tại phải trong khoảng ~1% đến ~20%.
+    Trả về (ok: bool, msg: str)."""
+    try:
+        cur = await get_single_price(session, symbol)
+    except Exception as e:
+        return False, f"LỖI lấy giá {symbol}: {e}"
+    if not cur or cur <= 0 or trigger_price <= 0:
+        return False, f"LỖI: không lấy được giá {symbol} để kiểm tra TP/SL."
+    dist = abs(trigger_price - cur) / cur
+    if dist < AI_TP_SL_MIN_DIST:
+        return False, (
+            f"❌ TỪ CHỐI TP/SL: khoảng cách {dist * 100:.2f}% quá gần entry (< ~1%). "
+            f"Đặt TP/SL cách giá ít nhất ~1%."
+        )
+    if dist > AI_TP_SL_MAX_DIST:
+        return False, (
+            f"❌ TỪ CHỐI TP/SL: khoảng cách {dist * 100:.2f}% quá xa (> ~20%). "
+            f"Đặt TP/SL trong khoảng ~1% đến ~20%."
+        )
+    return True, f"{dist * 100:.2f}%"
+
+
 async def tool_place_order(session, chat_id, args):
     symbol = _norm_symbol(args)
     side = str(args.get('side') or '').upper()
@@ -4921,6 +4977,9 @@ async def tool_place_order(session, chat_id, args):
                                    f"clamp về {stop_price} cho {symbol}")
             except Exception as clamp_e:
                 logger.warning(f"Lỗi clamp SL theo thanh lý/số dư: {clamp_e}")
+        ok_dist, dist_msg = await _ai_validate_tpsl_distance(session, symbol, stop_price)
+        if not ok_dist:
+            return dist_msg
         algo_params = {
             'algoType': 'CONDITIONAL',
             'symbol': symbol, 'side': side, 'type': otype,
@@ -4948,6 +5007,25 @@ async def tool_place_order(session, chat_id, args):
     elif args.get('reduce_only'):
         params['reduceOnly'] = 'true'
         desc += " (RO)"
+    if not args.get('reduce_only'):
+        ok_vol, vol_msg, tier = await _ai_validate_open_notional(
+            session, symbol, otype, quantity,
+            limit_price=(price if otype == 'LIMIT' else None)
+        )
+        if not ok_vol:
+            return vol_msg
+        try:
+            avail = await get_available_balance(session)
+            if avail and avail > 0 and tier:
+                max_lev = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
+                                                 os.getenv("BINANCE_API_SECRET"), symbol)
+                est_lev = max(1, min(int(max_lev or 1), 50))
+                margin = tier / est_lev
+                if margin > 0.25 * avail:
+                    return (f"❌ TỪ CHỐI LỆNH: ký quỹ cần ~{margin:,.2f} USDT (volume {tier}u / đòn bẩy {est_lev}x) "
+                            f"vượt ~25% số dư khả dụng ({avail:,.2f} USDT). Hạ mức volume hoặc nạp thêm vốn.")
+        except Exception as e:
+            logger.warning(f"Lỗi kiểm tra margin cho {symbol}: {e}")
     return await _stage_order(session, chat_id, 'place_order', params, desc)
 
 
@@ -5567,13 +5645,17 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
             "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy "
             "(hệ thống tự set đòn bẩy max cho symbol khi thực thi) — nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
-            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional chỉ được chọn 1 trong 3 mức: 200, 400 hoặc 1000 USDT — "
-            "và phải TÍNH TOÁN RỦI RO THẬT, tuyệt đối không thấy số dư đủ là chọn mức to nhất: "
-            "lỗ khi SL khớp = notional × (khoảng cách SL so với entry) và không được vượt ~20% số dư khả dụng; "
-            "margin cần = notional / đòn bẩy và không được vượt ~25% số dư khả dụng (đòn bẩy cao thì thanh lý đến rất sớm — "
-            "khoảng cách thanh lý ≈ 100%/đòn bẩy, ví dụ 20x chỉ chịu được ~5%). "
-            "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo người dùng rõ lý do. "
-            "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
+            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional (giá trị vị thế thực, đã tính đòn bẩy) CHỈ được chọn 1 trong 3 mức: 200, 400 hoặc 800 USDT — "
+             "đây là quy tắc BẮT BUỘC, hệ thống sẽ TỪ CHỐI lệnh nếu volume nằm ngoài 3 mức này. "
+             "Phải TÍNH TOÁN RỦI RO THẬT, tuyệt đối không thấy số dư đủ là chọn mức to nhất: "
+             "lỗ khi SL khớp = notional × (khoảng cách SL so với entry) và không được vượt ~20% số dư khả dụng; "
+             "margin cần = notional / đòn bẩy và không được vượt ~25% số dư khả dụng (đòn bẩy cao thì thanh lý đến rất sớm — "
+             "khoảng cách thanh lý ≈ 100%/đòn bẩy, ví dụ 20x chỉ chịu được ~5%). "
+             "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo người dùng rõ lý do. "
+             "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
+             "QUY TẮC TP/SL: khoảng cách TP và SL tính từ giá entry không được quá gần (~1%) và không được quá xa — "
+             "volume 200 → TP/SL ≤ ~20%, volume 400 → ≤ ~15%, volume 800 → ≤ ~10%; hệ thống sẽ TỪ CHỐI TP/SL ngoài khoảng ~1%–20%. "
+             "Đặt đòn bẩy CAO NHẤT an toàn (hệ thống tự set) để giảm ký quỹ. "
             "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
             "QUAN TRỌNG: khi câu trả lời có đề xuất lệnh cụ thể (coin, hướng, giá entry/TP/SL, quantity), hãy SOẠN NGAY các lệnh đó bằng "
             "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
