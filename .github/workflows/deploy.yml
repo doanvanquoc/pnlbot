@@ -3,7 +3,7 @@ name: Deploy Bot to VPS
 on:
   push:
     branches:
-      - main  # Hoặc master (tùy thuộc vào nhánh chính của bạn)
+      - main
 
 jobs:
   deploy:
@@ -13,13 +13,13 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.VPS_HOST }}         # IP public của VPS: 103.249.117.228
-          username: ${{ secrets.VPS_USER }}     # Username VPS (root)
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: 24432                           # Cổng ngoài SSH (NAT: 24432 -> 8686)
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 24432
           script: |
-            cd /home/pnlbot/pnlbot
-            git -c safe.directory=/home/pnlbot/pnlbot pull origin main
-            chown -R pnlbot:pnlbot /home/pnlbot/pnlbot
+            cd /pnlbot
+            git -c safe.directory=/pnlbot pull origin main
+            chown -R pnlbot:pnlbot /pnlbot
             systemctl restart pnlbot
             systemctl status pnlbot --no-pager

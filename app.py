@@ -343,15 +343,13 @@ def _extract_json(text):
     except Exception:
         return None
 
+MINTROUTER_BASE_URL = "https://api.mintrouter.ai/v1"
+
 def _ai_headers(api_key, session_id=None):
-    """Headers cho API OpenCode Go. Go yêu cầu header x-opencode-session với một session ID
-    ổn định cho từng hội thoại để tối ưu routing & prompt caching; thiếu nó sẽ trả HTTP 400 MissingSessionID."""
-    if not session_id:
-        session_id = os.getenv("OPENCODE_SESSION_ID") or "pnlbot-default"
+    """Headers cho API MintRouter.ai (OpenAI-compatible, xác thực qua Authorization: Bearer)."""
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "x-opencode-session": session_id,
         "User-Agent": "pnlbot/1.0",
     }
 
@@ -360,8 +358,8 @@ async def get_ai_analysis(session, digest, lessons=None):
     api_key = os.getenv("DASH_TOKEN")
     if not api_key or not digest:
         return None
-    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
-    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    url = f"{MINTROUTER_BASE_URL}/chat/completions"
     headers = _ai_headers(api_key)
     system_prompt = (
         "Bạn là một phân tích viên giao dịch crypto futures chuyên nghiệp, kỷ luật và thận trọng, sống bằng kết quả giao dịch thực tế. "
@@ -402,7 +400,7 @@ async def get_ai_analysis(session, digest, lessons=None):
             {"role": "user", "content": digest}
         ],
         "temperature": 0.2,
-        # glm-5.3-flash là thinking model: reasoning_content tiêu tốn token nên
+        # Model reasoning (Claude/GLM...) tiêu tốn token cho phần suy luận nên
         # cần budget đủ lớn để phần JSON cuối cùng không bị cắt (finish_reason=length)
         "max_tokens": 4000
     }
@@ -434,7 +432,7 @@ async def get_ai_analysis(session, digest, lessons=None):
                 else:
                     verdict['analysis'] = []
                 return verdict
-            # glm-5.3-flash là thinking model: nếu max_tokens quá nhỏ, phần suy luận
+            # Model reasoning: nếu max_tokens quá nhỏ, phần suy luận
             # (reasoning_content) ăn hết budget và content trả về rỗng → tăng budget thử lại
             if attempt == 1:
                 logger.warning(f"AI trả lời không parse được JSON (content rỗng/sai định dạng), thử lại với max_tokens lớn hơn: {str(content)[:150]}")
@@ -629,8 +627,8 @@ async def get_ai_lessons(session, force=False):
         digest = build_signal_lessons_digest()
         if not digest or not os.getenv("DASH_TOKEN"):
             return st['text']
-        model = os.getenv("DASH_MODEL", "glm-5.3-flash")
-        url = "https://opencode.ai/zen/go/v1/chat/completions"
+        model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+        url = f"{MINTROUTER_BASE_URL}/chat/completions"
         headers = _ai_headers(os.getenv('DASH_TOKEN'))
         payload = {
             "model": model,
@@ -713,8 +711,8 @@ async def get_ai_review(session, digest):
     api_key = os.getenv("DASH_TOKEN")
     if not api_key or not digest:
         return None
-    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
-    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    url = f"{MINTROUTER_BASE_URL}/chat/completions"
     headers = _ai_headers(api_key)
     system_prompt = (
         "Bạn là quản trị rủi ro giao dịch crypto futures. Dựa trên danh sách vị thế đang mở của khách hàng "
@@ -3243,13 +3241,13 @@ async def handle_photo_message(session, chat_id, photo_sizes, caption, reply_to=
     await handle_ai_command(session, chat_id, question, reply_to=reply_to, image_data_url=image_url)
 
 
-# ─── Usage API của OpenCode Go (quota 5h/tuần/tháng) ───
+# ─── Usage API của MintRouter.ai (số dư + usage 24h/7 ngày/30 ngày) ───
 async def get_go_usage(session):
-    """Gọi usage API của OpenCode Go. Trả về (usage_dict, None) hoặc (None, err)."""
+    """Gọi usage API của MintRouter.ai (key-usage). Trả về (data_dict, None) hoặc (None, err)."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
-    url = "https://opencode.ai/zen/go/v1/usage"
+    url = "https://api.mintrouter.ai/front/public/key-usage"
     headers = _ai_headers(api_key)
     try:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -3258,7 +3256,7 @@ async def get_go_usage(session):
                 body = await resp.text()
                 return None, f"HTTP {resp.status}: {body[:150]}"
             data = await resp.json()
-            return data.get('usage') or {}, None
+            return data or {}, None
     except Exception as e:
         return None, str(e)
 
@@ -3266,48 +3264,35 @@ async def get_go_usage(session):
 def _fmt_usage_window(name_vn, window):
     if not isinstance(window, dict):
         return f"{name_vn}: ❓ không có dữ liệu"
+    requests = window.get('requests', 0)
+    tokens = window.get('total_tokens', 0)
     try:
-        percent = float(window.get('percent', 0))
+        spend = float(window.get('spend_micros', 0)) / 1_000_000
     except (TypeError, ValueError):
-        percent = 0
-    filled = max(0, min(5, round(percent / 20)))
-    bar = "█" * filled + "░" * (5 - filled)
-    status = window.get('status', '')
-    emoji = "🔴" if status == 'rate-limited' or percent >= 90 else ("🟡" if percent >= 70 else "🟢")
-    reset_str = ""
-    resets_at = window.get('resetsAt')
-    if resets_at:
-        try:
-            reset_dt = datetime.fromisoformat(str(resets_at).replace('Z', '+00:00'))
-            remaining = reset_dt - datetime.now(timezone.utc)
-            total_sec = max(0, int(remaining.total_seconds()))
-            d, rem = divmod(total_sec, 86400)
-            h, rem2 = divmod(rem, 3600)
-            m, _ = divmod(rem2, 60)
-            if d > 0:
-                reset_str = f" (reset sau {d} ngày {h}h)"
-            elif h > 0:
-                reset_str = f" (reset sau {h}h{m:02d}p)"
-            else:
-                reset_str = f" (reset sau {m}p)"
-        except Exception:
-            reset_str = ""
-    warn = " ⛔ BỊ CHẶN" if status == 'rate-limited' else ""
-    return f"{emoji} {name_vn}: [{bar}] còn {100 - percent:.0f}%{reset_str}{warn}"
+        spend = 0.0
+    return f"• {name_vn}: {requests} request, {tokens:,} token, ${spend:.4f}"
 
 
 async def handle_usage_command(session, chat_id):
-    usage, err = await get_go_usage(session)
+    data, err = await get_go_usage(session)
     if err:
         await send_telegram_message(session, chat_id, f"❌ Không lấy được usage: {err}")
         return
+    balance = data.get('balance') or data.get('account_balance') or {}
+    usage = data.get('usage') or {}
+    try:
+        available = float(balance.get('available_micros', 0)) / 1_000_000
+    except (TypeError, ValueError):
+        available = None
+    balance_line = f"💰 Số dư khả dụng: ${available:.2f}\n" if available is not None else ""
     msg = (
-        "📊 *Usage OpenCode Go*\n"
+        "📊 *Usage MintRouter.ai*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        + balance_line
         + "\n".join([
-            _fmt_usage_window("5 giờ", usage.get('rolling')),
-            _fmt_usage_window("Tuần", usage.get('weekly')),
-            _fmt_usage_window("Tháng", usage.get('monthly')),
+            _fmt_usage_window("24 giờ", usage.get('rolling_24h')),
+            _fmt_usage_window("7 ngày", usage.get('rolling_7d')),
+            _fmt_usage_window("30 ngày", usage.get('rolling_30d')),
         ])
     )
     await send_telegram_message(session, chat_id, msg)
@@ -5141,8 +5126,8 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=3000, timeo
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
-    model = os.getenv("DASH_MODEL", "glm-5.3-flash")
-    url = "https://opencode.ai/zen/go/v1/chat/completions"
+    model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    url = f"{MINTROUTER_BASE_URL}/chat/completions"
     headers = _ai_headers(api_key, session_id=session_id)
     payload = {
         "model": model,
@@ -7056,7 +7041,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
-            "📊 `/usage` - Xem mức dùng quota AI (5 giờ/tuần/tháng) và thời gian reset.\n"
+            "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
             "📜 `/history [coin]` (hoặc `/lichsu`) - Xem lịch sử 10 vị thế đã đóng (Realized PnL) gần nhất.\n"
