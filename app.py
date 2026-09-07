@@ -265,6 +265,26 @@ def band_winrate_ok(confidence, min_samples=10, min_wr=0.5):
         return True
     return (wins / total) >= min_wr
 
+def side_winrate_ok(side, min_samples=None, min_wr=0.5):
+    """Adaptive gate theo CHIỀU (LONG/SHORT): chặn side có win-rate thực tế < min_wr với đủ mẫu.
+    Bổ sung cho band_winrate_ok — bắt đúng bệnh SHORT thua dù band vẫn tốt (backtest: SHORT 37.5%)."""
+    if min_samples is None:
+        min_samples = AI_AUTO_SIDE_MIN_SAMPLES
+    cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
+    wins = losses = 0
+    for s in signal_history:
+        if (s.get('side') != side or s.get('status') not in ('win', 'loss')
+                or s.get('ts', 0) < cutoff):
+            continue
+        if s['status'] == 'win':
+            wins += 1
+        else:
+            losses += 1
+    total = wins + losses
+    if total < min_samples:
+        return True
+    return (wins / total) >= min_wr
+
 async def signal_tracking_loop(app):
     """Task nền: theo dõi kết quả các tín hiệu đang mở (TP chạm trước hay SL trước)."""
     await asyncio.sleep(10)
@@ -3346,6 +3366,13 @@ def _safe_leverage_for_sl(entry_price, sl_price, max_lev):
 AI_AUTO_TRADER_INTERVAL = 5 * 3600
 AI_AUTO_MIN_SCORE = 5.0  # Chỉ tự vào lệnh khi tín hiệu 4-5 sao + điểm ≥ ngưỡng này (backtest: band 5.0-6.0 thắng 55.6%, band ≥6.0 chỉ 45.5%)
 AI_AUTO_AI_MIN_SCORE = 5.0  # AI tự chấm chiều tín hiệu phải ≥ ngưỡng này (điểm AI độc lập, không thể thiếu)
+# SHORT bị siết chặt hơn LONG theo bằng chứng backtest (6 coin × 2000 nến 1h):
+#   LONG thắng 70% (28/40 quyết định), SHORT chỉ 37.5% (12/32) → SHORT có edge âm ở RR 1:1.
+# → SHORT cần điểm hệ thống & AI tự chấm CAO HƠN hẳn LONG, cộng bộ lọc side dựa trên win-rate thực tế.
+AI_AUTO_SHORT_MIN_SCORE = 5.5      # SHORT hệ thống phải ≥ 5.5 (5.0-5.5 SHORT thắng dưới 40%)
+AI_AUTO_SHORT_AI_MIN_SCORE = 6.0   # SHORT phải có AI tự chấm ≥ 6.0 (rất tự tin) mới đủ sức thắng edge âm
+AI_AUTO_SIDE_MIN_SAMPLES = 5       # Số lệnh kết thúc tối thiểu để bộ lọc side có hiệu lực (thấp vì backtest ủng hộ)
+AI_AUTO_SIDE_MIN_WR = 0.5          # Win-rate tối thiểu của 1 side; dưới mức này → chặn side đó tự vào lệnh
 
 # ─── Rào chắn an toàn cho tự động hoá (giúp AI tự trade nhiều mà không liều) ───
 AUTO_MAX_CONSEC_LOSSES = 3        # Thua N lệnh auto liên tiếp → nghỉ (chống revenge trading)
@@ -3913,15 +3940,19 @@ async def ai_auto_trader_loop(app):
             # Tự vào lệnh chỉ khi: 4-5 sao + rule cao + AI xác nhận cùng chiều + AI chấm cao + cách biệt chiều ngược đủ lớn.
             # Backtest: band "Mạnh" (5.0-6.0) thắng 55.6%, band "Rất mạnh" (≥6.0) chỉ 45.5% -> KHÔNG ưu tiên điểm cao mù quáng.
             # AI lỗi/không phản hồi (ai=None) → KHÔNG tự vào lệnh (tiền thật, không liều).
+            # SHORT bị siết thêm: điểm hệ thống & AI tự chấm cao hơn hẳn LONG + bộ lọc side (SHORT backtest chỉ 37.5%).
             candidates = [s for s in quasi
                           if s.get('confidence') in ('Mạnh', 'Rất mạnh')
-                          and _auto_score(s) >= AI_AUTO_MIN_SCORE
-                          and _ai_score(s) is not None and _ai_score(s) >= AI_AUTO_AI_MIN_SCORE
-                          and (_ai_opp(s) is None or (_ai_score(s) - _ai_opp(s)) >= 1.5)]
+                          and _auto_score(s) >= (AI_AUTO_SHORT_MIN_SCORE if s.get('signal') == 'SHORT' else AI_AUTO_MIN_SCORE)
+                          and _ai_score(s) is not None
+                          and _ai_score(s) >= (AI_AUTO_SHORT_AI_MIN_SCORE if s.get('signal') == 'SHORT' else AI_AUTO_AI_MIN_SCORE)
+                          and (_ai_opp(s) is None or (_ai_score(s) - _ai_opp(s)) >= 1.5)
+                          and side_winrate_ok(s.get('signal'))]
             if quasi and not candidates:
                 logger.info(f"[AI-AUTO] Có {len(quasi)} tín hiệu 4-5 sao nhưng không đạt ngưỡng "
                             f"(phải 4-5⭐ + điểm ≥ {AI_AUTO_MIN_SCORE} + AI tự chấm ≥ {AI_AUTO_AI_MIN_SCORE} "
-                            f"+ cách biệt ≥ 1.5) — bỏ qua tất cả.")
+                            f"+ cách biệt ≥ 1.5; SHORT cần điểm ≥ {AI_AUTO_SHORT_MIN_SCORE} + AI ≥ {AI_AUTO_SHORT_AI_MIN_SCORE}) "
+                            f"— bỏ qua tất cả.")
                 quasi_lines = []
                 for s in sorted(quasi, key=_auto_score, reverse=True)[:5]:
                     sc = _auto_score(s)
