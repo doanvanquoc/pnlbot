@@ -7515,7 +7515,7 @@ async def on_cleanup(app):
         await app['session'].close()
     logger.info("Đã dọn dẹp hoàn tất.")
 
-# Hàm main khởi động ứng dụng
+# Hàm main khởi động  updated
 def main():
     load_dotenv()
     
