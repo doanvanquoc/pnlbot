@@ -752,7 +752,7 @@ async def get_ai_review(session, digest):
         return None
 
 
-_MD_HEADER_RE = re.compile(r'^\s{0,3}#{1,6}\s+(.*)$')
+_MD_HEADER_RE = re.compile(r'^(\s*(?:🤖\s*)?)#{1,6}\s+(.*)$')
 _MD_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
 _MD_TABLE_SEP_RE = re.compile(r'^\s*\|?[\s:\-]+\|[\s:\-|]*\|?\s*$')
 _MD_HRULE_RE = re.compile(r'^\s*([-_*])\1{2,}\s*$')
@@ -776,8 +776,9 @@ def sanitize_ai_markdown(text):
         line = lines[i]
         m = _MD_HEADER_RE.match(line)
         if m:
-            content = m.group(1).strip()
-            out.append(f"*{content}*" if content else "")
+            prefix, content = m.groups()
+            content = content.strip()
+            out.append(f"{prefix}*{content}*" if content else prefix.rstrip())
             i += 1
             continue
         if _MD_HRULE_RE.match(line):
