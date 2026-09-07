@@ -18,8 +18,8 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: 22
           script: |
-            cd /pnlbot
-            git -c safe.directory=/pnlbot pull origin main
-            chown -R pnlbot:pnlbot /pnlbot
-            systemctl restart pnlbot
-            systemctl status pnlbot --no-pager
+            cd /home/ubuntu/pnlbot
+            git -c safe.directory=/home/ubuntu/pnlbot pull origin main
+            sudo chown -R pnlbot:pnlbot /home/ubuntu/pnlbot
+            sudo systemctl restart pnlbot
+            sudo systemctl status pnlbot --no-pager
