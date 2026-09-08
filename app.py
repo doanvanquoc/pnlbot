@@ -3467,6 +3467,16 @@ AUTO_MANAGED_FILE = "auto_managed.json"
 
 auto_managed = {}   # position_key -> meta lệnh AI tự mở để trailing: symbol, side, entry, sl_initial, risk, atr, qty, pos_side, sl_algo_id, tp_algo_id, last_sl, ts
 
+# ─── Setup mặc định cho lệnh thủ công (/long, /short không truyền tp=/sl=) ───
+# Khi vào lệnh mà không chỉ định tp=/sl=, bot tự đặt TP/SL theo mặc định dưới đây
+# để lệnh lúc nào cũng có đủ 3 lệnh: vào (market/limit) + TP + SL.
+# Giá trị: SL là % giá (vd 2.0 = 2%), TP là bội số R (R = khoảng cách SL).
+DEFAULT_SETUP_ENABLED = True
+DEFAULT_SETUP = {
+    'sl_pct': 2.0,    # SL cách entry 2% giá
+    'tp_rr': 2.0,     # TP cách entry 2x khoảng cách SL (R:R = 2)
+}
+
 
 def _save_auto_managed():
     """Lưu trạng thái trailing xuống đĩa để sống sót qua restart bot."""
@@ -5579,6 +5589,12 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
             "người dùng không thích thì bấm Hủy hoặc bỏ qua (tự hết hạn). Chỉ không soạn khi trả lời thuần phân tích/kiến thức, không kèm đề xuất lệnh cụ thể. "
             "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
+            "QUY TẮC BẮT BUỘC - LUÔN ĐỦ 3 LỆNH: khi soạn lệnh MỞ vị thế mới (MARKET hoặc LIMIT), PHẢI soạn ngay cùng lúc "
+            "ĐỦ 3 lệnh: (1) lệnh vào vị thế, (2) lệnh TP điều kiện TAKE_PROFIT_MARKET reduce_only, (3) lệnh SL điều kiện STOP_MARKET reduce_only — "
+            "đừng bao giờ chỉ soạn lệnh vào mà thiếu TP/SL. Cách tính TP/SL theo biến động của coin: "
+            "SL đặt dưới support gần nhất trừ 0.3×ATR (LONG) hoặc trên resistance cộng 0.3×ATR (SHORT); không có S/R rõ thì SL = entry ± 1.5×ATR; "
+            "TP = entry ± (khoảng cách SL × 1.5 đến 2) — ưu tiên R:R ≥ 1.5. "
+            "SL phải đảm bảo lỗ khi khớp ≤ 20% số dư khả dụng. Khi có dữ liệu analyze_coin/scan_market thì DÙNG LUÔN TP/SL hệ thống đề xuất. "
             "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
             "hỏi về TIN TỨC/sự kiện/lý do coin tăng giảm/tin cộng đồng -> search_news (kết quả chỉ tham khảo, không phải tín hiệu); "
@@ -6317,6 +6333,21 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                     execute_qty = float(data.get('executedQty', 0))
                 
                 tp_sl_msg_parts = []
+
+                # Setup mặc định: lệnh không truyền tp=/sl= vẫn luôn có đủ TP + SL
+                # (đối chiếu giá tham chiếu đã biết: limit giá, market giá khớp trung bình).
+                # Dùng hậu tố '%' (không phải giá tuyệt đối) để tính chính xác cả coin giá thấp,
+                # và tránh với suffix 'r' của calculate_tpsl_price.
+                ref_price_for_default = limit_price if is_limit else (avg_price or 0)
+                if DEFAULT_SETUP_ENABLED and not tp_price_str and not sl_price_str and ref_price_for_default > 0:
+                    def_sl_pct = float(DEFAULT_SETUP.get('sl_pct', 2.0))
+                    def_tp_rr = float(DEFAULT_SETUP.get('tp_rr', 2.0))
+                    tp_price_str = f"{def_sl_pct * def_tp_rr}%"
+                    sl_price_str = f"{def_sl_pct}%"
+                    tp_sl_msg_parts.append(
+                        f"ℹ️ *Setup mặc định* (SL {def_sl_pct:.1f}%, "
+                        f"TP {def_tp_rr:.1f}R): áp dụng vì lệnh không chỉ định tp=/sl=."
+                    )
 
                 # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
                 final_tp_price = None
@@ -7096,8 +7127,8 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "🎯 `/tp <coin> <giá_tp>` - Cài đặt giá chốt lời (Take Profit).\n"
             "🛡️ `/sl <coin> <giá_sl>` - Cài đặt giá cắt lỗ (Stop Loss).\n"
             "🔮 `/tpsl <coin> <giá_tp> <giá_sl>` - Cài đặt đồng thời cả TP và SL.\n"
-            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá).\n"
-            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá).\n"
+            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá). Không truyền tp=/sl= → tự đặt TP/SL mặc định (SL 2%, TP 2R).\n"
+            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá). Không truyền tp=/sl= → tự đặt TP/SL mặc định (SL 2%, TP 2R).\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
@@ -7222,6 +7253,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
                 "• Lệnh Market: `/long <coin> <volume>`\n"
                 "• Lệnh Limit: `/long <coin> <volume> <giá>`\n"
                 "• Đi kèm TP/SL: `/long btc 400 60000 tp=65000 sl=58000` (hoặc `/long btc 400 tp=65000 sl=58000`)\n"
+                "• Không truyền tp=/sl= → tự áp setup mặc định: SL 2%, TP 2R (lệnh luôn có đủ TP/SL)\n"
                 "Ví dụ: `/long btc 1000` hoặc `/long btc 1000 98000`"
             )
         else:
