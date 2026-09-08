@@ -3484,10 +3484,9 @@ AUTO_MANAGED_FILE = "auto_managed.json"
 auto_managed = {}   # position_key -> meta lệnh AI tự mở để trailing: symbol, side, entry, sl_initial, risk, atr, qty, pos_side, sl_algo_id, tp_algo_id, last_sl, ts
 
 # ─── Setup mặc định cho lệnh thủ công (/long, /short không truyền tp=/sl=) ───
-# Khi vào lệnh mà không chỉ định tp=/sl=, bot tự đặt TP/SL theo mặc định dưới đây
-# để lệnh lúc nào cũng có đủ 3 lệnh: vào (market/limit) + TP + SL.
-# Giá trị: SL là % giá (vd 2.0 = 2%), TP là bội số R (R = khoảng cách SL).
-DEFAULT_SETUP_ENABLED = True
+# Người dùng yêu cầu TẮT tự động đặt TP/SL khi vào lệnh thủ công: /l và /s chỉ đặt
+# đúng 1 lệnh vào, TP/SL chỉ được đặt khi người dùng truyền tp=/sl= hoặc dùng /tp /sl /tpsl.
+DEFAULT_SETUP_ENABLED = False
 DEFAULT_SETUP = {
     'sl_pct': 2.0,    # SL cách entry 2% giá
     'tp_rr': 2.0,     # TP cách entry 2x khoảng cách SL (R:R = 2)
@@ -7225,8 +7224,8 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "🎯 `/tp <coin> <giá_tp>` - Cài đặt giá chốt lời (Take Profit).\n"
             "🛡️ `/sl <coin> <giá_sl>` - Cài đặt giá cắt lỗ (Stop Loss).\n"
             "🔮 `/tpsl <coin> <giá_tp> <giá_sl>` - Cài đặt đồng thời cả TP và SL.\n"
-            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá). Không truyền tp=/sl= → tự đặt TP/SL mặc định (SL 2%, TP 2R).\n"
-            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá). Không truyền tp=/sl= → tự đặt TP/SL mặc định (SL 2%, TP 2R).\n"
+            "📈 `/long <coin> <volume> [giá]` (hoặc `/l`) - LONG (Market nếu không nhập giá, Limit nếu có giá). TP/SL chỉ đặt khi truyền tp=/sl= (ví dụ `/long btc 400 tp=65000 sl=58000`).\n"
+            "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá). TP/SL chỉ đặt khi truyền tp=/sl=.\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
@@ -7351,7 +7350,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
                 "• Lệnh Market: `/long <coin> <volume>`\n"
                 "• Lệnh Limit: `/long <coin> <volume> <giá>`\n"
                 "• Đi kèm TP/SL: `/long btc 400 60000 tp=65000 sl=58000` (hoặc `/long btc 400 tp=65000 sl=58000`)\n"
-                "• Không truyền tp=/sl= → tự áp setup mặc định: SL 2%, TP 2R (lệnh luôn có đủ TP/SL)\n"
+                "• Không truyền tp=/sl= → chỉ đặt lệnh vào, KHÔNG tự đặt TP/SL\n"
                 "Ví dụ: `/long btc 1000` hoặc `/long btc 1000 98000`"
             )
         else:
