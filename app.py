@@ -819,7 +819,12 @@ def get_binance_signature(query_string, secret_key):
     ).hexdigest()
 
 # Gửi tin nhắn Telegram
+# Mốc thời gian (epoch) đến khi hết cửa sổ flood 429 của Telegram — mọi send chia sẻ chung,
+# tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
+_telegram_flood_until = 0.0
+
 async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=None, reply_markup=None):
+    global _telegram_flood_until
     if not is_auto:
         has_new_activity[chat_id] = True
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -836,20 +841,27 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
         payload["reply_markup"] = reply_markup
     max_attempts = 3
     for attempt in range(max_attempts):
+        # Nếu Telegram đang flood (429 trước đó bảo chờ), chờ hết cửa sổ mới gửi —
+        # tránh đè thêm request làm khóa lâu hơn và không mất tin nhắn.
+        wait = _telegram_flood_until - time.time()
+        if wait > 0:
+            logger.warning(f"Telegram đang flood: chờ {wait:.0f}s (tin nhắn giữ trong hàng đợi, không mất)")
+            await asyncio.sleep(min(wait, 30))
         try:
             async with session.post(url, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get('result', {}).get('message_id')
-                # Telegram trả 429 (rate limit): chờ retry_after rồi thử lại
+                # Telegram trả 429 (rate limit): ghi nhớ cửa sổ flood, chờ retry_after rồi thử lại
                 if resp.status == 429 and attempt < max_attempts - 1:
                     try:
                         err = await resp.json()
                         retry_after = int(err.get('parameters', {}).get('retry_after', 1))
                     except Exception:
                         retry_after = 1
+                    _telegram_flood_until = max(_telegram_flood_until, time.time() + retry_after)
                     logger.warning(f"Telegram 429 rate limit: thử lại sau {retry_after}s (lần {attempt + 1}/{max_attempts})")
-                    await asyncio.sleep(min(retry_after, 5))
+                    await asyncio.sleep(min(retry_after, 30))
                     continue
                 # Lỗi parse markdown (400): thử lại không parse_mode để tin nhắn không bị mất
                 if resp.status == 400 and 'parse_mode' in payload:
@@ -1536,6 +1548,10 @@ async def test_handler(request):
 def format_price(price):
     if price is None:
         return "Không tìm thấy"
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return str(price)
     if price >= 1000:
         return f"{price:,.2f}".rstrip('0').rstrip('.')
     elif price >= 1:
