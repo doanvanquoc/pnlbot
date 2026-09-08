@@ -41,6 +41,8 @@ subscribed_symbols = set() # Các symbol (viết thường) đã subscribe Mark 
 mark_price_ws = None    # WS connection cho Mark Price stream
 auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động mỗi 5 phút
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
+auto_pnl_chats = set()  # Danh sách chat_id nhận cập nhật TỔNG PNL tự động mỗi phút
+last_auto_pnl_messages = {}  # Lưu message_id tin nhắn TỔNG PNL auto cuối cùng (key: chat_id, value: message_id)
 has_new_activity = {}   # Đánh dấu có hoạt động mới trong chat (key: chat_id, value: bool)
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
@@ -79,6 +81,7 @@ CONF_MAP = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung 
 
 ACTIVE_CHATS_FILE = "active_chats.json"
 AUTO_CHATS_FILE = "auto_chats.json"
+AUTO_PNL_CHATS_FILE = "auto_pnl_chats.json"
 active_chats = set()
 
 def load_active_chats():
@@ -117,6 +120,25 @@ def save_auto_chats():
             json.dump({"chats": list(auto_chats), "last_messages": last_auto_messages}, f)
     except Exception as e:
         logger.error(f"Lỗi khi lưu auto_chats: {e}")
+
+def load_auto_pnl_chats():
+    global auto_pnl_chats, last_auto_pnl_messages
+    try:
+        if os.path.exists(AUTO_PNL_CHATS_FILE):
+            with open(AUTO_PNL_CHATS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            auto_pnl_chats = set(int(cid) for cid in data.get('chats', []))
+            last_auto_pnl_messages = {int(cid): mid for cid, mid in data.get('last_messages', {}).items()}
+            logger.info(f"Đã tải {len(auto_pnl_chats)} chat auto PnL từ file.")
+    except Exception as e:
+        logger.error(f"Lỗi khi tải auto_pnl_chats: {e}")
+
+def save_auto_pnl_chats():
+    try:
+        with open(AUTO_PNL_CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chats": list(auto_pnl_chats), "last_messages": last_auto_pnl_messages}, f)
+    except Exception as e:
+        logger.error(f"Lỗi khi lưu auto_pnl_chats: {e}")
 
 
 SIGNAL_HISTORY_FILE = "signal_history.json"
@@ -1409,50 +1431,59 @@ async def binance_mark_price_stream(session):
         await asyncio.sleep(5)
 
 # Vòng lặp gửi vị thế tự động mỗi 5 phút
+async def _update_auto_chat_message(session, chat_id, message, last_messages):
+    """Gửi hoặc sửa tin nhắn auto cho 1 chat (dùng chung cho vị thế và tổng PnL)."""
+    # Đang chat với AI (hoặc mới chat xong): tạm im lặng, không chen ngang
+    if ai_active_until.get(chat_id, 0) > time.time():
+        return
+    old_msg_id = last_messages.get(chat_id)
+
+    # Nếu có hoạt động mới trong chat, xóa tin nhắn cũ và gửi tin mới xuống dưới cùng
+    if has_new_activity.get(chat_id, True):
+        if old_msg_id:
+            await delete_telegram_message(session, chat_id, old_msg_id)
+        new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+        if new_msg_id:
+            last_messages[chat_id] = new_msg_id
+            has_new_activity[chat_id] = False
+    else:
+        # Nếu không có hoạt động mới, chỉnh sửa trực tiếp tin nhắn cũ
+        if old_msg_id:
+            edited_msg_id = await edit_telegram_message(session, chat_id, old_msg_id, message)
+            if edited_msg_id:
+                last_messages[chat_id] = edited_msg_id
+            else:
+                new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+                if new_msg_id:
+                    last_messages[chat_id] = new_msg_id
+                    has_new_activity[chat_id] = False
+        else:
+            new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+            if new_msg_id:
+                last_messages[chat_id] = new_msg_id
+                has_new_activity[chat_id] = False
+
+
 async def auto_pos_sender_loop(app):
     try:
         while True:
             # Lưu ý: người dùng đang đặt là 30 giây để test nhanh
-            await asyncio.sleep(60)  
+            await asyncio.sleep(60)
+            session = app['session']
+
+            # 1. Cập nhật bảng vị thế cho các chat đã bật /auto
             if auto_chats and positions:
-                session = app['session']
                 message = build_positions_text()
-                
-                # Gửi hoặc sửa tin nhắn cho tất cả các chat_id đã đăng ký (song song)
-                async def update_auto_chat(chat_id):
-                    # Đang chat với AI (hoặc mới chat xong): tạm im lặng, không chen ngang
-                    if ai_active_until.get(chat_id, 0) > time.time():
-                        return
-                    old_msg_id = last_auto_messages.get(chat_id)
-                    
-                    # Nếu có hoạt động mới trong chat, xóa tin nhắn PnL cũ và gửi tin mới xuống dưới cùng
-                    if has_new_activity.get(chat_id, True):
-                        if old_msg_id:
-                            await delete_telegram_message(session, chat_id, old_msg_id)
-                        
-                        new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
-                        if new_msg_id:
-                            last_auto_messages[chat_id] = new_msg_id
-                            has_new_activity[chat_id] = False
-                    else:
-                        # Nếu không có hoạt động mới, chỉnh sửa trực tiếp tin nhắn cũ
-                        if old_msg_id:
-                            edited_msg_id = await edit_telegram_message(session, chat_id, old_msg_id, message)
-                            if edited_msg_id:
-                                last_auto_messages[chat_id] = edited_msg_id
-                            else:
-                                new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
-                                if new_msg_id:
-                                    last_auto_messages[chat_id] = new_msg_id
-                                    has_new_activity[chat_id] = False
-                        else:
-                            new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
-                            if new_msg_id:
-                                last_auto_messages[chat_id] = new_msg_id
-                                has_new_activity[chat_id] = False
-                
-                await asyncio.gather(*(update_auto_chat(cid) for cid in list(auto_chats)), return_exceptions=True)
+                await asyncio.gather(*(_update_auto_chat_message(session, cid, message, last_auto_messages)
+                                       for cid in list(auto_chats)), return_exceptions=True)
                 save_auto_chats()
+
+            # 2. Cập nhật TỔNG PNL cho các chat đã bật /autopnl
+            if auto_pnl_chats:
+                pnl_msg = build_pnl_summary_text()
+                await asyncio.gather(*(_update_auto_chat_message(session, cid, pnl_msg, last_auto_pnl_messages)
+                                       for cid in list(auto_pnl_chats)), return_exceptions=True)
+                save_auto_pnl_chats()
     except asyncio.CancelledError:
         logger.info("Task tự động gửi vị thế đã bị hủy.")
     except Exception as e:
@@ -1487,6 +1518,30 @@ async def handle_auto_command(session, chat_id):
         else:
             await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
 
+# Xử lý lệnh /autopnl
+async def handle_auto_pnl_command(session, chat_id):
+    if chat_id in auto_pnl_chats:
+        auto_pnl_chats.remove(chat_id)
+
+        # Xóa tin nhắn auto PnL cuối cùng nếu có khi tắt chế độ
+        old_msg_id = last_auto_pnl_messages.pop(chat_id, None)
+        if old_msg_id:
+            await delete_telegram_message(session, chat_id, old_msg_id)
+        save_auto_pnl_chats()
+
+        await send_telegram_message(session, chat_id, "❌ Đã tắt tự động gửi TỔNG PNL mỗi 1 phút.")
+    else:
+        auto_pnl_chats.add(chat_id)
+        save_auto_pnl_chats()
+        await send_telegram_message(session, chat_id, "✅ Đã bật tự động gửi TỔNG PNL mỗi 1 phút.")
+
+        # Gửi luôn tổng PNL hiện tại và lưu message_id làm tin nhắn auto đầu tiên
+        new_msg_id = await send_telegram_message(session, chat_id, build_pnl_summary_text(), is_auto=True)
+        if new_msg_id:
+            last_auto_pnl_messages[chat_id] = new_msg_id
+            has_new_activity[chat_id] = False
+            save_auto_pnl_chats()
+
 # Đăng ký Webhook với Telegram
 async def setup_telegram_webhook(session):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1514,21 +1569,24 @@ async def setup_telegram_webhook(session):
     except Exception as e:
         logger.error(f"Lỗi khi thực hiện setWebhook: {e}")
 
-# Xử lý lệnh /pnl
-async def handle_pnl_command(session, chat_id):
-    if not positions:
-        await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
-        return
-        
+def build_pnl_summary_text():
+    """Tổng PNL (unrealized) của tất cả vị thế đang mở + số vị thế."""
     total_pnl = sum(pos.get('unrealizedPnL', 0.0) for pos in positions.values())
-    
-    message = (
+    return (
         f"📊 *TỔNG PNL VỊ THẾ HIỆN TẠI*\n"
         f"----------------------------------\n"
         f"💰 Trạng thái: {pnl_emoji(total_pnl)} *{fmt_signed(total_pnl)} USDT*\n"
         f"🔥 Vị thế đang mở: *{len(positions)}*"
     )
-    await send_telegram_message(session, chat_id, message)
+
+
+# Xử lý lệnh /pnl
+async def handle_pnl_command(session, chat_id):
+    if not positions:
+        await send_telegram_message(session, chat_id, "ℹ️ Hiện tại không có vị thế Futures nào đang mở.")
+        return
+
+    await send_telegram_message(session, chat_id, build_pnl_summary_text())
 
 # Xử lý lệnh /pos
 async def handle_pos_command(session, chat_id):
@@ -7134,7 +7192,7 @@ async def telegram_webhook_handler(request):
             '/start', '/help', '/pnl', '/pos', '/balance', '/wallet', '/sodu',
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
-            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto',
+            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
             '/review', '/ai', '/usage', '/scans', '/scan'
         }
@@ -7229,6 +7287,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
+            "📊 `/autopnl` - Bật/Tắt tự động gửi TỔNG PNL vị thế hiện tại mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
@@ -7456,6 +7515,9 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             
     elif command_base == '/auto':
         await handle_auto_command(request.app['session'], chat_id)
+
+    elif command_base == '/autopnl':
+        await handle_auto_pnl_command(request.app['session'], chat_id)
         
     elif command_base in ('/analyze', '/a'):
         parts = text.split()
@@ -7563,6 +7625,7 @@ async def on_startup(app):
     ai_lessons_lock = asyncio.Lock()
     load_active_chats()
     load_auto_chats()
+    load_auto_pnl_chats()
     load_signal_history()
     load_scan_history()
     _load_ai_alert_state()
