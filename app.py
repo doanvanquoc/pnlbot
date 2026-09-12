@@ -772,6 +772,10 @@ async def get_ai_verdict_cached(session, cache_key, digest):
     verdict = await get_ai_analysis(session, digest, lessons=lessons)
     if verdict:
         ai_verdict_cache[full_key] = {'verdict': verdict, 'ts': now}
+        # Dọn entry đã hết hạn (digest chứa giá live → key mới liên tục, không dọn là leak)
+        stale = [k for k, v in ai_verdict_cache.items() if now - v.get('ts', 0) > AI_CACHE_TTL]
+        for k in stale:
+            ai_verdict_cache.pop(k, None)
     return verdict
 
 
@@ -1036,6 +1040,27 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
     global _telegram_flood_until
     if not is_auto:
         has_new_activity[chat_id] = True
+    # Telegram giới hạn 4096 ký tự/tin: chia nhỏ gửi tiếp các phần (tránh tin dài bị rơi im lặng)
+    if len(text) > 4000:
+        chunks = []
+        cur = ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3900:
+                if cur:
+                    chunks.append(cur)
+                cur = line[:3900]
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        if cur:
+            chunks.append(cur)
+        sent_id = None
+        for i, chunk in enumerate(chunks[:4]):
+            kb = reply_markup if i == 0 else None
+            sent_id = await send_telegram_message(session, chat_id, chunk,
+                                                  is_auto=is_auto, reply_to=reply_to, reply_markup=kb)
+            if len(chunks) > 4 and i == 3:
+                await send_telegram_message(session, chat_id, "... (tin quá dài, còn lại bị lược bớt)", is_auto=True)
+        return sent_id
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -1077,6 +1102,17 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
                     payload.pop('parse_mode')
                     continue
                 body = await resp.text()
+                # Chat block bot / không tồn tại → gỡ khỏi mọi danh sách auto để không retry spam mỗi phút
+                if resp.status == 403 or 'bot was blocked' in body.lower() or 'chat not found' in body.lower():
+                    logger.warning(f"Chat {chat_id} block bot/không tồn tại — gỡ khỏi auto chats.")
+                    auto_chats.discard(chat_id)
+                    auto_pnl_chats.discard(chat_id)
+                    active_chats.discard(chat_id)
+                    last_auto_messages.pop(chat_id, None)
+                    last_auto_pnl_messages.pop(chat_id, None)
+                    save_auto_chats()
+                    save_auto_pnl_chats()
+                    save_active_chats()
                 logger.error(f"Lỗi gửi tin nhắn Telegram: HTTP {resp.status} - {body}")
                 return None
         except Exception as e:
@@ -1199,7 +1235,7 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
         timestamp = int(time.time() * 1000)
         params = [
             f"symbol={symbol}",
-            f"timestamp={timestamp}"
+            f"timestamp={timestamp}&recvWindow=10000"
         ]
         query = "&".join(params)
         sig = get_binance_signature(query, api_secret)
@@ -1216,7 +1252,7 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
                             order_id = order.get('orderId')
                             if order_id:
                                 del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
+                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}&recvWindow=10000"
                                 del_sig = get_binance_signature(del_query, api_secret)
                                 del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
                                 
@@ -1293,7 +1329,7 @@ async def update_position_cache(symbol, position_side, amount, entry_price, leve
 # Lấy snapshot vị thế ban đầu từ Binance Futures REST API
 async def init_positions(session, api_key, api_secret):
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -1331,6 +1367,70 @@ async def init_positions(session, api_key, api_secret):
         else:
             text = await resp.text()
             raise Exception(f"Lỗi lấy snapshot vị thế từ Binance: HTTP {resp.status} - {text}")
+
+
+async def position_reconcile_loop(app):
+    """Mỗi 5 phút: đối chiếu cache `positions` với REST /fapi/v2/positionRisk và sửa lại.
+    WS user-data chỉ đẩy DELTA — 1 sự kiện rớt khi reconnect → cache sai/vmissing VĨNH VIỄN,
+    làm sai mọi số liệu /pos /pnl /risk, auto-trader guard và quantity khi đóng lệnh."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            session = app['session']
+            data, err = await get_position_risk(session)
+            if not err and isinstance(data, list):
+                fresh_keys = set()
+                for p in data:
+                    try:
+                        amt = float(p.get('positionAmt', 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if amt == 0.0:
+                        continue
+                    symbol = p.get('symbol')
+                    pside = p.get('positionSide', 'BOTH')
+                    key = f"{symbol}_{pside}"
+                    fresh_keys.add(key)
+                    entry = float(p.get('entryPrice', 0) or 0)
+                    mark = float(p.get('markPrice', 0) or 0)
+                    lev = int(float(p.get('leverage', 1) or 1))
+                    cached = positions.get(key)
+                    if cached:
+                        try:
+                            cached_amt = float(cached.get('positionAmt', 0) or 0)
+                        except (TypeError, ValueError):
+                            cached_amt = None
+                        if cached_amt == amt and float(cached.get('entryPrice', 0) or 0) == entry:
+                            if mark > 0:
+                                cached['markPrice'] = mark
+                            continue
+                    side_sign = -1 if (pside == 'SHORT' or amt < 0) else 1
+                    unrealized = (mark - entry) * abs(amt) * side_sign if (mark > 0 and entry > 0) else 0.0
+                    old = positions.get(key, {})
+                    positions[key] = {
+                        'symbol': symbol, 'positionSide': pside, 'positionAmt': amt,
+                        'entryPrice': entry,
+                        'markPrice': mark or old.get('markPrice', entry),
+                        'unrealizedPnL': unrealized if unrealized else old.get('unrealizedPnL', 0.0),
+                        'leverage': lev,
+                        'fundingRate': old.get('fundingRate', 0.0),
+                    }
+                    logger.info(f"[RECONCILE] Sửa/nạp vị thế {key} (size {amt}, entry {entry})")
+                    await subscribe_mark_price(symbol)
+                # Vị thế stale trong cache nhưng Binance không còn → xóa + dọn TP/SL mồ côi
+                for key in list(positions.keys()):
+                    if key not in fresh_keys:
+                        p = positions[key]
+                        symbol = p['symbol']
+                        await update_position_cache(symbol, p.get('positionSide', 'BOTH'), 0.0,
+                                                    float(p.get('entryPrice', 0) or 0),
+                                                    int(p.get('leverage', 1) or 1), session=session)
+                        logger.info(f"[RECONCILE] Dọn vị thế stale {key}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Lỗi trong position_reconcile_loop: {e}")
+        await asyncio.sleep(300)
 
 # Lấy listenKey từ Binance
 async def get_listen_key(session, api_key):
@@ -1528,8 +1628,8 @@ async def binance_user_data_stream(session, api_key):
                                     msg_lines.append(f"🆔 Order ID: `{order_id}`")
                                     message = "\n".join(msg_lines)
 
-                            # Dọn dẹp cache nếu lệnh kết thúc bằng cách khác (CANCELED/EXPIRED)
-                            if status in ('CANCELED', 'EXPIRED'):
+                            # Dọn dẹp cache nếu lệnh kết thúc bằng cách khác (CANCELED/EXPIRED/REJECTED)
+                            if status in ('CANCELED', 'EXPIRED', 'REJECTED', 'EXPIRED_IN_MATCHING_ENGINE'):
                                 order_realized_pnl.pop(order_id, None)
                                 
                             # Gửi thông báo song song cho tất cả active_chats
@@ -1652,8 +1752,8 @@ async def _update_auto_chat_message(session, chat_id, message, last_messages):
 
 
 async def auto_pos_sender_loop(app):
-    try:
-        while True:
+    while True:
+        try:
             # Lưu ý: người dùng đang đặt là 30 giây để test nhanh
             await asyncio.sleep(60)
             session = app['session']
@@ -1671,10 +1771,12 @@ async def auto_pos_sender_loop(app):
                 await asyncio.gather(*(_update_auto_chat_message(session, cid, pnl_msg, last_auto_pnl_messages)
                                        for cid in list(auto_pnl_chats)), return_exceptions=True)
                 save_auto_pnl_chats()
-    except asyncio.CancelledError:
-        logger.info("Task tự động gửi vị thế đã bị hủy.")
-    except Exception as e:
-        logger.error(f"Lỗi trong auto_pos_sender_loop: {e}")
+        except asyncio.CancelledError:
+            logger.info("Task tự động gửi vị thế đã bị hủy.")
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi trong auto_pos_sender_loop (loop tiếp tục): {e}")
+            await asyncio.sleep(5)
 
 # Xử lý lệnh /auto
 async def handle_auto_command(session, chat_id):
@@ -1939,7 +2041,7 @@ async def handle_balance_command(session, chat_id):
     api_secret = os.getenv("BINANCE_API_SECRET")
     
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v2/account?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -2098,7 +2200,7 @@ async def handle_history_command(session, chat_id, coin_name=None):
     params = [
         "incomeType=REALIZED_PNL",
         "limit=100",  # Lấy nhiều bản ghi thô hơn để sau khi gom nhóm không bị thiếu
-        f"timestamp={timestamp}"
+        f"timestamp={timestamp}&recvWindow=10000"
     ]
     if symbol:
         params.insert(0, f"symbol={symbol}")
@@ -2196,7 +2298,7 @@ async def handle_liq_command(session, chat_id):
     api_secret = os.getenv("BINANCE_API_SECRET")
     
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -2894,6 +2996,45 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
     }
 
 
+async def get_scan_signals_fresh(session, max_age=300):
+    """Lấy tín hiệu quét thị trường: dùng cache nếu còn mới, quét ngoài lock (single-flight).
+    Trước đây toàn bộ scan 75 coin × 3 khung chạy TRONG lock → /a và các loop phải chờ cả phút."""
+    now = time.time()
+    if market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < max_age:
+        return market_scan_cache["signals"]
+    async with market_scan_cache["lock"]:
+        now = time.time()
+        if market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < max_age:
+            return market_scan_cache["signals"]
+        if market_scan_cache.get("scanning"):
+            waiter = True
+        else:
+            market_scan_cache["scanning"] = True
+            waiter = False
+    if waiter:
+        # Có scan đang chạy: chờ tối đa ~3 phút thay vì quét lại tốn request
+        start_ts = market_scan_cache.get("timestamp", 0.0)
+        for _ in range(90):
+            await asyncio.sleep(2)
+            if (not market_scan_cache.get("scanning")
+                    and market_scan_cache["signals"] is not None
+                    and market_scan_cache.get("timestamp", 0.0) > start_ts):
+                return market_scan_cache["signals"]
+        sigs = market_scan_cache.get("signals")
+        return sigs or ([], [])
+    try:
+        long_signals, short_signals = await scan_market_signals(session)
+        async with market_scan_cache["lock"]:
+            market_scan_cache["signals"] = (long_signals, short_signals)
+            market_scan_cache["timestamp"] = time.time()
+            market_scan_cache.pop("scanning", None)
+        return long_signals, short_signals
+    except Exception:
+        async with market_scan_cache["lock"]:
+            market_scan_cache.pop("scanning", None)
+        raise
+
+
 async def scan_market_signals(session):
     """
     Quét qua top 75 coin theo volume 24h để tìm cơ hội giao dịch có tỉ lệ thắng cao.
@@ -3382,21 +3523,17 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
         )
         
         try:
-            # Dùng lock để tránh việc nhiều request cùng quét đồng thời
-            async with market_scan_cache["lock"]:
-                # Kiểm tra lại một lần nữa phòng trường hợp task khác vừa quét xong trong khi chờ lock
-                now_check = time.time()
-                if market_scan_cache["signals"] is not None and now_check - market_scan_cache["timestamp"] < 300:
-                    long_signals, short_signals = market_scan_cache["signals"]
-                    cache_age = int(now_check - market_scan_cache["timestamp"])
-                else:
-                    long_signals, short_signals = await scan_market_signals(session)
-                    market_scan_cache["signals"] = (long_signals, short_signals)
-                    market_scan_cache["timestamp"] = time.time()
-                    cache_age = 0
-                    # Lưu tín hiệu quét mới vào lịch sử để theo dõi win-rate
-                    for sig_res in list(long_signals) + list(short_signals):
-                        record_signal(sig_res, sig_res.get('ai'), origin='scan')
+            # Scan ngoài lock (single-flight) — /a không còn chặn các loop và ngược lại
+            long_signals, short_signals = await get_scan_signals_fresh(session, max_age=300)
+            now_check = time.time()
+            if market_scan_cache["signals"] is not None:
+                cache_age = int(now_check - market_scan_cache["timestamp"])
+            else:
+                cache_age = 0
+            # Lưu tín hiệu quét mới vào lịch sử để theo dõi win-rate
+            if cache_age <= 5:
+                for sig_res in list(long_signals) + list(short_signals):
+                    record_signal(sig_res, sig_res.get('ai'), origin='scan')
             
             if loading_msg_id:
                 await delete_telegram_message(session, chat_id, loading_msg_id)
@@ -3424,7 +3561,7 @@ async def handle_review_command(session, chat_id):
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET")
         timestamp = int(time.time() * 1000)
-        query_string = f"timestamp={timestamp}"
+        query_string = f"timestamp={timestamp}&recvWindow=10000"
         signature = get_binance_signature(query_string, api_secret)
         url = f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}"
         headers = {"X-MBX-APIKEY": api_key}
@@ -3527,7 +3664,7 @@ async def build_account_context(session):
     lines = []
     try:
         ts = int(time.time() * 1000)
-        qs = f"timestamp={ts}"
+        qs = f"timestamp={ts}&recvWindow=10000"
         sig = get_binance_signature(qs, api_secret)
         async with session.get(f"https://fapi.binance.com/fapi/v2/account?{qs}&signature={sig}", headers=headers) as resp:
             if resp.status == 200:
@@ -3584,8 +3721,6 @@ async def build_account_context(session):
                     if tp_txt or sl_txt:
                         line += " | " + ", ".join(tp_txt + sl_txt)
                     lines.append(line)
-                else:
-                    lines.append("- Không có vị thế nào đang mở.")
         # Lệnh đang chờ: lệnh thường + lệnh TP/SL điều kiện (algo service, gồm cả lệnh đặt từ app)
         oo_data, oo_err = await binance_signed_request(session, 'GET', '/fapi/v1/openOrders')
         if not oo_err and oo_data:
@@ -3809,13 +3944,13 @@ AUTO_MANAGED_FILE = "auto_managed.json"
 
 auto_managed = {}   # position_key -> meta lệnh AI tự mở để trailing: symbol, side, entry, sl_initial, risk, atr, qty, pos_side, sl_algo_id, tp_algo_id, last_sl, ts
 
-# ─── Setup mặc định cho lệnh thủ công (/long, /short không truyền tp=/sl=) ───
+# ─── Setup mặc định cho lệnh thủ công (/long, /short) ───
 # Người dùng yêu cầu TẮT tự động đặt TP/SL khi vào lệnh thủ công: /l và /s chỉ đặt
 # đúng 1 lệnh vào, TP/SL chỉ được đặt khi người dùng truyền tp=/sl= hoặc dùng /tp /sl /tpsl.
 DEFAULT_SETUP_ENABLED = False
 DEFAULT_SETUP = {
-    'sl_pct': 2.0,    # SL cách entry 2% giá
-    'tp_rr': 2.0,     # TP cách entry 2x khoảng cách SL (R:R = 2)
+    'sl_pct': 2.0,    # SL cách entry 2% giá (chỉ dùng khi bật lại)
+    'tp_rr': 2.0,     # TP cách entry 2x khoảng cách SL (chỉ dùng khi bật lại)
 }
 
 
@@ -4058,7 +4193,7 @@ async def handle_fund_command(session, chat_id):
         pos = positions.get(f"{sym}_LONG") or positions.get(f"{sym}_SHORT")
         pos = pos or next((p for k, p in positions.items() if k.startswith(sym)), None)
         if pos and float(pos.get('positionAmt', 0) or 0) != 0:
-            pnl = float(pos.get('unrealizedProfit', pos.get('unRealizedProfit', 0)) or 0)
+            pnl = float(pos.get('unrealizedPnL', 0) or 0)
             if val < 0 and pnl > 0 and pnl < abs(val):
                 note = " ⚠️ lỗ funding > lời — cân nhắc đóng"
             elif val <= -1.0 and pnl <= 0:
@@ -4677,11 +4812,8 @@ async def ai_auto_trader_loop(app):
     while True:
         try:
             session = app['session']
-            # 1. Quét thị trường tươi (bỏ qua cache)
-            async with market_scan_cache["lock"]:
-                long_signals, short_signals = await scan_market_signals(session)
-                market_scan_cache["signals"] = (long_signals, short_signals)
-                market_scan_cache["timestamp"] = time.time()
+            # 1. Quét thị trường TƯƠI (bỏ qua cache) — scan ngoài lock, single-flight
+            long_signals, short_signals = await get_scan_signals_fresh(session, max_age=0)
 
             # 2. Lọc tín hiệu "CỰC LỚN": CHỈ 4-5 sao (Mạnh/Rất mạnh) + điểm ≥ ngưỡng + nhóm có win-rate OK.
             # (Lưu ý: live 4-5⭐: LONG 52%, SHORT 71% decided — số backtest 70%/37.5% cũ trong comment là prior cũ)
@@ -4817,14 +4949,8 @@ async def ai_signal_alert_loop(app):
     while True:
         try:
             session = app['session']
-            # 1. Quét thị trường tươi (ưu tiên dùng cache còn mới < 5 phút để đỡ tốn request)
-            async with market_scan_cache["lock"]:
-                if market_scan_cache["signals"] is None or time.time() - market_scan_cache["timestamp"] >= 300:
-                    long_signals, short_signals = await scan_market_signals(session)
-                    market_scan_cache["signals"] = (long_signals, short_signals)
-                    market_scan_cache["timestamp"] = time.time()
-                else:
-                    long_signals, short_signals = market_scan_cache["signals"]
+            # 1. Quét thị trường (dùng cache còn mới < 5 phút để đỡ tốn request) — ngoài lock
+            long_signals, short_signals = await get_scan_signals_fresh(session, max_age=300)
 
             now = time.time()
             candidates = []
@@ -4919,7 +5045,7 @@ async def ai_position_guard_loop(app):
                 entry = float(p.get('entryPrice', 0) or 0)
                 mark = float(p.get('markPrice', 0) or 0)
                 lev = p.get('leverage', 1) or 1
-                if now - ai_pos_guard_last.get(symbol, 0) < AI_POS_GUARD_COOLDOWN_SEC:
+                if now - ai_pos_guard_last.get((symbol, p_side), 0) < AI_POS_GUARD_COOLDOWN_SEC:
                     continue
 
                 try:
@@ -4984,7 +5110,7 @@ async def ai_position_guard_loop(app):
 
                     parts = [w for w in (trend_warn, funding_warn, loss_warn) if w]
                     if parts:
-                        ai_pos_guard_last[symbol] = now
+                        ai_pos_guard_last[(symbol, p_side)] = now
                         warns.append("\n\n".join(parts))
                 except Exception as e:
                     logger.warning(f"[AI-POS-GUARD] Lỗi phân tích {symbol}: {e}")
@@ -5545,6 +5671,9 @@ async def _stage_order(session, chat_id, order_type, params, desc):
     entry = pending_orders.get(chat_id)
     if not entry or time.time() - entry.get('ts', 0) > PENDING_ORDER_TTL:
         entry = {'items': [], 'ts': time.time()}
+    if len(entry['items']) >= 8:
+        return ("LỖI: đã có 8 lệnh chờ xác nhận — hãy chờ người dùng bấm Xác nhận/Hủy trước "
+                "khi soạn thêm (đừng gộp thêm lệnh vào hàng chờ).")
     entry['items'].append({'type': order_type, 'params': params, 'desc': desc, 'coin': params.get('symbol', '')})
     entry['ts'] = time.time()
     pending_orders[chat_id] = entry
@@ -5647,7 +5776,7 @@ async def tool_place_order(session, chat_id, args):
     if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET') and not args.get('stop_price'):
         return "LỖI: lệnh điều kiện cần stop_price (giá kích hoạt)."
     qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
-    quantity = round(quantity, qty_p)
+    quantity = round_down(quantity, qty_p)
     desc = f"{display_symbol(symbol)} {side} {otype} {quantity}"
 
     if otype in ('STOP_MARKET', 'TAKE_PROFIT_MARKET'):
@@ -5776,18 +5905,7 @@ async def tool_close_position(session, chat_id, args):
 
 async def tool_scan_market(session, chat_id, args):
     """Quét toàn thị trường tìm tín hiệu LONG/SHORT mạnh nhất (dùng lại cache quét của /analyze nếu còn hạn)."""
-    now = time.time()
-    if (market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < 300):
-        long_signals, short_signals = market_scan_cache["signals"]
-    else:
-        async with market_scan_cache["lock"]:
-            now = time.time()
-            if (market_scan_cache["signals"] is not None and now - market_scan_cache["timestamp"] < 300):
-                long_signals, short_signals = market_scan_cache["signals"]
-            else:
-                long_signals, short_signals = await scan_market_signals(session)
-                market_scan_cache["signals"] = (long_signals, short_signals)
-                market_scan_cache["timestamp"] = time.time()
+    long_signals, short_signals = await get_scan_signals_fresh(session, max_age=300)
 
     # Ghi vào bộ nhớ: các tín hiệu AI quét ra cũng được nhớ (dedup 4h tránh trùng với nguồn scan)
     for sig_res in list(long_signals) + list(short_signals):
@@ -6506,7 +6624,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
 async def check_position_mode(session, api_key, api_secret):
     global hedge_mode
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/positionSide/dual?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -6592,7 +6710,7 @@ async def get_symbol_precisions(session, symbol):
 # Lấy đòn bẩy tối đa của symbol
 async def get_max_leverage(session, api_key, api_secret, symbol):
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&timestamp={timestamp}"
+    query_string = f"symbol={symbol}&timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/leverageBracket?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -6615,7 +6733,7 @@ async def get_max_leverage(session, api_key, api_secret, symbol):
 # Cài đặt đòn bẩy
 async def set_leverage(session, api_key, api_secret, symbol, leverage):
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}"
+    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -6728,7 +6846,16 @@ async def draw_candlestick_chart(session, symbol, interval):
         logger.error(f"Lỗi lấy klines cho {symbol}: {e}")
         raise e
 
-    # 2. Xử lý dữ liệu nến bằng pandas
+    # Render (blocking matplotlib/pandas) trong executor — không chặn WS/command handlers
+    buf = await asyncio.get_running_loop().run_in_executor(
+        None, _render_chart_sync, klines_data, symbol, interval
+    )
+    return buf
+
+
+def _render_chart_sync(klines_data, symbol, interval):
+    """Render chart candlestick (blocking) — chạy trong executor để không chặn event loop."""
+    # Xử lý dữ liệu nến bằng pandas
     df = pd.DataFrame(klines_data, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'number_of_trades',
@@ -6850,7 +6977,7 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
     params = [
         f"symbol={symbol}",
         "algoType=CONDITIONAL",
-        f"timestamp={timestamp}"
+        f"timestamp={timestamp}&recvWindow=10000"
     ]
     query_string = "&".join(params)
     signature = get_binance_signature(query_string, api_secret)
@@ -6875,7 +7002,7 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                             algo_id = order.get('algoId')
                             if algo_id:
                                 del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&algoId={algo_id}&timestamp={del_timestamp}"
+                                del_query = f"symbol={symbol}&algoId={algo_id}&timestamp={del_timestamp}&recvWindow=10000"
                                 del_sig = get_binance_signature(del_query, api_secret)
                                 del_url = f"https://fapi.binance.com/fapi/v1/algoOrder?{del_query}&signature={del_sig}"
                                 
@@ -6896,7 +7023,7 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
         timestamp_reg = int(time.time() * 1000)
         params_reg = [
             f"symbol={symbol}",
-            f"timestamp={timestamp_reg}"
+            f"timestamp={timestamp_reg}&recvWindow=10000"
         ]
         query_reg = "&".join(params_reg)
         sig_reg = get_binance_signature(query_reg, api_secret)
@@ -6920,7 +7047,7 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                             order_id = order.get('orderId')
                             if order_id:
                                 del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}"
+                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}&recvWindow=10000"
                                 del_sig = get_binance_signature(del_query, api_secret)
                                 del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
                                 
@@ -6949,7 +7076,7 @@ async def place_algo_tpsl(session, api_key, api_secret, symbol, order_side, orde
         f"type={order_type}",
         f"triggerPrice={trigger_price}",
         "algoType=CONDITIONAL",
-        f"timestamp={timestamp}"
+        f"timestamp={timestamp}&recvWindow=10000"
     ]
     if quantity is not None:
         params.append(f"quantity={quantity}")
@@ -6973,6 +7100,37 @@ async def place_algo_tpsl(session, api_key, api_secret, symbol, order_side, orde
     except Exception as e:
         logger.error(f"Lỗi khi đặt lệnh {order_type} cho {symbol}: {e}")
         return False, str(e)
+
+
+async def _place_tpsl_safe(session, api_key, api_secret, symbol, pos_side, tpsl_side, otype, trigger, quantity=None, close_position=False):
+    """Đặt TP/SL mới AN TOÀN: đặt mới trước, chỉ hủy TP/SL cũ khi đặt mới bị xung đột (GTE/closePosition).
+    Không hủy-before-place → tránh vị thế trần trụi khi đặt mới thất bại.
+    Lỗi -2022/ReduceOnly (lệnh LIMIT chưa khớp → chưa có vị thế) → thử lại bằng closePosition.
+    Trả về (ok, val)."""
+    ok, val = await place_algo_tpsl(session, api_key, api_secret, symbol,
+                                    order_side=tpsl_side, order_type=otype,
+                                    trigger_price=trigger, pos_side=pos_side,
+                                    quantity=quantity, close_position=close_position)
+    if ok:
+        return True, val
+    val_txt = str(val)
+    if '-2022' in val_txt or 'ReduceOnly' in val_txt:
+        ok, val = await place_algo_tpsl(session, api_key, api_secret, symbol,
+                                        order_side=tpsl_side, order_type=otype,
+                                        trigger_price=trigger, pos_side=pos_side,
+                                        quantity=None, close_position=True)
+        return ok, val
+    if 'GTE' in val_txt or 'closePosition' in val_txt or '-4015' in val_txt:
+        is_tp = (otype == 'TAKE_PROFIT_MARKET')
+        await cancel_existing_tpsl(session, api_key, api_secret, symbol,
+                                   position_side=pos_side,
+                                   cancel_tp=is_tp, cancel_sl=not is_tp)
+        ok, val = await place_algo_tpsl(session, api_key, api_secret, symbol,
+                                        order_side=tpsl_side, order_type=otype,
+                                        trigger_price=trigger, pos_side=pos_side,
+                                        quantity=quantity, close_position=close_position)
+        return ok, val
+    return ok, val
 
 
 async def handle_order_command(session, chat_id, side_type, coin_name, volume_str, price_str=None, tp_price_str=None, sl_price_str=None):
@@ -7063,7 +7221,7 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
         f"side={side}",
         f"type={'LIMIT' if is_limit else 'MARKET'}",
         f"quantity={quantity}",
-        f"timestamp={timestamp}"
+        f"timestamp={timestamp}&recvWindow=10000"
     ]
     if is_limit:
         params.append(f"price={limit_price}")
@@ -7097,20 +7255,8 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                 
                 tp_sl_msg_parts = []
 
-                # Setup mặc định: lệnh không truyền tp=/sl= vẫn luôn có đủ TP + SL
-                # (đối chiếu giá tham chiếu đã biết: limit giá, market giá khớp trung bình).
-                # Dùng hậu tố '%' (không phải giá tuyệt đối) để tính chính xác cả coin giá thấp,
-                # và tránh với suffix 'r' của calculate_tpsl_price.
-                ref_price_for_default = limit_price if is_limit else (avg_price or 0)
-                if DEFAULT_SETUP_ENABLED and not tp_price_str and not sl_price_str and ref_price_for_default > 0:
-                    def_sl_pct = float(DEFAULT_SETUP.get('sl_pct', 2.0))
-                    def_tp_rr = float(DEFAULT_SETUP.get('tp_rr', 2.0))
-                    tp_price_str = f"{def_sl_pct * def_tp_rr}%"
-                    sl_price_str = f"{def_sl_pct}%"
-                    tp_sl_msg_parts.append(
-                        f"ℹ️ *Setup mặc định* (SL {def_sl_pct:.1f}%, "
-                        f"TP {def_tp_rr:.1f}R): áp dụng vì lệnh không chỉ định tp=/sl=."
-                    )
+    # Setup mặc định đã TẮT (người dùng yêu cầu): không truyền tp=/sl= → KHÔNG tự đặt TP/SL.
+    # Đặt TP/SL rõ ràng qua tp=/sl= hoặc /tp /sl /tpsl.
 
                 # Tính toán giá TP/SL nếu có (hỗ trợ %, u, r)
                 final_tp_price = None
@@ -7147,26 +7293,15 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
                     except Exception as e:
                         tp_sl_msg_parts.append(f"❌ *Lỗi tính toán SL '{sl_price_str}':* `{e}`")
 
-                # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
-                if final_tp_price is not None or final_sl_price is not None:
-                    await cancel_existing_tpsl(
-                        session, 
-                        api_key, 
-                        api_secret, 
-                        symbol, 
-                        position_side=pos_side, 
-                        cancel_tp=(final_tp_price is not None), 
-                        cancel_sl=(final_sl_price is not None)
-                    )
-
+                # Đặt TP/SL MỚI TRƯỚC (helper chỉ hủy cái cũ khi xung đột) —
+                # hủy-before-place từng khiến vị thế trần trụi khi đặt mới thất bại
                 tpsl_side = 'SELL' if side_type == 'LONG' else 'BUY'
-                
+
                 # Cài đặt TP nếu có
                 if final_tp_price is not None:
-                    tp_ok, tp_val = await place_algo_tpsl(
-                        session, api_key, api_secret, symbol,
-                        order_side=tpsl_side, order_type="TAKE_PROFIT_MARKET",
-                        trigger_price=final_tp_price, pos_side=pos_side,
+                    tp_ok, tp_val = await _place_tpsl_safe(
+                        session, api_key, api_secret, symbol, pos_side, tpsl_side,
+                        "TAKE_PROFIT_MARKET", final_tp_price,
                         quantity=(quantity if is_limit else None),
                         close_position=(not is_limit)
                     )
@@ -7177,10 +7312,9 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
 
                 # Cài đặt SL nếu có
                 if final_sl_price is not None:
-                    sl_ok, sl_val = await place_algo_tpsl(
-                        session, api_key, api_secret, symbol,
-                        order_side=tpsl_side, order_type="STOP_MARKET",
-                        trigger_price=final_sl_price, pos_side=pos_side,
+                    sl_ok, sl_val = await _place_tpsl_safe(
+                        session, api_key, api_secret, symbol, pos_side, tpsl_side,
+                        "STOP_MARKET", final_sl_price,
                         quantity=(quantity if is_limit else None),
                         close_position=(not is_limit)
                     )
@@ -7221,7 +7355,7 @@ async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
         return
         
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}"
+    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     
     url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
@@ -7254,7 +7388,7 @@ async def handle_orders_command(session, chat_id):
     api_secret = os.getenv("BINANCE_API_SECRET")
     
     timestamp = int(time.time() * 1000)
-    query_string = f"timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/openOrders?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -7408,22 +7542,10 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 results.append(f"   • SL (*{pos_display}*): 🔴 Lỗi tính toán '{sl_price_str}': {e}")
         
         # Tự động hủy TP/SL cũ để tránh lỗi GTE của Binance
-        if final_tp_price is not None or final_sl_price is not None:
-            await cancel_existing_tpsl(
-                session, 
-                api_key, 
-                api_secret, 
-                symbol, 
-                position_side=side, 
-                cancel_tp=(final_tp_price is not None), 
-                cancel_sl=(final_sl_price is not None)
-            )
-            
         if final_tp_price is not None:
-            tp_ok, tp_val = await place_algo_tpsl(
-                session, api_key, api_secret, symbol,
-                order_side=order_side, order_type="TAKE_PROFIT_MARKET",
-                trigger_price=final_tp_price, pos_side=side,
+            tp_ok, tp_val = await _place_tpsl_safe(
+                session, api_key, api_secret, symbol, side, order_side,
+                "TAKE_PROFIT_MARKET", final_tp_price,
                 close_position=True
             )
             if tp_ok:
@@ -7432,10 +7554,9 @@ async def handle_tpsl_command(session, chat_id, coin_name, tp_price_str=None, sl
                 results.append(f"   • TP (*{pos_display}* tại giá *{format_price(final_tp_price)}*): 🔴 Thất bại: `{tp_val}`")
                 
         if final_sl_price is not None:
-            sl_ok, sl_val = await place_algo_tpsl(
-                session, api_key, api_secret, symbol,
-                order_side=order_side, order_type="STOP_MARKET",
-                trigger_price=final_sl_price, pos_side=side,
+            sl_ok, sl_val = await _place_tpsl_safe(
+                session, api_key, api_secret, symbol, side, order_side,
+                "STOP_MARKET", final_sl_price,
                 close_position=True
             )
             if sl_ok:
@@ -7546,7 +7667,7 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
             f"price={dca_price}",
             "timeInForce=GTC",
             f"newClientOrderId={client_order_id}",
-            f"timestamp={timestamp}"
+            f"timestamp={timestamp}&recvWindow=10000"
         ]
         
         if hedge_mode:
@@ -7589,7 +7710,7 @@ async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
         return
         
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&orderId={order_id}&timestamp={timestamp}"
+    query_string = f"symbol={symbol}&orderId={order_id}&timestamp={timestamp}&recvWindow=10000"
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
@@ -7681,7 +7802,20 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
     pos_side = target_pos['positionSide']
     amt = target_pos['positionAmt']
     abs_amt = abs(amt)
-    
+
+    # Lấy size TƯƠI từ REST trước khi đóng: cache WS có thể stale (SL khớp một phần
+    # trong lúc rớt sự kiện) → đóng theo cache sai sẽ mở lệnh ngược chiều (hedge mode)
+    try:
+        fresh, ferr = await get_position_risk(session, {'symbol': symbol})
+        if not ferr and isinstance(fresh, list):
+            for fp in fresh:
+                if (fp.get('positionSide', 'BOTH') == pos_side
+                        and float(fp.get('positionAmt', 0) or 0) != 0.0):
+                    abs_amt = abs(float(fp.get('positionAmt', 0) or 0))
+                    break
+    except Exception as e:
+        logger.warning(f"[CLOSE] Không lấy được size tươi của {symbol}: {e} — dùng cache")
+
     if abs_amt <= 0:
         await send_telegram_message(
             session,
@@ -7699,8 +7833,7 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
         f"side={side}",
         "type=MARKET",
         f"quantity={abs_amt}",
-        f"timestamp={timestamp}",
-        "recvWindow=10000"
+        f"timestamp={timestamp}&recvWindow=10000",
     ]
     
     if pos_side != 'BOTH':
@@ -8187,6 +8320,13 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
     elif command_base in ('/scans', '/scan'):
         await handle_scan_history_command(request.app['session'], chat_id)
 
+    else:
+        if command_base.startswith('/'):
+            await send_telegram_message(
+                request.app['session'], chat_id,
+                f"❓ Lệnh `{command_base}` không hỗ trợ. Gõ /help để xem danh sách lệnh."
+            )
+
     return web.Response(status=200)
 
 
@@ -8328,6 +8468,10 @@ async def on_startup(app):
     app['ai_review_task'] = asyncio.create_task(
         ai_review_loop(app)
     )
+    # Đối chiếu cache vị thế với REST mỗi 5 phút (WS chỉ đẩy delta — miss event = cache sai vĩnh viễn)
+    app['position_reconcile_task'] = asyncio.create_task(
+        position_reconcile_loop(app)
+    )
     _load_auto_state()
 
 async def on_cleanup(app):
@@ -8354,6 +8498,8 @@ async def on_cleanup(app):
         app['tpsl_progress_task'].cancel()
     if 'ai_review_task' in app:
         app['ai_review_task'].cancel()
+    if 'position_reconcile_task' in app:
+        app['position_reconcile_task'].cancel()
         
     if 'session' in app:
         await app['session'].close()
