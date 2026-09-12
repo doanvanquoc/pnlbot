@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 import logging
 import aiohttp
+import yarl
 from aiohttp import web
 from dotenv import load_dotenv
 import io
@@ -1643,8 +1644,9 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
         query = "&".join(params)
         sig = get_binance_signature(query, api_secret)
         url = f"https://fapi.binance.com/fapi/v1/openOrders?{query}&signature={sig}"
-        
-        async with session.get(url, headers=headers) as resp:
+
+        # encoded=True: không để yarl decode/encode lại URL (signature phải khớp chuỗi gửi đi)
+        async with session.get(yarl.URL(url, encoded=True), headers=headers) as resp:
             if resp.status == 200:
                 orders = await resp.json()
                 if isinstance(orders, list):
@@ -1658,8 +1660,8 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
                                 del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}&recvWindow=10000"
                                 del_sig = get_binance_signature(del_query, api_secret)
                                 del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
-                                
-                                async with session.delete(del_url, headers=headers) as del_resp:
+
+                                async with session.delete(yarl.URL(del_url, encoded=True), headers=headers) as del_resp:
                                     del_data = await del_resp.json()
                                     if del_resp.status == 200:
                                         cancelled_count += 1
@@ -2607,14 +2609,14 @@ async def handle_history_command(session, chat_id, coin_name=None):
     ]
     if symbol:
         params.insert(0, f"symbol={symbol}")
-        
+
     query_string = "&".join(params)
     signature = get_binance_signature(query_string, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/income?{query_string}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
-    
+
     try:
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(yarl.URL(url, encoded=True), headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if not data:
@@ -5164,7 +5166,7 @@ async def _auto_place_order(session, best, available):
     signature = get_binance_signature(query, api_secret)
     url = f"https://fapi.binance.com/fapi/v1/order?{query}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
-    async with session.post(url, headers=headers) as resp:
+    async with session.post(yarl.URL(url, encoded=True), headers=headers) as resp:
         data = await resp.json()
     if resp.status != 200:
         err_msg = data.get('msg', f"HTTP {resp.status}")
@@ -5290,7 +5292,7 @@ async def _cancel_algo_sl(session, api_key, api_secret, symbol, algo_id):
         sig = get_binance_signature(query, api_secret)
         url = f"https://fapi.binance.com/fapi/v1/algoOrder?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": api_key}
-        async with session.delete(url, headers=headers) as resp:
+        async with session.delete(yarl.URL(url, encoded=True), headers=headers) as resp:
             data = await resp.json()
             if resp.status == 200:
                 logger.info(f"[AI-TRAIL] Đã hủy SL algo cũ algoId={algo_id} của {symbol}")
@@ -5866,7 +5868,9 @@ async def binance_signed_request(session, method, path, params=None, base_url="h
     url = f"{base_url}{path}?{query}&signature={signature}"
     headers = {"X-MBX-APIKEY": api_key}
     try:
-        async with session.request(method, url, headers=headers) as resp:
+        # encoded=True: yarl KHÔNG decode lại URL. Nếu không, symbol chữ TQ (我踏马来了USDT...)
+        # bị decode %XX → ký tự thô trên dây ≠ chuỗi đã ký → Binance trả lỗi -1022.
+        async with session.request(method, yarl.URL(url, encoded=True), headers=headers) as resp:
             data = await resp.json()
             if resp.status != 200:
                 msg = data.get('msg', f"HTTP {resp.status}") if isinstance(data, dict) else f"HTTP {resp.status}"
