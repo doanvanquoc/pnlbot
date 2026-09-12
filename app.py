@@ -3999,61 +3999,51 @@ async def handle_usage_command(session, chat_id):
     """Lệnh /usage: Usage PLAN MintRouter (dashboard overview qua session) + credit + key usage."""
     data, plan, err = await get_front_overview(session)
     if data:
-        lines = ["📊 *Usage MintRouter — PLAN*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+        sl = data.get('spend_limits') or {}
+        lines = [
+            "📊 *QUOTA PLAN MINTROUTER*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
         if plan:
             lines.append(f"🎫 Plan: *{plan}*")
-        sl = data.get('spend_limits') or {}
-        lim = data.get('limits') or {}
-        # Quota 24h của plan (Basic $35/ngày) — admin cap đang bật
-        cap_24h = _fmt_micros(sl.get('cap_24h_suggested_default_micros'))
-        if sl.get('cap_24h_admin_active') or sl.get('cap_24h_enabled'):
-            quota_line = f"Quota 24h: {cap_24h}"
-        else:
-            quota_line = "Quota 24h: không giới hạn"
-        lines.append(f"⏱ 5h qua: {_fmt_micros(sl.get('spend_5h_micros'))} | "
-                     f"24h: {_fmt_micros(sl.get('spend_24h_micros'))} | {quota_line}")
-        lines.append(f"📅 7 ngày: {_fmt_micros(sl.get('spend_7d_micros'))}")
+        # Quota mặc định của plan (Basic: $35/ngày, $240/tuần) — enforce bởi admin cap
+        cap_5h_def = sl.get('cap_5h_suggested_default_micros') or 0
+        cap_24h_def = sl.get('cap_24h_suggested_default_micros') or 0
+        cap_7d_def = sl.get('cap_7d_suggested_default_micros') or 0
+
+        def _row(label, spent_key, cap_def, enforced):
+            spent = float(sl.get(spent_key, 0) or 0)
+            if enforced and cap_def > 0:
+                pct = spent / cap_def * 100
+                emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
+                return (f"{emoji} {label}: {_fmt_micros(spent)} / {_fmt_micros(cap_def)} "
+                        f"({pct:.1f}%) — còn {_fmt_micros(max(cap_def - spent, 0))}")
+            return f"🟢 {label}: {_fmt_micros(spent)} (không giới hạn)"
+
+        lines.append(_row("Quota 5 giờ", 'spend_5h_micros', cap_5h_def, sl.get('cap_5h_admin_active')))
+        lines.append(_row("Quota NGÀY", 'spend_24h_micros', cap_24h_def, sl.get('cap_24h_admin_active')))
+        lines.append(_row("Quota TUẦN", 'spend_7d_micros', cap_7d_def,
+                          sl.get('cap_7d_admin_active') or sl.get('cap_24h_admin_active')))
         kpi = data.get('kpi') or {}
         lines.append(
             f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
             f"{int(kpi.get('total_tokens', 0)):,} token, "
-            f"thành công {kpi.get('success_rate', 0):.0f}%, "
-            f"cache-hit {kpi.get('cache_hit_rate', 0):.0f}%"
+            f"thành công {kpi.get('success_rate', 0):.0f}%"
         )
-        # Giá trị plan: provider cost MTD vs đã được plan bao vs tự trả
-        mtd_provider = _fmt_micros(kpi.get('mtd_provider_cost_micros'))
-        mtd_covered = _fmt_micros(kpi.get('mtd_pass_covered_micros'))
-        mtd_paid = _fmt_micros(kpi.get('mtd_cost_micros'))
-        lines.append(f"🎁 Tháng này: API trị giá {mtd_provider} — plan đã bao {mtd_covered} — tự trả {mtd_paid}")
-        avail = lim.get('available') if lim.get('available') is not None else lim.get('extra_credit')
-        if avail is not None:
-            lines.append(f"💰 Credit khả dụng: {_fmt_micros(lim.get('available_micros'))}"
-                         + (" ⚠️ sắp cạn!" if float(lim.get('available', 1) or 1) < 2.0 else ""))
-        local_block = _fmt_llm_usage_days(7)
-        if local_block:
-            lines.append("\n🤖 Bot tự đếm (7 ngày, đối chiếu):\n" + local_block)
         await send_telegram_message(session, chat_id, "\n".join(lines))
         return
     # Fallback: key-usage công khai + local stats
     key_data, kerr = await get_go_usage(session)
-    lines = ["📊 *Usage MintRouter.ai*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📊 *Usage MintRouter (key)*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
     if err:
-        lines.append(f"⚠️ Không lấy được plan usage: {err}")
+        lines.append(f"⚠️ Không lấy được quota plan: {err}")
     if key_data:
-        balance = key_data.get('balance') or {}
-        try:
-            available = float(balance.get('available_micros', 0)) / 1_000_000
-            lines.append(f"💰 Credit khả dụng: *${available:,.2f}*")
-        except (TypeError, ValueError):
-            pass
         usage = key_data.get('usage') or {}
         for label, key in (("Hôm nay", 'today'), ("7 ngày", 'rolling_7d'), ("30 ngày", 'rolling_30d')):
             w = usage.get(key) or {}
             if isinstance(w, dict):
                 spend = float(w.get('spend_micros', 0)) / 1_000_000
                 lines.append(f"• {label}: {w.get('requests', 0)} request, {int(w.get('total_tokens', 0)):,} token, ${spend:,.4f}")
-        if float(balance.get('available_micros', 0) or 0) / 1_000_000 < 2.0:
-            lines.append("⚠️ *Số dư sắp cạn — nạp thêm trên mintrouter.ai!*")
     elif kerr:
         lines.append(f"⚠️ Không lấy được key usage: {kerr}")
     local_block = _fmt_llm_usage_days(7)
