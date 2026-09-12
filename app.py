@@ -4115,7 +4115,7 @@ async def handle_usage_command(session, chat_id):
             if limit <= 0:
                 return f"🟢 {label}: ${used:,.2f}"
             pct = used / limit * 100
-            emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
+            emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 50 else "🟩")
             return f"{emoji} {label}: ${used:,.2f}/${limit:,.0f} ({pct:.0f}%)" + tail
 
         lines.append(_row("Ngày", pass_data.get('daily')))
