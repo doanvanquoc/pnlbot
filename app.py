@@ -243,18 +243,19 @@ def record_scan(kind, coins):
     save_scan_history()
 
 def get_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
-    """Thống kê win/loss theo band độ tin cậy (4⭐/5⭐) trong `days` ngày gần nhất.
+    """Thống kê win/loss/expired theo band độ tin cậy (4⭐/5⭐) trong `days` ngày gần nhất.
     Chỉ tính tín hiệu 4-5 sao (Mạnh/Rất mạnh) — bỏ qua tín hiệu yếu (Trung bình/Yếu)
-    phát sinh từ /a <coin> hoặc /ai chat để không làm sai lệch win-rate hiển thị."""
+    phát sinh từ /a <coin> hoặc /ai chat để không làm sai lệch win-rate hiển thị.
+    'expired' = tín hiệu không chạm TP/SL trong 72h (TP 1:1 quá xa/đi sideway)."""
     cutoff = time.time() - days * 86400
     stats = {}
     for s in signal_history:
-        if (s.get('status') not in ('win', 'loss') or s.get('ts', 0) < cutoff
+        if (s.get('status') not in ('win', 'loss', 'expired') or s.get('ts', 0) < cutoff
                 or s.get('confidence') not in ('Mạnh', 'Rất mạnh')):
             continue
         band = '5⭐' if s.get('confidence') == 'Rất mạnh' else '4⭐'
-        st = stats.setdefault(band, {'win': 0, 'loss': 0})
-        st['win' if s['status'] == 'win' else 'loss'] += 1
+        st = stats.setdefault(band, {'win': 0, 'loss': 0, 'expired': 0})
+        st['expired' if s['status'] == 'expired' else s['status']] += 1
     return stats
 
 def format_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
@@ -266,9 +267,10 @@ def format_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
     for band in ('5⭐', '4⭐'):
         if band in stats:
             st = stats[band]
-            total = st['win'] + st['loss']
-            wr = st['win'] / total * 100
-            parts.append(f"{band} {st['win']}/{total} ({wr:.0f}%)")
+            decided = st['win'] + st['loss']
+            total = decided + st['expired']
+            wr = st['win'] / decided * 100 if decided else 0.0
+            parts.append(f"{band} {st['win']}W/{st['loss']}L ({wr:.0f}%{f', hết hạn {st['expired']}' if st['expired'] else ''})")
     if not parts:
         return ""
     return f"📈 *Win-rate thực tế {days} ngày:* " + " | ".join(parts)
@@ -580,15 +582,18 @@ def build_ai_digest(symbol, timeframe_results, oi_change=None, taker_ratio=None,
     return "\n".join(lines)
 
 async def get_ai_verdict_cached(session, cache_key, digest):
-    """Gọi AI có cache TTL 10 phút để tiết kiệm usage."""
+    """Gọi AI có cache TTL 10 phút để tiết kiệm usage.
+    Key cache gắn thêm hash digest: digest đổi (giá/điểm mới) → verdict mới, không dùng kết luận cũ."""
     now = time.time()
-    cached = ai_verdict_cache.get(cache_key)
+    digest_hash = hashlib.md5(digest.encode('utf-8')).hexdigest()[:8]
+    full_key = f"{cache_key}_{digest_hash}"
+    cached = ai_verdict_cache.get(full_key)
     if cached and now - cached['ts'] < AI_CACHE_TTL:
         return cached['verdict']
     lessons = await get_ai_lessons(session)
     verdict = await get_ai_analysis(session, digest, lessons=lessons)
     if verdict:
-        ai_verdict_cache[cache_key] = {'verdict': verdict, 'ts': now}
+        ai_verdict_cache[full_key] = {'verdict': verdict, 'ts': now}
     return verdict
 
 
@@ -598,8 +603,12 @@ ai_lessons_state = {'text': None, 'ts': 0, 'resolved_count': -1}
 ai_lessons_lock = asyncio.Lock()
 
 def build_signal_lessons_digest():
-    """Dựng digest từ lịch sử tín hiệu đã kết thúc (win/loss) để AI rút bài học."""
-    resolved = [s for s in signal_history if s.get('status') in ('win', 'loss')]
+    """Dựng digest từ lịch sử tín hiệu đã kết thúc (win/loss) để AI rút bài học.
+    Chỉ dùng tín hiệu 4-5 sao (Mạnh/Rất mạnh) — đúng population quét/auto,
+    tránh tín hiệu 1-3⭐ từ /a <coin> hay /ai chat làm sai lệch bài học."""
+    resolved = [s for s in signal_history
+                if s.get('status') in ('win', 'loss')
+                and s.get('confidence') in ('Mạnh', 'Rất mạnh')]
     if len(resolved) < 5:
         return None
     wins = sum(1 for s in resolved if s['status'] == 'win')
@@ -2452,15 +2461,6 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         # Volume quá thấp → tín hiệu yếu, penalty
         long_score *= 0.7
         short_score *= 0.7
-        
-    # ═══ Volume confirmation đặc biệt (Multiplier) ═══
-    if vol_ratio >= 1.8:
-        if long_score > short_score:
-            long_score *= 1.15
-        elif short_score > long_score:
-            short_score *= 1.15
-    elif vol_ratio < 0.6:
-        # volume cực thấp, hạ thêm điểm tin cậy
         long_score *= 0.85
         short_score *= 0.85
         
@@ -2498,12 +2498,12 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         elif funding_rate_val <= -0.00075:
             short_score *= 0.85
         
-    # ═══ PENALTY: Tín hiệu mâu thuẫn ═══
-    # Nếu MACD bearish nhưng RSI bullish (hoặc ngược lại) → giảm điểm
+    # ═══ PENALTY: Tín hiệu mâu thuẫn (logic MOMENTUM: RSI cao = động lượng tăng) ═══
+    # MACD đang tăng nhưng RSI yếu (hoặc ngược lại) → động lượng chưa đồng thuận, hạ điểm
     macd_bullish = hist_val > 0
-    rsi_bullish = rsi_val < 45
+    rsi_bullish = rsi_val > 55
     macd_bearish = hist_val < 0
-    rsi_bearish = rsi_val > 55
+    rsi_bearish = rsi_val < 45
     if macd_bullish and rsi_bearish:
         long_score *= 0.8
     if macd_bearish and rsi_bullish:
@@ -2571,11 +2571,15 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         sl_price = close_price - (atr_val * 1.5)
         if sl_price <= 0 or sl_price >= close_price:
             sl_price = close_price * 0.97
-        # SL không vượt quá support gần nhất (nếu support gần)
+        # Chỉ siết SL về dưới support khi support GẦN (trên ATR SL):
+        # support là đáy 50 nến, kéo SL xuống đáy xa làm TP 1:1 viển vông → 27% tín hiệu hết hạn 72h.
         if support > 0 and support < close_price:
             sl_from_support = support - (atr_val * 0.3)
-            if sl_from_support > 0:
-                sl_price = min(sl_price, sl_from_support)
+            if sl_from_support > sl_price:
+                sl_price = sl_from_support
+        # SL không vượt quá 20% giá — TP 1:1 xa hơn thế gần như không bao giờ chạm
+        if sl_price < close_price * 0.80:
+            sl_price = close_price * 0.80
         risk = close_price - sl_price
         tp_price = close_price + (risk * rr_ratio)
         
@@ -2583,10 +2587,13 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
         sl_price = close_price + (atr_val * 1.5)
         if sl_price <= close_price:
             sl_price = close_price * 1.03
-        # SL không vượt quá resistance gần nhất
+        # Chỉ siết SL về trên resistance khi resistance GẦN (trong 1.5×ATR)
         if resistance > 0 and resistance > close_price:
             sl_from_resistance = resistance + (atr_val * 0.3)
-            sl_price = max(sl_price, sl_from_resistance)
+            if sl_from_resistance < sl_price:
+                sl_price = sl_from_resistance
+        if sl_price > close_price * 1.20:
+            sl_price = close_price * 1.20
         risk = sl_price - close_price
         tp_price = close_price - (risk * rr_ratio)
         if tp_price <= 0:
@@ -2648,13 +2655,24 @@ async def scan_market_signals(session):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
-    
+
+    # Loại cổ phiếu/hàng hóa giao dịch theo phiên (không 24/7): EMA stack + volume 24h
+    # của các symbol này gây tín hiệu rác trong quét (AAPL/MSTR/SOXL/XAU... xuất hiện trong live history)
+    SCAN_BLACKLIST = {
+        'AAPLUSDT', 'NVDAUSDT', 'MSTRUSDT', 'TSLAUSDT', 'GOOGLUSDT', 'AMZNUSDT', 'METAUSDT',
+        'MSFTUSDT', 'COINUSDT', 'NFLXUSDT', 'AVGOUSDT', 'ORCLUSDT', 'PLTRUSDT', 'HOODUSDT',
+        'CRCLUSDT', 'SBUXUSDT', 'MCDUSDT', 'DISUSDT', 'BAUSDT', 'INTCUSDT', 'AMDUSDT',
+        'SPXUSDT', 'SPYUSDT', 'QQQUSDT', 'DIAUSDT', 'IWMUSDT', 'SOXLUSDT', 'SOXSUSDT',
+        'TSLLUSDT', 'TSLQUSDT', 'GOOGUSDT', 'SHOPUSDT', 'ABNBUSDT', 'UBERUSDT',
+        'XAUUSDT', 'XAGUSDT', 'BZUSDT', 'CLUSDT', 'NGUSDT', 'GCSIUSDT', 'WTIUSDT', 'XPTUSDT',
+    }
+
     coins_to_scan = []
     try:
         async with session.get(url_ticker, headers=headers) as resp:
             if resp.status == 200:
                 tickers = await resp.json()
-                usdt_tickers = [t for t in tickers if t['symbol'].endswith('USDT')]
+                usdt_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and t['symbol'] not in SCAN_BLACKLIST]
                 # Sắp xếp theo quoteVolume 24h giảm dần
                 usdt_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
                 coins_to_scan = [t['symbol'] for t in usdt_tickers[:75]]
@@ -2948,10 +2966,10 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
             
             # Mô tả chỉ báo
             rsi_str = f"{res['rsi']:.1f}"
-            rsi_desc = "Quá bán 🟢" if res['rsi'] <= 30 else ("Quá mua 🔴" if res['rsi'] >= 70 else "Trung tính")
+            rsi_desc = "Quá bán ⚠️ (rủi ro rơi tiếp)" if res['rsi'] <= 30 else ("Quá mua ⚠️ (rủi ro bật lại)" if res['rsi'] >= 70 else "Trung tính")
             
             stoch_str = f"K:{res['stoch_k']:.1f} D:{res['stoch_d']:.1f}"
-            stoch_desc = "Quá bán 🟢" if res['stoch_k'] <= 20 else ("Quá mua 🔴" if res['stoch_k'] >= 80 else "Trung tính")
+            stoch_desc = "Quá bán ⚠️" if res['stoch_k'] <= 20 else ("Quá mua ⚠️" if res['stoch_k'] >= 80 else "Trung tính")
             
             if res['close'] > res['ema9'] > res['ema21'] > res['ema50']:
                 ema_desc = "Uptrend 🟢"
@@ -2965,7 +2983,7 @@ async def handle_analyze_command(session, chat_id, coin_name=None):
                 ema_desc = "Sideway"
             
             bb_pct_str = f"{res['bb_pct'] * 100:.0f}%"
-            bb_desc = "Chạm biên dưới 🟢" if res['bb_pct'] <= 0.05 else ("Chạm biên trên 🔴" if res['bb_pct'] >= 0.95 else "Trung tính")
+            bb_desc = "Chạm biên dưới ⚠️ (rủi ro rơi tiếp)" if res['bb_pct'] <= 0.05 else ("Chạm biên trên ⚠️ (rủi ro bật lại)" if res['bb_pct'] >= 0.95 else "Trung tính")
             
             macd_hist_str = f"{res['hist']:+,.4f}".rstrip('0').rstrip('.')
             macd_desc = "Bullish" if res['hist'] > 0 else "Bearish"
@@ -3532,8 +3550,9 @@ AUTO_TRAIL_MIN_RR = 0.25          # Chỉ cập nhật SL khi cải thiện ≥ 
 AUTO_TRAIL_CHECK_SEC = 30         # Chu kỳ kiểm tra (giây)
 
 # ─── Chốt lời một phần (partial TP) cho vị thế auto — backtest xác nhận EV/R tăng ───
-# Trail + partial TP 2.0R (50%): EV +0.15 vs +0.12, PF 1.53 vs 1.42 (top 75, 500 bars)
-AUTO_PARTIAL_TP_RR = 2.0          # Đạt +2.0R → chốt 50% khối lượng, phần còn lại chạy tiếp
+# Sweep (6 coin × 2000 nến 1h): partial 1.5R (50%) EV +0.11 / PF 1.39 / MaxDD 5.94R
+# so với 2.0R: EV +0.11 / PF 1.36 / MaxDD 6.19R → 1.5R chốt sớm hơn, drawdown thấp hơn.
+AUTO_PARTIAL_TP_RR = 1.5          # Đạt +1.5R → chốt 50% khối lượng, phần còn lại chạy tiếp
 AUTO_PARTIAL_TP_PCT = 0.5         # Tỷ lệ chốt sớm
 AUTO_MAX_HOLD_HOURS = 72          # Vị thế auto mở quá 72h (khớp MAX_HOLD_BARS của backtest) → đóng thị trường
 
@@ -3698,7 +3717,7 @@ async def _auto_place_order(session, best, available):
         sl_dist = abs(price_ref - float(best['sl'])) / price_ref
         max_loss_per_notional = min(sl_dist, 0.5 / use_lev) if use_lev > 1 else sl_dist
         risk_cap = (0.20 * available) / max_loss_per_notional if max_loss_per_notional > 0 else None
-        margin_cap = 0.20 * available * use_lev
+        margin_cap = 0.20 * available
         for notional in (200, 400, 800):
             if (risk_cap is None or notional <= risk_cap) and notional / use_lev <= margin_cap:
                 chosen_notional = notional
@@ -3748,7 +3767,6 @@ async def _auto_place_order(session, best, available):
         )
         return False
 
-    record_signal(best, best.get('ai'), origin='auto')
     # 5. Tự đặt TP/SL điều kiện (algo service) — SL theo thanh lý + số dư, TP theo R:R
     close_side = 'SELL' if side == 'BUY' else 'BUY'
     is_long_pos = (close_side == 'SELL')
@@ -3777,6 +3795,12 @@ async def _auto_place_order(session, best, available):
     else:
         tp_capped = False
     tp_trig = round_price_step(tp_trig, tick_size, price_p)
+    # Ghi lịch sử tín hiệu với TP/SL THỰC TẾ (đã clamp thanh lý + cap TP) để
+    # win-rate trong stats khớp đúng lệnh auto đã đặt, không phải TP/SL gốc của scan
+    best['tp'] = tp_trig
+    best['sl'] = sl_trig
+    best['close'] = price_ref
+    record_signal(best, best.get('ai'), origin='auto')
     sl_algo_id = None
     tp_algo_id = None
     tpsl_results = []
@@ -3820,7 +3844,7 @@ async def _auto_place_order(session, best, available):
         f"🤖⚡ *AI TỰ ĐỘNG VÀO LỆNH*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 {signal_desc}\n"
-        f"💵 Volume: {chosen_notional} USDT (đòn bẩy {max_lev}x)\n"
+        f"💵 Volume: {chosen_notional} USDT (đòn bẩy {use_lev}x)\n"
         f"📦 Quantity: {quantity:.{qty_p}f}\n"
         f"OrderId: `{data.get('orderId')}` | Status: {data.get('status')}"
         f"{tpsl_block}"
@@ -4065,7 +4089,8 @@ async def ai_auto_trader_loop(app):
                 market_scan_cache["signals"] = (long_signals, short_signals)
                 market_scan_cache["timestamp"] = time.time()
 
-            # 2. Lọc tín hiệu "CỰC LỚN": CHỈ 5 sao (Rất mạnh) + điểm ≥ AI_AUTO_MIN_SCORE + nhóm có win-rate OK.
+            # 2. Lọc tín hiệu "CỰC LỚN": CHỈ 4-5 sao (Mạnh/Rất mạnh) + điểm ≥ ngưỡng + nhóm có win-rate OK.
+            # (Lưu ý: live 4-5⭐: LONG 52%, SHORT 71% decided — số backtest 70%/37.5% cũ trong comment là prior cũ)
             quasi = [s for s in (list(long_signals) + list(short_signals))
                      if s.get('confidence') in ('Mạnh', 'Rất mạnh') and band_winrate_ok(s.get('confidence'))]
             def _auto_score(s):
@@ -5345,7 +5370,7 @@ TOOL_EXECUTORS = {
 }
 
 
-async def get_ai_agent_response(session, messages, tools, max_tokens=3000, timeout_s=150, session_id=None):
+async def get_ai_agent_response(session, messages, tools, max_tokens=6000, timeout_s=150, session_id=None):
     """Một lượt gọi LLM hỗ trợ tool calling. Trả về (message_dict, None) khi OK hoặc (None, error_detail) khi lỗi."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
@@ -5719,37 +5744,31 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
 
         system_prompt = (
             "Bạn là trợ lý giao dịch crypto futures có quyền truy cập dữ liệu tài khoản Binance của người dùng qua các công cụ. "
-            "Hãy chủ động dùng công cụ khi cần dữ liệu mới nhất (số dư, vị thế, lệnh, thu nhập) thay vì đoán. "
-            "Khi người dùng muốn tìm cơ hội/coin tốt: gọi scan_market, chọn tín hiệu tốt nhất (ưu tiên confidence cao, R:R tốt, "
-            "khớp với tài khoản hiện có) và trình bày lý do lựa chọn. "
-            "Khi người dùng nói lệnh theo giá trị USDT (vd 'long 400u'): tính quantity = giá trị / giá entry lấy từ scan_market "
-            "hoặc giá mark từ get_positions, và ghi rõ phép tính trong câu trả lời. "
-            "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ đọc, (2) gọi công cụ soạn lệnh, "
+            "Hãy chủ động dùng công cụ khi cần dữ liệu MỚI nhất (số dư, vị thế, giá, lệnh) — ngữ cảnh trong tin nhắn có thể đã cũ, "
+            "đừng phụ thuộc hoàn toàn vào nó khi số liệu quan trọng cho quyết định tiền thật. "
+            "MẶC ĐỊNH mỗi câu hỏi là PHÂN TÍCH: trả lời ngắn gọn (tối đa ~10 dòng) nêu rõ: hướng, tín hiệu hệ thống ủng hộ "
+            "(kèm điểm + số sao), TP/SL đề xuất, rủi ro chính. Nếu trong ngữ cảnh có nhận định AI (ai score) THIẾU hoặc "
+            "NGƯỢC chiều tín hiệu → nói thẳng điều đó, tuyệt đối không nói 'AI xác nhận' khi thực tế không có xác nhận. "
+            "CHỈ soạn lệnh bằng công cụ khi người dùng YÊU CẦU đặt/vào lệnh, hoặc đồng ý rõ ràng với đề xuất của bạn. "
+            "Câu hỏi thuần phân tích (xu hướng, nên vào không, vì sao tăng) → KHÔNG soạn lệnh. "
+            "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ, (2) gọi công cụ soạn lệnh, "
             "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
-            "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy "
-            "(hệ thống tự set đòn bẩy max cho symbol khi thực thi) — nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
+            "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy — "
+            "nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
             "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional (giá trị vị thế thực, đã tính đòn bẩy) CHỈ được chọn 1 trong 3 mức: 200, 400 hoặc 800 USDT — "
-             "đây là quy tắc BẮT BUỘC, hệ thống sẽ TỪ CHỐI lệnh nếu volume nằm ngoài 3 mức này. "
-             "Phải TÍNH TOÁN RỦI RO THẬT, tuyệt đối không thấy số dư đủ là chọn mức to nhất: "
-             "lỗ khi SL khớp = notional × (khoảng cách SL so với entry) và không được vượt ~20% số dư khả dụng; "
-             "margin cần = notional / đòn bẩy và không được vượt ~25% số dư khả dụng (đòn bẩy cao thì thanh lý đến rất sớm — "
-             "khoảng cách thanh lý ≈ 100%/đòn bẩy, ví dụ 20x chỉ chịu được ~5%). "
-             "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo người dùng rõ lý do. "
-             "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
-             "QUY TẮC TP/SL: khoảng cách TP và SL tính từ giá entry không được quá gần (~1%) và không được quá xa — "
-             "volume 200 → TP/SL ≤ ~20%, volume 400 → ≤ ~15%, volume 800 → ≤ ~10%; hệ thống sẽ TỪ CHỐI TP/SL ngoài khoảng ~1%–20%. "
-             "Đặt đòn bẩy CAO NHẤT an toàn (hệ thống tự set) để giảm ký quỹ. "
-            "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
-            "QUAN TRỌNG: khi câu trả lời có đề xuất lệnh cụ thể (coin, hướng, giá entry/TP/SL, quantity), hãy SOẠN NGAY các lệnh đó bằng "
-            "place_order cùng lúc với việc trình bày đề xuất — đừng chờ người dùng trả lời thêm một vòng. Việc soạn KHÔNG đặt lệnh thật nên vô hại; "
-            "người dùng không thích thì bấm Hủy hoặc bỏ qua (tự hết hạn). Chỉ không soạn khi trả lời thuần phân tích/kiến thức, không kèm đề xuất lệnh cụ thể. "
+            "quy tắc BẮT BUỘC, hệ thống sẽ TỪ CHỐI lệnh ngoài 3 mức này. "
+            "Tính rủi ro thật: lỗ khi SL khớp = notional × (khoảng cách SL so với entry) ≤ ~20% số dư khả dụng; "
+            "margin cần = notional / đòn bẩy ≤ ~25% số dư khả dụng (đòn bẩy cao → thanh lý sớm, khoảng cách ≈ 100%/đòn bẩy). "
+            "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo rõ lý do. "
+            "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
+            "QUY TẮC TP/SL: lệnh mở mới PHẢI soạn ĐỦ 3 lệnh: (1) vào vị thế, (2) TP điều kiện TAKE_PROFIT_MARKET reduceOnly, "
+            "(3) SL điều kiện STOP_MARKET reduceOnly. Có dữ liệu analyze_coin/scan_market thì DÙNG TP/SL hệ thống đề xuất. "
+            "Tự tính: SL = dưới support − 0.3×ATR (LONG) / trên resistance + 0.3×ATR (SHORT), không có S/R rõ thì entry ± 1.5×ATR; "
+            "TP = entry ± đúng khoảng cách SL (R:R 1:1 — khớp engine, đã backtest là cấu hình edge dương duy nhất). "
+            "Khoảng cách TP/SL từ entry phải ≥ ~1% và ≤ ~20% (volume 800 → ≤ ~10%, volume 400 → ≤ ~15%); "
+            "hệ thống sẽ TỪ CHỐI TP/SL ngoài khoảng này — đừng soạn lệnh chắc chắn bị từ chối. "
             "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
-            "QUY TẮC BẮT BUỘC - LUÔN ĐỦ 3 LỆNH: khi soạn lệnh MỞ vị thế mới (MARKET hoặc LIMIT), PHẢI soạn ngay cùng lúc "
-            "ĐỦ 3 lệnh: (1) lệnh vào vị thế, (2) lệnh TP điều kiện TAKE_PROFIT_MARKET reduce_only, (3) lệnh SL điều kiện STOP_MARKET reduce_only — "
-            "đừng bao giờ chỉ soạn lệnh vào mà thiếu TP/SL. Cách tính TP/SL theo biến động của coin: "
-            "SL đặt dưới support gần nhất trừ 0.3×ATR (LONG) hoặc trên resistance cộng 0.3×ATR (SHORT); không có S/R rõ thì SL = entry ± 1.5×ATR; "
-            "TP = entry ± (khoảng cách SL × 1.5 đến 2) — ưu tiên R:R ≥ 1.5. "
-            "SL phải đảm bảo lỗ khi khớp ≤ 20% số dư khả dụng. Khi có dữ liệu analyze_coin/scan_market thì DÙNG LUÔN TP/SL hệ thống đề xuất. "
+            "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
             "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
             "hỏi về TIN TỨC/sự kiện/lý do coin tăng giảm/tin cộng đồng -> search_news (kết quả chỉ tham khảo, không phải tín hiệu); "
@@ -5757,20 +5776,15 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "QUAN TRỌNG về TP/SL: TP/SL của vị thế thường là lệnh ĐIỀU KIỆN riêng (STOP_MARKET/TAKE_PROFIT_MARKET qua Algo Service), "
             "KHÔNG gắn trên vị thế. Khi đánh giá vị thế có TP/SL hay chưa, PHẢI xem kết quả get_open_orders hoặc phần 'TP/SL điều kiện' "
             "trong get_positions — đừng kết luận 'không có SL' chỉ vì phần vị thế không hiển thị TP/SL. "
-            "MỖI lượt gọi công cụ, phần content của bạn BẮT BUỘC phải là MỘT câu ngắn tiếng Việt tự nhiên (dưới 120 ký tự) "
-            "mô tả CHÍNH XÁC việc bạn đang làm ngay lúc đó và lý do, viết như người thật đang kể tiến trình "
-            "(vd: 'Để t tra giá và phân tích btc đã', 'Giờ t kiểm tra số dư và vị thế trước đã', 'Đang quét thị trường tìm coin ngon, hơi lâu xíu'). "
-            "KHÔNG được bỏ trống content khi gọi công cụ — câu này được hiển thị cho người dùng như tiến trình làm việc. "
-            "Nếu cần nhiều công cụ, hãy KỂ TỪNG BƯỚC một (mỗi lượt một câu tiến trình khác nhau) thay vì gộp chung. "
+            "MỖI lượt gọi công cụ, content của bạn là MỘT câu ngắn tiếng Việt (dưới 120 ký tự) mô tả đúng việc đang làm "
+            "(vd: 'Để t tra giá và phân tích btc đã', 'Giờ t kiểm tra số dư và vị thế trước đã'). KHÔNG bỏ trống content khi gọi công cụ. "
             "Bạn có bộ nhớ hội thoại: các lượt trao đổi gần đây được cung cấp, hãy dùng nó để hiểu câu hỏi nối tiếp "
             "(vd 'vậy đặt đi', 'còn coin khác không') thay vì hỏi lại từ đầu. "
             "Khi người dùng nhắc 'coin này/2 coin này/mấy coin này/coin đầu tiên' mà trong ngữ cảnh có mục "
             "'Tín hiệu vừa báo trong tin AI QUÉT MỖI 30 PHÚT gần nhất' (có đánh số), hãy hiểu chúng là các coin vừa liệt kê ở đó — "
             "KHÔNG hỏi lại người dùng 'coin nào' mà hãy phân tích/soạn lệnh ngay cho đúng coin được ám chỉ. "
-            "Bạn là agent làm việc THAY người dùng: chủ động, quyết đoán, đề xuất phương án tốt nhất thay vì chỉ trả lời thụ động. "
             "QUAN TRỌNG - TRẢ LỜI NHANH: gộp các công cụ độc lập vào CÙNG MỘT lượt gọi; "
-            "chỉ dùng nhiều nhất 2-3 lượt gọi công cụ cho mỗi câu hỏi — dữ liệu ban đầu (giá, số dư, vị thế, lệnh chờ) "
-            "đã có sẵn trong ngữ cảnh, đừng gọi lại tool nếu câu trả lời có thể dựa vào đó. "
+            "chỉ dùng nhiều nhất 2-3 lượt gọi công cụ cho mỗi câu hỏi — đừng gọi lại tool nếu câu trả lời có thể dựa vào dữ liệu đã có. "
             "Nếu người dùng gửi kèm hình ảnh, hãy mô tả/phân tích nó (chart, giao dịch, thông báo lỗi, tin tức...) "
             "kết hợp với dữ liệu thị trường và tài khoản nếu liên quan. "
             "Trả lời tiếng Việt, ngắn gọn, thực dụng, không dùng ký tự markdown (*, _, `)."
@@ -5863,7 +5877,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
                 for tid, res in tool_results:
                     if isinstance(res, Exception):
                         res = f"LỖI khi gọi tool: {res}"
-                    messages.append({"role": "tool", "tool_call_id": tid, "content": str(res)[:2000]})
+                    messages.append({"role": "tool", "tool_call_id": tid, "content": str(res)[:3500]})
                 continue
             final_text = (msg.get('content') or '').strip()
             break
