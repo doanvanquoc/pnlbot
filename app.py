@@ -3998,7 +3998,7 @@ def _fmt_micros(v):
         return "?"
 
 
-async def get_front_pass(session):
+async def get_front_pass(session, force=False):
     """Quota PLAN thật từ /v0/front/pass (daily/weekly used-limit + reset_at). Cache 5 phút.
     Quota đếm theo GIÁ TRỊ OFFICIAL/pass-covered — KHÁC với spend_limits (metered $)."""
     now = time.time()
