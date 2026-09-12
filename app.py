@@ -4345,6 +4345,13 @@ def _save_auto_state():
         logger.error(f"Lỗi lưu auto_state: {e}")
 
 
+def _ai_features_paused():
+    """True khi người dùng đã tắt TẤT CẢ auto AI (/stopai).
+    Chỉ tắt các loop AI (auto-trader, alert 30p, pos guard, review 6h) —
+    /auto, /autopnl, cảnh báo tiến độ TP/SL vẫn chạy bình thường."""
+    return time.time() < AUTO_STATE.get('features_off_until', 0)
+
+
 async def _fetch_algo_tpsl_map(session):
     """Lấy TP/SL điều kiện đang treo của mọi symbol: {symbol: [('TP'|'SL', trigger_price, qty)]}."""
     tpsl_map = {}
@@ -4446,15 +4453,33 @@ async def handle_risk_command(session, chat_id):
 
 
 async def handle_stopauto_command(session, chat_id, arg=None):
-    """Lệnh /stopauto: kill switch — dừng AI tự trade 24h ngay lập tức.
-    /stopauto        → dừng AI tự vào lệnh trong 24h
-    /stopauto close  → dừng + ĐÓNG luôn các vị thế AI tự mở
-    /stopauto off    → bật lại AI tự trade (bỏ kill switch)"""
+    """Lệnh /stopauto: kill switch AI.
+    /stopauto        → dừng AI TỰ VÀO LỆNH 24h
+    /stopauto all    → TẮT TẤT CẢ auto AI: auto-trade + alert 30p + pos-guard + review 6h
+                       (lệnh tay, /auto, /autopnl, cảnh báo TP/SL vẫn chạy bình thường)
+    /stopauto close  → dừng AI + ĐÓNG luôn các vị thế AI tự mở
+    /stopauto off    → bật lại mọi auto AI (bỏ kill switch + pause toàn bộ)"""
     arg = (arg or '').strip().lower()
     if arg == 'off':
         AUTO_STATE['circuit_break_until'] = 0.0
+        AUTO_STATE['features_off_until'] = 0.0
         _save_auto_state()
-        await send_telegram_message(session, chat_id, "▶️ Đã bật lại AI tự trade (bỏ kill switch).")
+        await send_telegram_message(session, chat_id, "▶️ Đã bật lại TOÀN BỘ AI: auto-trade + alert + pos-guard + review.")
+        return
+    if arg == 'all':
+        AUTO_STATE['features_off_until'] = time.time() + 365 * 24 * 3600
+        _save_auto_state()
+        await send_telegram_message(
+            session, chat_id,
+            "🛑 *Đã TẮT TẤT CẢ auto AI:*\n"
+            "• AI tự đặt lệnh 5h ❌\n"
+            "• Báo coin ngon 30p ❌\n"
+            "• Rà vị thế (pos guard) ❌\n"
+            "• AI review 6h ❌\n"
+            "━━━━━━━━━━━━━━━━━━━\n"
+            "✅ Vẫn chạy bình thường: /auto, /autopnl, cảnh báo tiến độ TP/SL, lệnh tay, /trail.\n"
+            "Bật lại toàn bộ: `/stopauto off`"
+        )
         return
     AUTO_STATE['circuit_break_until'] = time.time() + 24 * 3600
     _save_auto_state()
@@ -4629,6 +4654,9 @@ async def ai_review_loop(app):
     await asyncio.sleep(300)
     while True:
         try:
+            if _ai_features_paused():
+                await asyncio.sleep(AI_REVIEW_INTERVAL)
+                continue
             session = app['session']
             now = time.time()
             window_start = now - AI_REVIEW_INTERVAL
@@ -5146,6 +5174,9 @@ async def ai_auto_trader_loop(app):
     await asyncio.sleep(90)  # chờ khởi động xong (exchangeInfo, positions...)
     while True:
         try:
+            if _ai_features_paused():
+                await asyncio.sleep(AI_AUTO_TRADER_INTERVAL)
+                continue
             session = app['session']
             # 1. Quét thị trường TƯƠI (bỏ qua cache) — scan ngoài lock, single-flight
             long_signals, short_signals = await get_scan_signals_fresh(session, max_age=0)
@@ -5283,6 +5314,9 @@ async def ai_signal_alert_loop(app):
     await asyncio.sleep(60)
     while True:
         try:
+            if _ai_features_paused():
+                await asyncio.sleep(AI_ALERT_INTERVAL)
+                continue
             session = app['session']
             # 1. Quét thị trường (dùng cache còn mới < 5 phút để đỡ tốn request) — ngoài lock
             long_signals, short_signals = await get_scan_signals_fresh(session, max_age=300)
@@ -5365,6 +5399,9 @@ async def ai_position_guard_loop(app):
     await asyncio.sleep(60)
     while True:
         try:
+            if _ai_features_paused():
+                await asyncio.sleep(AI_POS_GUARD_INTERVAL)
+                continue
             session = app['session']
             open_positions = [p for p in positions.values() if float(p.get('positionAmt', 0) or 0) != 0.0]
             if not open_positions:
@@ -8372,7 +8409,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📊 `/stats` - Thống kê chi tiết win-rate 30 ngày: theo chiều, theo sao, coin tốt/tệ nhất, AI chấm điểm có đáng tin không.\n"
             "🎯 `/kq` - Liệt kê lệnh đã vào THEO AI (tự vào/theo AI chấm/theo alert) kèm thắng-thua. Lọc: `/kq auto`, `/kq thang`, `/kq thua`.\n"
             "🩺 `/risk` - Bảng rủi ro danh mục: margin dùng, đòn bẩy trung bình, vị thế gần thanh lý nhất, funding 24h.\n"
-            "🛑 `/stopauto` - Kill switch: dừng AI tự trade 24h. `/stopauto close` = đóng luôn vị thế AI đang mở. `/stopauto off` = bật lại.\n"
+            "🛑 `/stopauto` - Kill switch AI: dừng AI tự trade 24h. `/stopauto all` = TẮT TẤT CẢ auto AI (trade+alert+guard+review). `/stopauto close` = đóng luôn vị thế AI. `/stopauto off` = bật lại.\n"
             "⏳ `/fund` - Tổng funding trả/thu 7 ngày theo coin + cảnh báo vị thế đang cháy funding.\n"
             "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
