@@ -315,35 +315,68 @@ def side_winrate_ok(side, min_samples=None, min_wr=0.5):
     return (wins / total) >= min_wr
 
 async def signal_tracking_loop(app):
-    """Task nền: theo dõi kết quả các tín hiệu đang mở (TP chạm trước hay SL trước)."""
+    """Task nền: theo dõi kết quả các tín hiệu đang mở (TP chạm trước hay SL trước).
+    Dùng nến 1m high/low khớp mô hình backtest thay vì chỉ giá last mỗi 30s:
+    - LONG: high >= TP → win; low <= SL → loss; cả hai cùng nến → SL ưu tiên (loss).
+    - SHORT: mirror."""
     await asyncio.sleep(10)
     while True:
         try:
             open_signals = [s for s in signal_history if s.get('status') == 'open']
             if open_signals:
                 session = app['session']
-                tickers_map, _ = await get_market_snapshot(session)
-                changed = False
                 now = time.time()
+                sem = asyncio.Semaphore(8)
+
+                async def resolve_signal(sig):
+                    async with sem:
+                        url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={sig['symbol']}"
+                               f"&interval=1m&limit=3")
+                        try:
+                            async with session.get(url) as resp:
+                                if resp.status != 200:
+                                    return False
+                                candles = await resp.json()
+                        except Exception:
+                            return False
+                        if not isinstance(candles, list):
+                            return False
+                        for c in candles:
+                            try:
+                                open_ms = int(c[0])
+                                high = float(c[2])
+                                low = float(c[3])
+                            except (TypeError, ValueError, IndexError):
+                                continue
+                            if open_ms < sig.get('checked_ts', sig.get('ts', 0)) * 1000:
+                                continue
+                            if sig['side'] == 'LONG':
+                                hit_tp = high >= sig['tp']
+                                hit_sl = low <= sig['sl']
+                            else:
+                                hit_tp = low <= sig['tp']
+                                hit_sl = high >= sig['sl']
+                            if hit_tp and hit_sl:
+                                sig['status'] = 'loss'  # cùng nến: SL ưu tiên (khớp backtest)
+                            elif hit_tp:
+                                sig['status'] = 'win'
+                            elif hit_sl:
+                                sig['status'] = 'loss'
+                            else:
+                                continue
+                            sig['closed_ts'] = now
+                            return True
+                        return False
+
+                results = await asyncio.gather(*(resolve_signal(s) for s in open_signals), return_exceptions=True)
+                changed = sum(1 for r in results if r is True) > 0
                 for sig in open_signals:
-                    info = tickers_map.get(sig['symbol'])
-                    price = info['price'] if info else 0
-                    if price > 0:
-                        if sig['side'] == 'LONG':
-                            if price >= sig['tp']:
-                                sig['status'] = 'win'
-                            elif price <= sig['sl']:
-                                sig['status'] = 'loss'
-                        else:
-                            if price <= sig['tp']:
-                                sig['status'] = 'win'
-                            elif price >= sig['sl']:
-                                sig['status'] = 'loss'
                     if sig['status'] == 'open' and now - sig.get('ts', 0) > SIGNAL_TIMEOUT_HOURS * 3600:
                         sig['status'] = 'expired'
-                    if sig['status'] != 'open':
                         sig['closed_ts'] = now
                         changed = True
+                    # Mốc thời gian đã quét (memory-only; mất khi restart thì quét lại vô hại)
+                    sig['checked_ts'] = now
                 if changed:
                     prune_signal_history()
                     save_signal_history()
@@ -3523,7 +3556,7 @@ AI_AUTO_AI_MIN_SCORE = 5.0  # AI tự chấm chiều tín hiệu phải ≥ ngư
 # → SHORT cần điểm hệ thống & AI tự chấm CAO HƠN hẳn LONG, cộng bộ lọc side dựa trên win-rate thực tế.
 AI_AUTO_SHORT_MIN_SCORE = 5.5      # SHORT hệ thống phải ≥ 5.5 (5.0-5.5 SHORT thắng dưới 40%)
 AI_AUTO_SHORT_AI_MIN_SCORE = 6.0   # SHORT phải có AI tự chấm ≥ 6.0 (rất tự tin) mới đủ sức thắng edge âm
-AI_AUTO_SIDE_MIN_SAMPLES = 5       # Số lệnh kết thúc tối thiểu để bộ lọc side có hiệu lực (thấp vì backtest ủng hộ)
+AI_AUTO_SIDE_MIN_SAMPLES = 12      # Số lệnh kết thúc tối thiểu để bộ lọc side có hiệu lực (5 mẫu quá nhỏ, dễ chặn nhầm)
 AI_AUTO_SIDE_MIN_WR = 0.5          # Win-rate tối thiểu của 1 side; dưới mức này → chặn side đó tự vào lệnh
 
 # ─── Rào chắn an toàn cho tự động hoá (giúp AI tự trade nhiều mà không liều) ───
