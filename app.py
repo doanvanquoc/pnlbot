@@ -1111,15 +1111,200 @@ def get_binance_signature(query_string, secret_key):
 # tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
 _telegram_flood_until = 0.0
 
+# ─── Lệnh /model: list model + giá MintRouter, bấm chọn → đổi .env + restart ───
+MINT_MODEL_PRICES = {
+    'claude-fable-5-1': (2.90, 14.50), 'claude-fable-5': (2.90, 14.50),
+    'gpt-6-astra': (2.90, 14.50),
+    'claude-opus-5': (1.45, 7.25), 'claude-opus-4-8': (0.69, 3.47),
+    'claude-opus-4-7': (0.69, 3.47), 'claude-opus-4-6': (0.69, 3.47),
+    'claude-sonnet-5': (0.28, 1.39), 'claude-sonnet-5-500k': (0.28, 1.39),
+    'claude-sonnet-4-6': (0.42, 2.08), 'claude-sonnet-4-6-500k': (0.42, 2.08),
+    'claude-haiku-4-5': (0.14, 0.69),
+    'gpt-5.6-luna': (0.028, 0.17), 'gpt-5.6-sol': (0.56, 2.78), 'gpt-5.6-terra': (0.28, 1.67),
+    'gpt-5.5': (0.69, 4.17),
+    'glm-5.3': (0.41, 1.28), 'glm-5.2': (0.41, 1.28),
+    'gemini-3.8-flash': (0.16, 0.81), 'gemini-3.7-flash': (0.16, 0.81),
+    'gemini-3.1-pro-preview': (0.28, 1.67),
+    'grok4.6': (0.43, 1.30), 'grok4.5': (0.43, 1.30),
+    'kimi-k3': (0.87, 4.35), 'kimi-k2.7': (0.28, 1.16),
+}
+MINT_MODEL_LABELS = {
+    'claude-fable-5-1': 'Fable 5.1', 'claude-fable-5': 'Fable 5', 'gpt-6-astra': 'GPT-6 Astra',
+    'claude-opus-5': 'Opus 5', 'claude-opus-4-8': 'Opus 4.8', 'claude-opus-4-7': 'Opus 4.7',
+    'claude-sonnet-5': 'Sonnet 5', 'claude-sonnet-5-500k': 'Sonnet 5 (500K)',
+    'claude-sonnet-4-6': 'Sonnet 4.6', 'claude-sonnet-4-6-500k': 'Sonnet 4.6 (500K)',
+    'claude-haiku-4-5': 'Haiku 4.5',
+    'gpt-5.6-luna': 'GPT-5.6 Luna', 'gpt-5.6-sol': 'GPT-5.6 Sol', 'gpt-5.6-terra': 'GPT-5.6 Terra',
+    'gpt-5.5': 'GPT-5.5', 'glm-5.3': 'GLM 5.3', 'glm-5.2': 'GLM 5.2',
+    'gemini-3.8-flash': 'Gemini 3.8 Flash', 'gemini-3.7-flash': 'Gemini 3.7 Flash',
+    'gemini-3.1-pro-preview': 'Gemini 3.1 Pro',
+    'grok4.6': 'Grok 4.6', 'grok4.5': 'Grok 4.5', 'kimi-k3': 'Kimi K3', 'kimi-k2.7': 'Kimi K2.7',
+}
+# Model ưu tiên hiển thị trước (phổ biến + giá tốt)
+MINT_MODEL_ORDER = [
+    'glm-5.3', 'claude-sonnet-5', 'claude-fable-5-1', 'gpt-5.6-luna', 'gpt-6-astra',
+    'claude-opus-5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gemini-3.8-flash', 'grok4.6',
+    'kimi-k3', 'claude-haiku-4-5', 'gpt-5.5', 'glm-5.2', 'gpt-5.6-terra',
+    'gemini-3.7-flash', 'gemini-3.1-pro-preview', 'grok4.5', 'kimi-k2.7',
+    'claude-fable-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6',
+    'claude-sonnet-4-6', 'claude-sonnet-5-500k', 'claude-sonnet-4-6-500k',
+    'claude-opus-4-7-500k', 'claude-opus-4-6-500k',
+]
+
+MODEL_PAGE_SIZE = 8
+model_page_state = {}  # chat_id -> page hiện tại
+
+
+async def fetch_available_models(session):
+    """Danh sách model khả dụng từ /v1/models. Trả về list id, fallback về MINT_MODEL_ORDER."""
+    api_key = os.getenv("DASH_TOKEN")
+    if not api_key:
+        return list(MINT_MODEL_ORDER)
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with session.get("https://api.mintrouter.ai/v1/models",
+                               headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                ids = [m.get('id') for m in (data.get('data') or []) if m.get('id')]
+                if ids:
+                    return ids
+    except Exception:
+        pass
+    return list(MINT_MODEL_ORDER)
+
+
+def _set_dash_model_env(model_id):
+    """Sửa DASH_MODEL trong .env (gitignored). Trả về True nếu thành công."""
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        with open(env_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith('DASH_MODEL='):
+                lines[i] = f"DASH_MODEL={model_id}\n"
+                found = True
+                break
+        if not found:
+            lines.append(f"DASH_MODEL={model_id}\n")
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi ghi .env DASH_MODEL: {e}")
+        return False
+
+
+def _restart_bot_service():
+    """Restart service pnlbot (bot chạy user ubuntu, sudo NOPASSWD)."""
+    import subprocess
+    for cmd in (['sudo', 'systemctl', 'restart', 'pnlbot'],
+                ['systemctl', 'restart', 'pnlbot']):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
+            if r.returncode == 0:
+                return True
+            logger.warning(f"Restart bot thất bại: {' '.join(cmd)} → rc={r.returncode} {r.stderr[:120]}")
+        except Exception as e:
+            logger.warning(f"Lỗi restart bot: {e}")
+    return False
+
+
+async def handle_model_command(session, chat_id):
+    """Lệnh /model: list model + giá MintRouter, inline keyboard chọn → đổi DASH_MODEL + restart bot."""
+    available = await fetch_available_models(session)
+    current = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    # Sắp xếp: order ưu tiên trước, model còn lại xếp sau; loại model free (không dùng làm main)
+    ordered = [m for m in MINT_MODEL_ORDER if m in available]
+    rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
+    ordered += rest
+    model_page_state[chat_id] = 0
+    lines = [f"🤖 *MODEL AI HIỆN TẠI: {current}*", "", "🔁 Bấm chọn model (giá /1M tokens in/out):"]
+    kb_rows = []
+    for m in ordered[:MODEL_PAGE_SIZE]:
+        label = MINT_MODEL_LABELS.get(m, m)
+        if m in MINT_MODEL_PRICES:
+            pi, po = MINT_MODEL_PRICES[m]
+            label += f" · ${pi:g}/${po:g}"
+        if m == current:
+            label = f"✅ {label}"
+        kb_rows.append([{"text": label, "callback_data": f"setmodel:{m}"}])
+    kb_rows.append([{"text": "➡️ Trang sau", "callback_data": "modelpage:1"}])
+    lines.append(f"→ Trang 1/{max(1, -(-len(ordered) // MODEL_PAGE_SIZE))}")
+    await send_telegram_message(
+        session, chat_id,
+        "\n".join(lines),
+        reply_markup={"inline_keyboard": kb_rows}
+    )
+
+
+async def handle_model_callback(session, chat_id, cb_data, message_id=None, answer_cb=None):
+    """Callback cho /model: đổi trang hoặc chọn model → ghi .env → restart bot."""
+    action, _, arg = cb_data.partition(':')
+    if action == 'modelpage':
+        try:
+            page = int(arg)
+        except ValueError:
+            return
+        available = await fetch_available_models(session)
+        current = os.getenv("DASH_MODEL", "claude-sonnet-5")
+        ordered = [m for m in MINT_MODEL_ORDER if m in available]
+        rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
+        ordered += rest
+        pages = max(1, -(-len(ordered) // MODEL_PAGE_SIZE))
+        page = max(0, min(page, pages - 1))
+        model_page_state[chat_id] = page
+        chunk = ordered[page * MODEL_PAGE_SIZE:(page + 1) * MODEL_PAGE_SIZE]
+        kb_rows = []
+        for m in chunk:
+            label = MINT_MODEL_LABELS.get(m, m)
+            if m in MINT_MODEL_PRICES:
+                pi, po = MINT_MODEL_PRICES[m]
+                label += f" · ${pi:g}/${po:g}"
+            if m == current:
+                label = f"✅ {label}"
+            kb_rows.append([{"text": label, "callback_data": f"setmodel:{m}"}])
+        nav = []
+        if page > 0:
+            nav.append({"text": "⬅️ Trước", "callback_data": f"modelpage:{page - 1}"})
+        if page < pages - 1:
+            nav.append({"text": "➡️ Sau", "callback_data": f"modelpage:{page + 1}"})
+        if nav:
+            kb_rows.append(nav)
+        text = (f"🤖 *MODEL AI HIỆN TẠI: {current}*\n"
+                f"→ Trang {page + 1}/{pages} — bấm chọn (giá $/1M in/out)")
+        if message_id:
+            await edit_telegram_message(session, chat_id, message_id, text, reply_markup={"inline_keyboard": kb_rows})
+        else:
+            await send_telegram_message(session, chat_id, text, reply_markup={"inline_keyboard": kb_rows})
+        return
+    if action == 'setmodel':
+        model_id = arg.strip()
+        if not model_id or 'free' in model_id:
+            if answer_cb:
+                await answer_cb("Model free không dùng được làm main")
+            return
+        if answer_cb:
+            await answer_cb(f"Đổi sang {model_id} — đang restart bot...")
+        ok = _set_dash_model_env(model_id)
+        if not ok:
+            await send_telegram_message(session, chat_id, f"❌ Ghi .env thất bại — không đổi được model.")
+            return
+        await send_telegram_message(session, chat_id,
+            f"🔄 *Đã đổi DASH_MODEL → {model_id}*\nĐang restart bot... (bot sẽ tự mở lại sau ~10 giây)")
+        def _do_restart():
+            _restart_bot_service()
+        await asyncio.get_running_loop().run_in_executor(None, _do_restart)
+
+
 def _strip_md_chars(text):
-    """Bỏ sạch ký tự Markdown thô (*, `) khi phải gửi plain (fallback parse fail) —
-    tránh hiện '*Tổng quan*' kiểu dấu sao lộ nguyên cho người dùng."""
+    """Bỏ sạch ký tự Markdown thô (*, `) khi phải gửi plain (fallback parse fail)."""
     if not text:
         return text
     text = text.replace('**', '')
     text = text.replace('*', '')
     text = text.replace('`', '')
-    # Heading còn sót '### '
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
     return text
 
@@ -6655,6 +6840,10 @@ async def handle_order_callback(session, cb):
             return
 
         action, _, arg = cb_data.partition(':')
+        if action in ('setmodel', 'modelpage'):
+            msg_id = msg.get('message_id')
+            await handle_model_callback(session, chat_id, cb_data, message_id=msg_id, answer_cb=answer_cb)
+            return
         symbol = arg.strip().upper() or None
         new_text = None
         reply_kb = None
@@ -8309,7 +8498,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl', '/stats', '/trail',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/review', '/ai', '/usage', '/scans', '/scan', '/kq', '/ketqua', '/risk', '/stopauto', '/fund'
+            '/review', '/ai', '/usage', '/scans', '/scan', '/kq', '/ketqua', '/risk', '/stopauto', '/fund', '/model'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -8412,6 +8601,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "🩺 `/risk` - Bảng rủi ro danh mục: margin dùng, đòn bẩy trung bình, vị thế gần thanh lý nhất, funding 24h.\n"
             "🛑 `/stopauto` - Kill switch AI: dừng AI tự trade 24h. `/stopauto all` = TẮT TẤT CẢ auto AI (trade+alert+guard+review). `/stopauto close` = đóng luôn vị thế AI. `/stopauto off` = bật lại.\n"
             "⏳ `/fund` - Tổng funding trả/thu 7 ngày theo coin + cảnh báo vị thế đang cháy funding.\n"
+            "🤖 `/model` - Xem danh sách model AI + giá (/1M token), bấm chọn model mới (bot tự restart).\n"
             "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
@@ -8687,6 +8877,9 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
 
     elif command_base == '/fund':
         await handle_fund_command(request.app['session'], chat_id)
+
+    elif command_base == '/model':
+        await handle_model_command(request.app['session'], chat_id)
         
     elif command_base == '/liq':
         await handle_liq_command(request.app['session'], chat_id)
