@@ -3,3 +3,9 @@
 /active_chats.json
 /auto_managed.json
 /backtest_cache
+mint_session.json
+llm_usage.json
+auto_state.json
+auto_chats.json
+auto_pnl_chats.json
+ai_alert_state.json

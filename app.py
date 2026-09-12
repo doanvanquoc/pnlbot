@@ -3866,7 +3866,7 @@ async def get_go_usage(session):
             if resp.status != 200:
                 body = await resp.text()
                 return None, f"HTTP {resp.status}: {body[:150]}"
-            # Endpoint có thể trả HTML (MintRouter đã gỡ key-usage) — không crash, trả None
+            # Endpoint có thể trả HTML — không crash, trả None
             try:
                 data = await resp.json(content_type=None)
             except Exception:
@@ -3878,45 +3878,187 @@ async def get_go_usage(session):
         return None, str(e)
 
 
+# ─── Plan usage (dashboard) — cần session cookie từ /v0/front/login ───
+FRONT_SESSION_FILE = "mint_session.json"
+FRONT_OVERVIEW_CACHE = {'data': None, 'ts': 0.0, 'plan': None}
+_front_last_login = {'ts': 0.0}
+
+
+def _load_front_session():
+    try:
+        if os.path.exists(FRONT_SESSION_FILE):
+            with open(FRONT_SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get('cookies'):
+                FRONT_OVERVIEW_CACHE['plan'] = data.get('plan')
+                return data['cookies']
+    except Exception:
+        pass
+    return None
+
+
+def _save_front_session(cookies, plan=None):
+    try:
+        with open(FRONT_SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump({'cookies': cookies, 'plan': plan or FRONT_OVERVIEW_CACHE.get('plan'), 'ts': time.time()}, f)
+        os.chmod(FRONT_SESSION_FILE, 0o600)
+    except Exception as e:
+        logger.warning(f"Lỗi lưu mint_session: {e}")
+
+
+async def _front_login(session):
+    """Login dashboard MintRouter (email/password trong .env) → session cookies.
+    Rate-limit: không login quá 1 lần/60s để không bị khóa account."""
+    email = os.getenv("MINTROUTER_EMAIL")
+    pwd = os.getenv("MINTROUTER_PASSWORD")
+    if not email or not pwd:
+        return None
+    now = time.time()
+    if now - _front_last_login['ts'] < 60:
+        return None
+    _front_last_login['ts'] = now
+    url = "https://api.mintrouter.ai/v0/front/login"
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.post(url, json={"username": email, "password": pwd},
+                                headers={"Origin": "https://mintrouter.ai",
+                                         "Referer": "https://mintrouter.ai/login",
+                                         "Content-Type": "application/json"},
+                                timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.warning(f"MintRouter login thất bại: HTTP {resp.status} {body[:120]}")
+                return None
+            data = await resp.json(content_type=None)
+            cookies = {}
+            for k, v in resp.cookies.items():
+                cookies[k] = v.value
+            if not cookies:
+                return None
+            plan = data.get('plan') if isinstance(data, dict) else None
+            _front_last_login['ts'] = time.time()
+            _save_front_session(cookies, plan)
+            FRONT_OVERVIEW_CACHE['plan'] = plan or FRONT_OVERVIEW_CACHE.get('plan')
+            logger.info(f"[MINTROUTER] Đã login dashboard (plan: {plan})")
+            return cookies
+    except Exception as e:
+        logger.warning(f"Lỗi login MintRouter: {e}")
+        return None
+
+
+async def get_front_overview(session, force=False):
+    """Lấy usage PLAN từ dashboard MintRouter (/v0/front/dashboard/overview) qua session cookie.
+    Cache 5 phút để không spam API. Trả về (data|None, plan_name|None, err|None)."""
+    now = time.time()
+    if (not force and FRONT_OVERVIEW_CACHE['data'] is not None
+            and now - FRONT_OVERVIEW_CACHE['ts'] < 300):
+        return FRONT_OVERVIEW_CACHE['data'], FRONT_OVERVIEW_CACHE.get('plan'), None
+    cookies = _load_front_session()
+    plan = FRONT_OVERVIEW_CACHE.get('plan')
+    url = "https://api.mintrouter.ai/v0/front/dashboard/overview"
+    for attempt in (1, 2):
+        if not cookies:
+            cookies = await _front_login(session)
+            if not cookies:
+                return None, plan, "chưa có session (thiếu MINTROUTER_EMAIL/PASSWORD trong .env)"
+        cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with session.get(url, headers={
+                "Cookie": cookie_hdr,
+                "Origin": "https://mintrouter.ai",
+                "Referer": "https://mintrouter.ai/dashboard",
+                "Accept": "application/json",
+            }, timeout=timeout) as resp:
+                if resp.status == 401 and attempt == 1:
+                    cookies = None  # session hết hạn → login lại
+                    continue
+                if resp.status != 200:
+                    return None, plan, f"HTTP {resp.status}"
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict):
+                    FRONT_OVERVIEW_CACHE['data'] = data
+                    FRONT_OVERVIEW_CACHE['ts'] = time.time()
+                    if plan:
+                        FRONT_OVERVIEW_CACHE['plan'] = plan
+                    return data, FRONT_OVERVIEW_CACHE.get('plan'), None
+                return None, plan, "Định dạng không mong đợi"
+        except Exception as e:
+            return None, plan, str(e)
+    return None, plan, "session hết hạn và không login lại được"
+
+
+def _fmt_micros(v):
+    try:
+        return f"${float(v) / 1_000_000:,.2f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
 async def handle_usage_command(session, chat_id):
-    """Lệnh /usage: số dư + usage MintRouter (endpoint /v0/front/public/key-usage)
-    + thống kê token AI mà BOT tự đếm (24h / 7 ngày / 30 ngày) làm đối chiếu."""
-    data, err = await get_go_usage(session)
-    lines = [
-        "📊 *Usage MintRouter.ai*",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
+    """Lệnh /usage: Usage PLAN MintRouter (dashboard overview qua session) + credit + key usage."""
+    data, plan, err = await get_front_overview(session)
     if data:
-        balance = data.get('balance') or {}
+        lines = ["📊 *Usage MintRouter — PLAN*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+        if plan:
+            lines.append(f"🎫 Plan: *{plan}*")
+        sl = data.get('spend_limits') or {}
+        lim = data.get('limits') or {}
+        # Quota 24h của plan (Basic $35/ngày) — admin cap đang bật
+        cap_24h = _fmt_micros(sl.get('cap_24h_suggested_default_micros'))
+        if sl.get('cap_24h_admin_active') or sl.get('cap_24h_enabled'):
+            quota_line = f"Quota 24h: {cap_24h}"
+        else:
+            quota_line = "Quota 24h: không giới hạn"
+        lines.append(f"⏱ 5h qua: {_fmt_micros(sl.get('spend_5h_micros'))} | "
+                     f"24h: {_fmt_micros(sl.get('spend_24h_micros'))} | {quota_line}")
+        lines.append(f"📅 7 ngày: {_fmt_micros(sl.get('spend_7d_micros'))}")
+        kpi = data.get('kpi') or {}
+        lines.append(
+            f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
+            f"{int(kpi.get('total_tokens', 0)):,} token, "
+            f"thành công {kpi.get('success_rate', 0):.0f}%, "
+            f"cache-hit {kpi.get('cache_hit_rate', 0):.0f}%"
+        )
+        # Giá trị plan: provider cost MTD vs đã được plan bao vs tự trả
+        mtd_provider = _fmt_micros(kpi.get('mtd_provider_cost_micros'))
+        mtd_covered = _fmt_micros(kpi.get('mtd_pass_covered_micros'))
+        mtd_paid = _fmt_micros(kpi.get('mtd_cost_micros'))
+        lines.append(f"🎁 Tháng này: API trị giá {mtd_provider} — plan đã bao {mtd_covered} — tự trả {mtd_paid}")
+        avail = lim.get('available') if lim.get('available') is not None else lim.get('extra_credit')
+        if avail is not None:
+            lines.append(f"💰 Credit khả dụng: {_fmt_micros(lim.get('available_micros'))}"
+                         + (" ⚠️ sắp cạn!" if float(lim.get('available', 1) or 1) < 2.0 else ""))
+        local_block = _fmt_llm_usage_days(7)
+        if local_block:
+            lines.append("\n🤖 Bot tự đếm (7 ngày, đối chiếu):\n" + local_block)
+        await send_telegram_message(session, chat_id, "\n".join(lines))
+        return
+    # Fallback: key-usage công khai + local stats
+    key_data, kerr = await get_go_usage(session)
+    lines = ["📊 *Usage MintRouter.ai*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    if err:
+        lines.append(f"⚠️ Không lấy được plan usage: {err}")
+    if key_data:
+        balance = key_data.get('balance') or {}
         try:
             available = float(balance.get('available_micros', 0)) / 1_000_000
-            balance_line = f"💰 Số dư khả dụng: *${available:,.2f}*"
-            expires = data.get('expires_at') or ''
-            if expires and available > 0:
-                try:
-                    exp_ts = datetime.fromisoformat(expires.replace('Z', '+00:00'))
-                    days_left = (exp_ts - datetime.now(timezone.utc)).days
-                    balance_line += f" (tier hết hạn sau ~{days_left} ngày)"
-                except Exception:
-                    pass
-            lines.append(balance_line)
+            lines.append(f"💰 Credit khả dụng: *${available:,.2f}*")
         except (TypeError, ValueError):
-            lines.append("💰 Số dư: không đọc được")
-        usage = data.get('usage') or {}
+            pass
+        usage = key_data.get('usage') or {}
         for label, key in (("Hôm nay", 'today'), ("7 ngày", 'rolling_7d'), ("30 ngày", 'rolling_30d')):
             w = usage.get(key) or {}
             if isinstance(w, dict):
                 spend = float(w.get('spend_micros', 0)) / 1_000_000
                 lines.append(f"• {label}: {w.get('requests', 0)} request, {int(w.get('total_tokens', 0)):,} token, ${spend:,.4f}")
-            else:
-                lines.append(f"• {label}: ❓ không có dữ liệu")
-        if available <= 2.0:
-            lines.append("⚠️ *Số dư sắp cạn — nạp thêm trên mintrouter.ai để AI không ngưng chấm điểm!*")
-    else:
-        lines.append(f"⚠️ Không lấy được usage từ MintRouter: {err}")
+        if float(balance.get('available_micros', 0) or 0) / 1_000_000 < 2.0:
+            lines.append("⚠️ *Số dư sắp cạn — nạp thêm trên mintrouter.ai!*")
+    elif kerr:
+        lines.append(f"⚠️ Không lấy được key usage: {kerr}")
     local_block = _fmt_llm_usage_days(7)
     if local_block:
-        lines.append("\n🤖 Bot tự đếm (7 ngày, để đối chiếu):\n" + local_block)
+        lines.append("\n🤖 Bot tự đếm (7 ngày):\n" + local_block)
     await send_telegram_message(session, chat_id, "\n".join(lines))
 
 
