@@ -2011,6 +2011,77 @@ async def handle_top_command(session, chat_id):
         await send_telegram_message(session, chat_id, "❌ Đã xảy ra lỗi khi xử lý dữ liệu biến động.")
 
 
+ORIGIN_LABEL = {
+    'auto': '🤖 AI tự vào',
+    'ai': '🤖 theo AI chấm',
+    'alert': '🔔 theo alert 30p',
+}
+STATUS_LABEL = {
+    'win': '✅ THẮNG',
+    'loss': '❌ THUA',
+    'expired': '⏰ HẾT HẠN',
+    'open': '🔄 ĐANG MỞ',
+}
+
+
+async def handle_kq_command(session, chat_id, filter_arg=None):
+    """Lệnh /kq: thống kê các lệnh đã vào THEO AI (auto/ai/alert) và thắng hay thua.
+    /kq            → 20 lệnh gần nhất theo AI
+    /kq auto       → chỉ lệnh AI TỰ vào
+    /kq thua       → chỉ lệnh thua
+    /kq thang      → chỉ lệnh thắng"""
+    fl = (filter_arg or '').strip().lower()
+    want_status = None
+    want_origin = None
+    if fl in ('win', 'thang', 'thắng'):
+        want_status = 'win'
+    elif fl in ('loss', 'thua', 'thua'):
+        want_status = 'loss'
+    elif fl in ('open', 'dangmo', 'đang mở'):
+        want_status = 'open'
+    elif fl in ('auto'):
+        want_origin = 'auto'
+    elif fl in ('ai'):
+        want_origin = 'ai'
+    elif fl in ('alert'):
+        want_origin = 'alert'
+
+    pool = [s for s in signal_history
+            if s.get('origin') in ORIGIN_LABEL
+            and (want_status is None or s.get('status') == want_status)
+            and (want_origin is None or s.get('origin') == want_origin)]
+    pool.sort(key=lambda s: s.get('ts', 0), reverse=True)
+    if not pool:
+        await send_telegram_message(session, chat_id, "ℹ️ Chưa có lệnh nào khớp điều kiện lọc.")
+        return
+
+    shown = pool[:20]
+    tz_vn = timezone(timedelta(hours=7))
+    lines = ["🎯 *KẾT QUẢ LỆNH ĐÃ VÀO THEO AI*", "----------------------------------"]
+    for s in shown:
+        t_str = datetime.fromtimestamp(s.get('ts', 0), tz=tz_vn).strftime("%d/%m %H:%M")
+        disp = s['symbol'][:-4] if s['symbol'].endswith('USDT') else s['symbol']
+        ai_sc = f", AI {s['ai_score']:.1f}" if s.get('ai_score') is not None else ""
+        lines.append(
+            f"{t_str} {disp} {s['side']} @{format_price(s.get('entry', 0))} "
+            f"{ORIGIN_LABEL.get(s.get('origin'), '')} → {STATUS_LABEL.get(s.get('status'), s.get('status'))} "
+            f"(điểm {s.get('score', 0):.1f}{ai_sc})"
+        )
+    # Tổng kết cả pool (không chỉ 20 lệnh hiển thị)
+    cnt = {'win': 0, 'loss': 0, 'expired': 0, 'open': 0}
+    for s in pool:
+        st = s.get('status')
+        if st in cnt:
+            cnt[st] += 1
+    decided = cnt['win'] + cnt['loss']
+    total_n = len(pool)
+    wr_txt = f"{cnt['win']}/{decided} ({cnt['win'] / decided * 100:.0f}%)" if decided else "—"
+    lines.append("----------------------------------")
+    lines.append(f"📈 Tổng: {total_n} lệnh | Thắng {wr_txt} | Hết hạn {cnt['expired']} | Đang mở {cnt['open']}")
+    lines.append("💵 Tiền lời/lỗ thực tế từng lệnh: /history")
+    await send_telegram_message(session, chat_id, "\n".join(lines))
+
+
 async def handle_history_command(session, chat_id, coin_name=None):
     """
     Lấy lịch sử chốt vị thế (Realized PnL) từ Binance Futures.
@@ -7386,7 +7457,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl', '/stats', '/trail',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/review', '/ai', '/usage', '/scans', '/scan'
+            '/review', '/ai', '/usage', '/scans', '/scan', '/kq', '/ketqua'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -7485,6 +7556,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
             "📊 `/stats` - Thống kê chi tiết win-rate 30 ngày: theo chiều, theo sao, coin tốt/tệ nhất, AI chấm điểm có đáng tin không.\n"
+            "🎯 `/kq` - Liệt kê lệnh đã vào THEO AI (tự vào/theo AI chấm/theo alert) kèm thắng-thua. Lọc: `/kq auto`, `/kq thang`, `/kq thua`.\n"
             "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
@@ -7744,6 +7816,11 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
         parts = text.split()
         coin_name = parts[1] if len(parts) > 1 else None
         await handle_history_command(request.app['session'], chat_id, coin_name)
+
+    elif command_base in ('/kq', '/ketqua'):
+        parts = text.split()
+        filter_arg = parts[1] if len(parts) > 1 else None
+        await handle_kq_command(request.app['session'], chat_id, filter_arg)
         
     elif command_base == '/liq':
         await handle_liq_command(request.app['session'], chat_id)
