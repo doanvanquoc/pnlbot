@@ -4085,7 +4085,7 @@ async def get_front_analysis(session):
 
 async def handle_usage_command(session, chat_id):
     """Lệnh /usage: QUOTA PLAN MintRouter từ /v0/front/pass — daily/weekly used/limit + giờ reset."""
-    pass_data, perr = await get_front_pass(session)
+    pass_data, _, perr = await get_front_pass(session)
     plan = (pass_data or {}).get('group_name') or FRONT_OVERVIEW_CACHE.get('plan')
     data = None
     if pass_data:
