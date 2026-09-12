@@ -4082,7 +4082,8 @@ def _fmt_remaining(iso_str):
         delta = ts - datetime.now(timezone.utc)
         secs = max(int(delta.total_seconds()), 0)
         days, rem = divmod(secs, 86400)
-        hours, mins = divmod(rem, 3600)
+        hours, rem2 = divmod(rem, 3600)
+        mins = rem2 // 60
         if days > 0:
             return f"{days} ngày {hours}h"
         if hours > 0:
