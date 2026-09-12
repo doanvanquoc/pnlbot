@@ -560,6 +560,77 @@ def _ai_headers(api_key, session_id=None):
         "User-Agent": "pnlbot/1.0",
     }
 
+# ─── Thống kê token LLM ở local (MintRouter đã gỡ API key-usage — endpoint trả HTML) ───
+LLM_USAGE_FILE = "llm_usage.json"
+llm_usage = {}   # day 'YYYY-MM-DD' (UTC) -> {model: {'calls': n, 'in': tokens, 'out': tokens}}
+
+
+def _load_llm_usage():
+    global llm_usage
+    try:
+        if os.path.exists(LLM_USAGE_FILE):
+            with open(LLM_USAGE_FILE, "r", encoding="utf-8") as f:
+                llm_usage = json.load(f) or {}
+    except Exception as e:
+        logger.error(f"Lỗi nạp llm_usage: {e}")
+
+
+def _save_llm_usage():
+    try:
+        # chỉ giữ 35 ngày gần nhất
+        keep = sorted(llm_usage.keys())[-35:]
+        trimmed = {k: llm_usage[k] for k in keep}
+        llm_usage.clear()
+        llm_usage.update(trimmed)
+        with open(LLM_USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(llm_usage, f)
+    except Exception as e:
+        logger.error(f"Lỗi lưu llm_usage: {e}")
+
+
+def record_llm_usage(model, usage):
+    """Ghi nhận tokens in/out từ trường `usage` của mỗi response chat completions."""
+    try:
+        usage = usage or {}
+        p = int(usage.get('prompt_tokens') or 0)
+        c = int(usage.get('completion_tokens') or 0)
+        if p <= 0 and c <= 0:
+            return
+        day = time.strftime('%Y-%m-%d', time.gmtime())
+        day_stats = llm_usage.setdefault(day, {})
+        m = day_stats.setdefault(model or 'unknown', {'calls': 0, 'in': 0, 'out': 0})
+        m['calls'] += 1
+        m['in'] += p
+        m['out'] += c
+        _save_llm_usage()
+    except Exception as e:
+        logger.warning(f"Lỗi ghi usage: {e}")
+
+
+def _fmt_llm_usage_days(days):
+    """Tổng hợp usage N ngày gần nhất. Trả về dòng text hoặc None."""
+    cutoff = time.time() - days * 86400
+    agg = {}
+    for day, models in llm_usage.items():
+        try:
+            ts = time.mktime(time.strptime(day, '%Y-%m-%d'))
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        for model, st in models.items():
+            a = agg.setdefault(model, {'calls': 0, 'in': 0, 'out': 0})
+            a['calls'] += st.get('calls', 0)
+            a['in'] += st.get('in', 0)
+            a['out'] += st.get('out', 0)
+    if not agg:
+        return None
+    lines = []
+    for model, st in sorted(agg.items(), key=lambda kv: -(kv[1]['in'] + kv[1]['out'])):
+        lines.append(f"  · {model}: {st['calls']} calls | in {st['in']:,} | out {st['out']:,} tokens")
+    return "\n".join(lines)
+
+
 async def get_ai_analysis(session, digest, lessons=None):
     """Gọi LLM phân tích digest chỉ báo. Trả về {direction, confidence, reason, analysis} hoặc None."""
     api_key = os.getenv("DASH_TOKEN")
@@ -622,6 +693,7 @@ async def get_ai_analysis(session, digest, lessons=None):
                     logger.warning(f"AI API trả lỗi HTTP {resp.status}: {body[:200]}")
                     return None
                 data = await resp.json()
+            record_llm_usage(model, data.get('usage'))
             content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
             verdict = _extract_json(content)
             if verdict and verdict.get('direction') in ('LONG', 'SHORT', 'NEUTRAL'):
@@ -3794,47 +3866,44 @@ async def get_go_usage(session):
             if resp.status != 200:
                 body = await resp.text()
                 return None, f"HTTP {resp.status}: {body[:150]}"
-            data = await resp.json()
-            return data or {}, None
+            # Endpoint có thể trả HTML (MintRouter đã gỡ key-usage) — không crash, trả None
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                return None, "API trả nội dung không phải JSON (endpoint có thể đã bị gỡ)"
+            if not isinstance(data, dict):
+                return None, "API trả định dạng không mong đợi"
+            return data, None
     except Exception as e:
         return None, str(e)
 
 
-def _fmt_usage_window(name_vn, window):
-    if not isinstance(window, dict):
-        return f"{name_vn}: ❓ không có dữ liệu"
-    requests = window.get('requests', 0)
-    tokens = window.get('total_tokens', 0)
-    try:
-        spend = float(window.get('spend_micros', 0)) / 1_000_000
-    except (TypeError, ValueError):
-        spend = 0.0
-    return f"• {name_vn}: {requests} request, {tokens:,} token, ${spend:.4f}"
-
-
 async def handle_usage_command(session, chat_id):
+    """Lệnh /usage: số dư MintRouter (API key-usage đã bị gỡ → chỉ thành công khi khôi phục)
+    + thống kê token AI mà BOT đã dùng theo local accounting (24h / 7 ngày / 30 ngày)."""
     data, err = await get_go_usage(session)
-    if err:
-        await send_telegram_message(session, chat_id, f"❌ Không lấy được usage: {err}")
-        return
-    balance = data.get('balance') or data.get('account_balance') or {}
-    usage = data.get('usage') or {}
-    try:
-        available = float(balance.get('available_micros', 0)) / 1_000_000
-    except (TypeError, ValueError):
-        available = None
-    balance_line = f"💰 Số dư khả dụng: ${available:.2f}\n" if available is not None else ""
-    msg = (
-        "📊 *Usage MintRouter.ai*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        + balance_line
-        + "\n".join([
-            _fmt_usage_window("24 giờ", usage.get('rolling_24h')),
-            _fmt_usage_window("7 ngày", usage.get('rolling_7d')),
-            _fmt_usage_window("30 ngày", usage.get('rolling_30d')),
-        ])
-    )
-    await send_telegram_message(session, chat_id, msg)
+    balance_line = ""
+    if data:
+        balance = data.get('balance') or data.get('account_balance') or {}
+        try:
+            available = float(balance.get('available_micros', 0)) / 1_000_000
+            if available > 0:
+                balance_line = f"💰 Số dư khả dụng: ${available:.2f}\n"
+        except (TypeError, ValueError):
+            pass
+    lines = [
+        "📊 *Usage AI của bot*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if balance_line:
+        lines.append(balance_line)
+    else:
+        lines.append("⚠️ MintRouter đã gỡ API key-usage (trả HTML thay JSON) — số dư credit xem trên web mintrouter.ai\n")
+    for label, days in (("24 giờ", 1), ("7 ngày", 7), ("30 ngày", 30)):
+        block = _fmt_llm_usage_days(days)
+        lines.append(f"📅 *{label}*" + ("\n" + block if block else " — không có cuộc gọi nào"))
+    lines.append("💵 Giá token theo model xem: https://mintrouter.ai/models")
+    await send_telegram_message(session, chat_id, "\n".join(lines))
 
 
 async def handle_scan_history_command(session, chat_id):
@@ -6105,6 +6174,7 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=6000, timeo
                 logger.warning(f"AI agent trả lỗi HTTP {resp.status}: {body[:200]}")
                 return None, f"HTTP {resp.status}: {body[:200]}"
             data = await resp.json()
+            record_llm_usage(os.getenv("DASH_MODEL", "claude-sonnet-5"), data.get('usage'))
             choice = data.get('choices', [{}])[0]
             msg = choice.get('message')
             if msg is None:
@@ -8409,6 +8479,7 @@ async def on_startup(app):
     load_scan_history()
     _load_ai_alert_state()
     _load_auto_managed()
+    _load_llm_usage()
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
     app['session'] = aiohttp.ClientSession(connector=connector)
     
