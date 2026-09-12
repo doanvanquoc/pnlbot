@@ -1312,20 +1312,29 @@ def _build_model_sections(available, live_prices):
     return result
 
 
+def _fmt_price(p):
+    """$0.14 → 2 số lẻ; giá < 0.1 (Luna 0.028) → 3 số lẻ cho chính xác."""
+    return f"${p:.3f}" if p < 0.1 else f"${p:.2f}"
+
+
 def _model_button_label(mid, current, live_prices):
-    """Nhãn nút chọn model: tên hiển thị + giá live (fallback bảng cứng)."""
-    label = mid
+    """Nhãn nút chọn model: GIÁ RA TRƯỚC ($x.xx/$x.xx · Tên) để cột giá thẳng hàng —
+    Telegram luôn căn trái chữ trong button, tên dài ngắn khác nhau làm trông lệch.
+    Dấu ✅ (model đang dùng) đặt CUỐI để không đẩy lệch cột giá."""
     if live_prices and mid in live_prices:
         pi, po, dn = live_prices[mid]
-        label = dn or mid
-        label += f" · ${pi:g}/${po:g}"
+        name = dn or mid
     else:
-        label = MINT_MODEL_LABELS.get(mid, mid)
+        pi = po = None
+        name = MINT_MODEL_LABELS.get(mid, mid)
         if mid in MINT_MODEL_PRICES:
             pi, po = MINT_MODEL_PRICES[mid]
-            label += f" · ${pi:g}/${po:g}"
+    if pi is not None:
+        label = f"{_fmt_price(pi)}/{_fmt_price(po)} · {name}"
+    else:
+        label = name
     if mid == current:
-        label = f"✅ {label}"
+        label = f"{label} ✅"
     return label
 
 
