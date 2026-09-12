@@ -1211,25 +1211,90 @@ def _restart_bot_service():
     return False
 
 
+async def get_front_model_pricing(session):
+    """Giá model MỚI NHẤT từ /v0/front/models/pricing (cần session cookie + UA trình duyệt).
+    Trả về dict {model_id: (price_in_1M, price_out_1M, display_name)} hoặc None khi fail.
+    Cache 30 phút — giá ít khi đổi, không spam API."""
+    now = time.time()
+    if (MODEL_PRICING_CACHE['data'] is not None
+            and now - MODEL_PRICING_CACHE['ts'] < 1800):
+        return MODEL_PRICING_CACHE['data']
+    cookies = _load_front_session()
+    url = "https://api.mintrouter.ai/v0/front/models/pricing"
+    for attempt in (1, 2):
+        if not cookies:
+            cookies = await _front_login(session)
+            if not cookies:
+                return None
+        cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with session.get(url, headers={
+                "Cookie": cookie_hdr,
+                "Origin": "https://mintrouter.ai",
+                "Referer": "https://mintrouter.ai/models",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+            }, timeout=timeout) as resp:
+                if resp.status == 401 and attempt == 1:
+                    cookies = None  # session hết hạn → login lại
+                    continue
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                items = (data.get('per_token') if isinstance(data, dict) else None) or []
+                prices = {}
+                for it in items:
+                    mid = it.get('model')
+                    pi, po = it.get('price_input_token'), it.get('price_output_token')
+                    if mid and pi is not None and po is not None:
+                        prices[mid] = (float(pi), float(po), it.get('display_name') or mid)
+                if prices:
+                    MODEL_PRICING_CACHE['data'] = prices
+                    MODEL_PRICING_CACHE['ts'] = now
+                    return prices
+                return None
+        except Exception:
+            if attempt == 1:
+                cookies = None
+                continue
+            return None
+    return None
+
+
+def _model_button_label(mid, current, live_prices):
+    """Nhãn nút chọn model: tên hiển thị + giá live (fallback bảng cứng)."""
+    label = mid
+    if live_prices and mid in live_prices:
+        pi, po, dn = live_prices[mid]
+        label = dn or mid
+        label += f" · ${pi:g}/${po:g}"
+    else:
+        label = MINT_MODEL_LABELS.get(mid, mid)
+        if mid in MINT_MODEL_PRICES:
+            pi, po = MINT_MODEL_PRICES[mid]
+            label += f" · ${pi:g}/${po:g}"
+    if mid == current:
+        label = f"✅ {label}"
+    return label
+
+
 async def handle_model_command(session, chat_id):
     """Lệnh /model: list model + giá MintRouter, inline keyboard chọn → đổi DASH_MODEL + restart bot."""
     available = await fetch_available_models(session)
     current = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    live_prices = await get_front_model_pricing(session)
     # Sắp xếp: order ưu tiên trước, model còn lại xếp sau; loại model free (không dùng làm main)
     ordered = [m for m in MINT_MODEL_ORDER if m in available]
     rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
     ordered += rest
     model_page_state[chat_id] = 0
-    lines = [f"🤖 *MODEL AI HIỆN TẠI: {current}*", "", "🔁 Bấm chọn model (giá /1M tokens in/out):"]
+    price_note = "giá mới nhất từ MintRouter" if live_prices else "giá tham khảo"
+    lines = [f"🤖 *MODEL AI HIỆN TẠI: {current}*", "", f"🔁 Bấm chọn model ({price_note}, $/1M in/out):"]
     kb_rows = []
     for m in ordered[:MODEL_PAGE_SIZE]:
-        label = MINT_MODEL_LABELS.get(m, m)
-        if m in MINT_MODEL_PRICES:
-            pi, po = MINT_MODEL_PRICES[m]
-            label += f" · ${pi:g}/${po:g}"
-        if m == current:
-            label = f"✅ {label}"
-        kb_rows.append([{"text": label, "callback_data": f"setmodel:{m}"}])
+        kb_rows.append([{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}])
     kb_rows.append([{"text": "➡️ Trang sau", "callback_data": "modelpage:1"}])
     lines.append(f"→ Trang 1/{max(1, -(-len(ordered) // MODEL_PAGE_SIZE))}")
     await send_telegram_message(
@@ -1249,6 +1314,7 @@ async def handle_model_callback(session, chat_id, cb_data, message_id=None, answ
             return
         available = await fetch_available_models(session)
         current = os.getenv("DASH_MODEL", "claude-sonnet-5")
+        live_prices = await get_front_model_pricing(session)
         ordered = [m for m in MINT_MODEL_ORDER if m in available]
         rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
         ordered += rest
@@ -1258,13 +1324,7 @@ async def handle_model_callback(session, chat_id, cb_data, message_id=None, answ
         chunk = ordered[page * MODEL_PAGE_SIZE:(page + 1) * MODEL_PAGE_SIZE]
         kb_rows = []
         for m in chunk:
-            label = MINT_MODEL_LABELS.get(m, m)
-            if m in MINT_MODEL_PRICES:
-                pi, po = MINT_MODEL_PRICES[m]
-                label += f" · ${pi:g}/${po:g}"
-            if m == current:
-                label = f"✅ {label}"
-            kb_rows.append([{"text": label, "callback_data": f"setmodel:{m}"}])
+            kb_rows.append([{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}])
         nav = []
         if page > 0:
             nav.append({"text": "⬅️ Trước", "callback_data": f"modelpage:{page - 1}"})
@@ -4084,6 +4144,7 @@ async def get_go_usage(session):
 FRONT_SESSION_FILE = "mint_session.json"
 FRONT_OVERVIEW_CACHE = {'data': None, 'ts': 0.0, 'plan': None}
 _front_last_login = {'ts': 0.0}
+MODEL_PRICING_CACHE = {'data': None, 'ts': 0.0}
 
 
 def _load_front_session():
