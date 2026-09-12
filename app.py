@@ -3995,6 +3995,36 @@ def _fmt_micros(v):
         return "?"
 
 
+async def get_front_analysis(session):
+    """Token composition 30 ngày từ dashboard MintRouter (/v0/front/dashboard/analysis). Cache 5 phút."""
+    now = time.time()
+    if getattr(get_front_analysis, '_cache', None) and now - get_front_analysis._cache[0] < 300:
+        return get_front_analysis._cache[1], None, None
+    cookies = _load_front_session()
+    if not cookies:
+        cookies = await _front_login(session)
+        if not cookies:
+            return None, None, "chưa có session"
+    cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.get("https://api.mintrouter.ai/v0/front/dashboard/analysis", headers={
+            "Cookie": cookie_hdr,
+            "Origin": "https://mintrouter.ai",
+            "Referer": "https://mintrouter.ai/dashboard",
+            "Accept": "application/json",
+        }, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None, None, f"HTTP {resp.status}"
+            data = await resp.json(content_type=None)
+            if isinstance(data, dict):
+                get_front_analysis._cache = (time.time(), data)
+                return data, None, None
+            return None, None, "Định dạng không mong đợi"
+    except Exception as e:
+        return None, None, str(e)
+
+
 async def handle_usage_command(session, chat_id):
     """Lệnh /usage: Usage PLAN MintRouter (dashboard overview qua session) + credit + key usage."""
     data, plan, err = await get_front_overview(session)
@@ -4018,9 +4048,13 @@ async def handle_usage_command(session, chat_id):
                 emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
                 return (f"{emoji} {label}: {_fmt_micros(spent)} / {_fmt_micros(cap_def)} "
                         f"({pct:.1f}%) — còn {_fmt_micros(max(cap_def - spent, 0))}")
-            return f"🟢 {label}: {_fmt_micros(spent)} (không giới hạn)"
+            return None
 
-        lines.append(_row("Quota 5 giờ", 'spend_5h_micros', cap_5h_def, sl.get('cap_5h_admin_active')))
+        row_5h = _row("Quota 5 giờ", 'spend_5h_micros', cap_5h_def, sl.get('cap_5h_admin_active') or sl.get('cap_5h_enabled'))
+        if not (sl.get('cap_5h_admin_active') or sl.get('cap_5h_enabled')):
+            row_5h = None  # MintRouter chưa bật quota 5h trên account này → ẩn
+        if row_5h:
+            lines.append(row_5h)
         lines.append(_row("Quota NGÀY", 'spend_24h_micros', cap_24h_def, sl.get('cap_24h_admin_active')))
         lines.append(_row("Quota TUẦN", 'spend_7d_micros', cap_7d_def,
                           sl.get('cap_7d_admin_active') or sl.get('cap_24h_admin_active')))
@@ -4030,6 +4064,18 @@ async def handle_usage_command(session, chat_id):
             f"{int(kpi.get('total_tokens', 0)):,} token, "
             f"thành công {kpi.get('success_rate', 0):.0f}%"
         )
+        # Tokens 30 ngày (số token MỚI là usage thật; phần lớn là cache-hit rẻ)
+        try:
+            adata, aerr, _ = await get_front_analysis(session)
+            tc = (adata or {}).get('token_composition') or {}
+            if tc and tc.get('total_tokens'):
+                lines.append(
+                    f"🧮 30 ngày: {int(tc.get('total_tokens', 0)):,} token "
+                    f"(in {int(tc.get('input_tokens', 0)):,}, out {int(tc.get('output_tokens', 0)):,}, "
+                    f"cache {int(tc.get('cached_tokens', 0)):,})"
+                )
+        except Exception:
+            pass
         await send_telegram_message(session, chat_id, "\n".join(lines))
         return
     # Fallback: key-usage công khai + local stats
