@@ -1111,6 +1111,19 @@ def get_binance_signature(query_string, secret_key):
 # tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
 _telegram_flood_until = 0.0
 
+def _strip_md_chars(text):
+    """Bỏ sạch ký tự Markdown thô (*, `) khi phải gửi plain (fallback parse fail) —
+    tránh hiện '*Tổng quan*' kiểu dấu sao lộ nguyên cho người dùng."""
+    if not text:
+        return text
+    text = text.replace('**', '')
+    text = text.replace('*', '')
+    text = text.replace('`', '')
+    # Heading còn sót '### '
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+    return text
+
+
 async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=None, reply_markup=None):
     global _telegram_flood_until
     if not is_auto:
@@ -1172,9 +1185,10 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
                     logger.warning(f"Telegram 429 rate limit: thử lại sau {retry_after}s (lần {attempt + 1}/{max_attempts})")
                     await asyncio.sleep(min(retry_after, 30))
                     continue
-                # Lỗi parse markdown (400): thử lại không parse_mode để tin nhắn không bị mất
+                # Lỗi parse markdown (400): bỏ parse_mode + strip ký tự md thô để tin nhắn không bị mất
                 if resp.status == 400 and 'parse_mode' in payload:
                     payload.pop('parse_mode')
+                    payload['text'] = _strip_md_chars(payload['text'])
                     continue
                 body = await resp.text()
                 # Chat block bot / không tồn tại → gỡ khỏi mọi danh sách auto để không retry spam mỗi phút
