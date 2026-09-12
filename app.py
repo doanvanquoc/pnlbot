@@ -388,6 +388,151 @@ async def signal_tracking_loop(app):
             await asyncio.sleep(30)
 
 
+def format_detailed_stats_text(days=SIGNAL_MAX_AGE_DAYS):
+    """Thống kê chi tiết & trung thực cho lệnh /stats: theo chiều, band, coin, mức AI chấm."""
+    cutoff = time.time() - days * 86400
+    sigs = [s for s in signal_history if s.get('ts', 0) >= cutoff
+            and s.get('confidence') in ('Mạnh', 'Rất mạnh')]
+    decided = [s for s in sigs if s.get('status') in ('win', 'loss')]
+    expired = [s for s in sigs if s.get('status') == 'expired']
+    if len(decided) + len(expired) < 10:
+        return ""
+    lines = [f"📊 *STATS {days} NGÀY (chỉ 4-5⭐)*", "----------------------------------"]
+    wins = sum(1 for s in decided if s['status'] == 'win')
+    if decided:
+        lines.append(f"🎯 Tổng: {wins}W/{len(decided) - wins}L "
+                     f"({wins / len(decided) * 100:.0f}%) + {len(expired)} hết hạn")
+    for side in ('LONG', 'SHORT'):
+        sub = [s for s in decided if s.get('side') == side]
+        if sub:
+            w = sum(1 for s in sub if s['status'] == 'win')
+            lines.append(f"{'🟢' if side == 'LONG' else '🔴'} {side}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
+    for band in ('Rất mạnh', 'Mạnh'):
+        sub = [s for s in decided if s.get('confidence') == band]
+        if sub:
+            w = sum(1 for s in sub if s['status'] == 'win')
+            stars = '⭐⭐⭐⭐⭐' if band == 'Rất mạnh' else '⭐⭐⭐⭐'
+            lines.append(f"{stars}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
+    # Theo coin (tối thiểu 3 lệnh decided) — 3 tốt nhất / 3 tệ nhất
+    sym_stats = {}
+    for s in decided:
+        st = sym_stats.setdefault(s['symbol'], {'win': 0, 'loss': 0})
+        st[s['status']] += 1
+    ranked = sorted(((sym, st['win'] / (st['win'] + st['loss']), st['win'] + st['loss'])
+                     for sym, st in sym_stats.items() if st['win'] + st['loss'] >= 3),
+                    key=lambda x: x[1])
+    if len(ranked) >= 3:
+        best = [f"{sym} {wr * 100:.0f}% ({n}l)" for sym, wr, n in ranked[-3:][::-1]]
+        worst = [f"{sym} {wr * 100:.0f}% ({n}l)" for sym, wr, n in ranked[:3]]
+        lines.append(f"🏆 Tốt nhất: {' | '.join(best)}")
+        lines.append(f"💀 Tệ nhất: {' | '.join(worst)}")
+    # Hiệu chuẩn AI: bucket nào AI phóng tay (thua thật dù chấm cao)
+    for bucket, lo, hi in (('AI < 5', 0, 5), ('AI 5-6', 5, 6), ('AI 6-7', 6, 7), ('AI ≥ 7', 7, 11)):
+        sub = [s for s in decided if s.get('ai_score') is not None and lo <= s['ai_score'] < hi]
+        if sub:
+            w = sum(1 for s in sub if s['status'] == 'win')
+            lines.append(f"🤖 {bucket}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
+    if expired:
+        long_exp = sum(1 for s in expired if s.get('side') == 'LONG')
+        lines.append(f"⏰ Hết hạn: {long_exp} LONG / {len(expired) - long_exp} SHORT "
+                     f"(TP 1:1 chưa chạm trong {SIGNAL_TIMEOUT_HOURS}h)")
+    return "\n".join(lines)
+
+
+async def handle_stats_command(session, chat_id):
+    """Lệnh /stats: thống kê chi tiết win-rate thực tế 30 ngày."""
+    text = format_detailed_stats_text()
+    if not text:
+        await send_telegram_message(session, chat_id, "ℹ️ Chưa đủ dữ liệu tín hiệu (cần ≥10 lệnh 4-5⭐ trong 30 ngày).")
+        return
+    await send_telegram_message(session, chat_id, text)
+
+
+async def handle_trail_command(session, chat_id, coin_name, action_str=None):
+    """Lệnh /trail: bật/tắt quản lý trailing stop cho VỊ THẾ NGƯỜI DÙNG đặt tay.
+    /trail btc        → bật (đặt SL 1.5×ATR, đạt +0.8R trailing + hủy TP, +1.5R chốt 50%)
+    /trail btc off    → tắt (giữ nguyên SL hiện tại)"""
+    if not coin_name:
+        await send_telegram_message(session, chat_id,
+            "❌ Sai cú pháp!\n`/trail <coin>` để BẬT (vd `/trail btc`)\n`/trail <coin> off` để TẮT")
+        return
+    coin_name = coin_name.upper()
+    symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    want_off = (action_str or '').strip().lower() == 'off'
+
+    pos = positions.get(f"{symbol}_LONG") or positions.get(f"{symbol}_SHORT")
+    key = next((k for k in positions if k.startswith(symbol)), None)
+    if key:
+        pos = positions[key]
+
+    if want_off or not pos or float(pos.get('positionAmt', 0) or 0) == 0:
+        removed = [k for k in auto_managed if k.startswith(symbol)]
+        for k in removed:
+            auto_managed.pop(k, None)
+        _save_auto_managed()
+        if removed:
+            await send_telegram_message(session, chat_id,
+                f"🛑 Đã tắt trailing cho {display_symbol(symbol)} (giữ nguyên SL hiện tại).")
+        else:
+            await send_telegram_message(session, chat_id,
+                f"ℹ️ Không có vị thế {display_symbol(symbol)} đang mở để quản lý.")
+        return
+
+    amount = float(pos.get('positionAmt', 0) or 0)
+    side = 'LONG' if amount > 0 else 'SHORT'
+    entry = float(pos.get('entryPrice', 0) or 0)
+    mark = float(pos.get('markPrice', 0) or 0)
+    pos_side = pos.get('positionSide', 'BOTH')
+    if entry <= 0 or mark <= 0:
+        await send_telegram_message(session, chat_id, "⚠️ Chưa lấy được giá entry/mark — thử lại sau.")
+        return
+    res = await analyze_market(session, symbol, interval='1h', fetch_extras=False)
+    if not res or not res.get('atr') or res['atr'] <= 0:
+        await send_telegram_message(session, chat_id, "⚠️ Không tính được ATR — thử lại sau.")
+        return
+    atr = float(res['atr'])
+    risk = atr * 1.5
+    sl_price = entry - risk if side == 'LONG' else entry + risk
+
+    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+    sl_price = round_price_step(sl_price, tick_size, price_p)
+    real_qty = abs(amount)
+    close_side = 'SELL' if side == 'LONG' else 'BUY'
+
+    # Thay SL cũ (nếu có) bằng SL 1.5×ATR; KHÔNG đụng TP người dùng đã đặt
+    await cancel_existing_tpsl(session, api_key, api_secret, symbol,
+                               position_side=(None if pos_side == 'BOTH' else pos_side),
+                               cancel_tp=False, cancel_sl=True)
+    ok, info = await _place_conditional_tpsl(session, symbol, close_side, 'STOP_MARKET',
+                                             f"{sl_price:.{price_p}f}",
+                                             f"{real_qty:.{qty_p}f}",
+                                             None if pos_side == 'BOTH' else pos_side)
+    if not ok:
+        await send_telegram_message(session, chat_id, f"❌ Không đặt được SL: {info}")
+        return
+
+    algo_id = info if isinstance(info, str) and str(info).isdigit() else None
+    pos_key = f"{symbol}_{pos_side}"
+    auto_managed[pos_key] = {
+        'symbol': symbol, 'side': side, 'origin': 'manual',
+        'entry': entry, 'sl_initial': sl_price, 'risk': risk, 'atr': atr,
+        'qty': real_qty, 'pos_side': pos_side,
+        'sl_algo_id': algo_id, 'tp_algo_id': None,
+        'last_sl': sl_price, 'ts': time.time(),
+    }
+    _save_auto_managed()
+    cur_r = ((mark - entry) / risk if side == 'LONG' else (entry - mark) / risk)
+    await send_telegram_message(
+        session, chat_id,
+        f"🛡️ *Đã bật trailing cho {display_symbol(symbol)} {side}*\n"
+        f"SL: `{format_price(sl_price)}` (entry ± 1.5×ATR)\n"
+        f"Đang {cur_r:+.1f}R. Đạt +0.8R → trailing + hủy TP để lời chạy; +1.5R → chốt 50%.\n"
+        f"Tắt: `/trail {coin_name[:-4] if coin_name.endswith('USDT') else coin_name} off`"
+    )
+
+
 # ─── AI phân tích realtime (endpoint OpenAI-compatible) ───
 AI_CACHE_TTL = 600
 ai_verdict_cache = {}
@@ -7239,7 +7384,7 @@ async def telegram_webhook_handler(request):
             '/start', '/help', '/pnl', '/pos', '/balance', '/wallet', '/sodu',
             '/top', '/gainers', '/orders', '/lenh', '/cancel', '/huy',
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
-            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl',
+            '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl', '/stats', '/trail',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
             '/review', '/ai', '/usage', '/scans', '/scan'
         }
@@ -7334,10 +7479,12 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
             "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
+            "🛡️ `/trail <coin>` - Bật trailing stop tự động cho vị thế bạn đặt tay (SL 1.5×ATR, +0.8R trailing, +1.5R chốt 50%). Tắt: `/trail <coin> off`.\n"
             "📊 `/autopnl` - Bật/Tắt tự động gửi TỔNG PNL vị thế hiện tại mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
             "🤖 `/ai <coin>` - Yêu cầu AI phân tích coin trực tiếp (ví dụ: `/ai btc`, `/ai eth`). Cần cấu hình DASH_TOKEN.\n"
             "🩺 `/review` - AI soi tổng thể các vị thế đang mở, khuyến nghị giữ/chốt/DCA/cắt lỗ.\n"
+            "📊 `/stats` - Thống kê chi tiết win-rate 30 ngày: theo chiều, theo sao, coin tốt/tệ nhất, AI chấm điểm có đáng tin không.\n"
             "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
@@ -7583,6 +7730,15 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
 
     elif command_base == '/usage':
         await handle_usage_command(request.app['session'], chat_id)
+
+    elif command_base == '/stats':
+        await handle_stats_command(request.app['session'], chat_id)
+
+    elif command_base == '/trail':
+        parts = text.split()
+        coin_name = parts[1] if len(parts) > 1 else None
+        action_str = parts[2] if len(parts) > 2 else None
+        await handle_trail_command(request.app['session'], chat_id, coin_name, action_str)
 
     elif command_base in ('/history', '/lichsu', '/his'):
         parts = text.split()
