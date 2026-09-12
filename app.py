@@ -1318,24 +1318,15 @@ def _fmt_price(p):
 
 
 def _model_button_label(mid, current, live_prices):
-    """Nhãn nút chọn model: GIÁ RA TRƯỚC ($x.xx/$x.xx · Tên) để cột giá thẳng hàng —
-    Telegram luôn căn trái chữ trong button, tên dài ngắn khác nhau làm trông lệch.
-    Dấu ✅ (model đang dùng) đặt CUỐI để không đẩy lệch cột giá."""
+    """Nhãn nút chọn model: CHỈ TÊN (giá đã hiện trong text bên trên).
+    Dấu ✅ (model đang dùng) đặt cuối tên."""
     if live_prices and mid in live_prices:
-        pi, po, dn = live_prices[mid]
-        name = dn or mid
+        name = live_prices[mid][2] or mid
     else:
-        pi = po = None
         name = MINT_MODEL_LABELS.get(mid, mid)
-        if mid in MINT_MODEL_PRICES:
-            pi, po = MINT_MODEL_PRICES[mid]
-    if pi is not None:
-        label = f"{_fmt_price(pi)}/{_fmt_price(po)} · {name}"
-    else:
-        label = name
     if mid == current:
-        label = f"{label} ✅"
-    return label
+        name = f"{name} ✅"
+    return name
 
 
 async def handle_model_command(session, chat_id):
