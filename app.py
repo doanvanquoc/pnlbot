@@ -3858,7 +3858,7 @@ async def get_go_usage(session):
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
-    url = "https://api.mintrouter.ai/front/public/key-usage"
+    url = "https://api.mintrouter.ai/v0/front/public/key-usage"
     headers = _ai_headers(api_key)
     try:
         timeout = aiohttp.ClientTimeout(total=30)
@@ -3879,30 +3879,44 @@ async def get_go_usage(session):
 
 
 async def handle_usage_command(session, chat_id):
-    """Lệnh /usage: số dư MintRouter (API key-usage đã bị gỡ → chỉ thành công khi khôi phục)
-    + thống kê token AI mà BOT đã dùng theo local accounting (24h / 7 ngày / 30 ngày)."""
+    """Lệnh /usage: số dư + usage MintRouter (endpoint /v0/front/public/key-usage)
+    + thống kê token AI mà BOT tự đếm (24h / 7 ngày / 30 ngày) làm đối chiếu."""
     data, err = await get_go_usage(session)
-    balance_line = ""
-    if data:
-        balance = data.get('balance') or data.get('account_balance') or {}
-        try:
-            available = float(balance.get('available_micros', 0)) / 1_000_000
-            if available > 0:
-                balance_line = f"💰 Số dư khả dụng: ${available:.2f}\n"
-        except (TypeError, ValueError):
-            pass
     lines = [
-        "📊 *Usage AI của bot*",
+        "📊 *Usage MintRouter.ai*",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    if balance_line:
-        lines.append(balance_line)
+    if data:
+        balance = data.get('balance') or {}
+        try:
+            available = float(balance.get('available_micros', 0)) / 1_000_000
+            balance_line = f"💰 Số dư khả dụng: *${available:,.2f}*"
+            expires = data.get('expires_at') or ''
+            if expires and available > 0:
+                try:
+                    exp_ts = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                    days_left = (exp_ts - datetime.now(timezone.utc)).days
+                    balance_line += f" (tier hết hạn sau ~{days_left} ngày)"
+                except Exception:
+                    pass
+            lines.append(balance_line)
+        except (TypeError, ValueError):
+            lines.append("💰 Số dư: không đọc được")
+        usage = data.get('usage') or {}
+        for label, key in (("Hôm nay", 'today'), ("7 ngày", 'rolling_7d'), ("30 ngày", 'rolling_30d')):
+            w = usage.get(key) or {}
+            if isinstance(w, dict):
+                spend = float(w.get('spend_micros', 0)) / 1_000_000
+                lines.append(f"• {label}: {w.get('requests', 0)} request, {int(w.get('total_tokens', 0)):,} token, ${spend:,.4f}")
+            else:
+                lines.append(f"• {label}: ❓ không có dữ liệu")
+        if available <= 2.0:
+            lines.append("⚠️ *Số dư sắp cạn — nạp thêm trên mintrouter.ai để AI không ngưng chấm điểm!*")
     else:
-        lines.append("⚠️ MintRouter đã gỡ API key-usage (trả HTML thay JSON) — số dư credit xem trên web mintrouter.ai\n")
-    for label, days in (("24 giờ", 1), ("7 ngày", 7), ("30 ngày", 30)):
-        block = _fmt_llm_usage_days(days)
-        lines.append(f"📅 *{label}*" + ("\n" + block if block else " — không có cuộc gọi nào"))
-    lines.append("💵 Giá token theo model xem: https://mintrouter.ai/models")
+        lines.append(f"⚠️ Không lấy được usage từ MintRouter: {err}")
+    local_block = _fmt_llm_usage_days(7)
+    if local_block:
+        lines.append("\n🤖 Bot tự đếm (7 ngày, để đối chiếu):\n" + local_block)
     await send_telegram_message(session, chat_id, "\n".join(lines))
 
 
