@@ -563,6 +563,7 @@ def _ai_headers(api_key, session_id=None):
 # ─── Thống kê token LLM ở local (MintRouter đã gỡ API key-usage — endpoint trả HTML) ───
 LLM_USAGE_FILE = "llm_usage.json"
 llm_usage = {}   # day 'YYYY-MM-DD' (UTC) -> {model: {'calls': n, 'in': tokens, 'out': tokens}}
+_llm_usage_last_ts = 0.0  # ts của cuộc gọi LLM gần nhất (để bypass cache /usage khi có call mới)
 
 
 def _load_llm_usage():
@@ -590,6 +591,7 @@ def _save_llm_usage():
 
 def record_llm_usage(model, usage):
     """Ghi nhận tokens in/out từ trường `usage` của mỗi response chat completions."""
+    global _llm_usage_last_ts
     try:
         usage = usage or {}
         p = int(usage.get('prompt_tokens') or 0)
@@ -602,6 +604,7 @@ def record_llm_usage(model, usage):
         m['calls'] += 1
         m['in'] += p
         m['out'] += c
+        _llm_usage_last_ts = time.time()
         _save_llm_usage()
     except Exception as e:
         logger.warning(f"Lỗi ghi usage: {e}")
@@ -3999,8 +4002,13 @@ async def get_front_pass(session):
     """Quota PLAN thật từ /v0/front/pass (daily/weekly used-limit + reset_at). Cache 5 phút.
     Quota đếm theo GIÁ TRỊ OFFICIAL/pass-covered — KHÁC với spend_limits (metered $)."""
     now = time.time()
-    if getattr(get_front_pass, '_cache', None) and now - get_front_pass._cache[0] < 300:
-        return get_front_pass._cache[1], None, None
+    cached = getattr(get_front_pass, '_cache', None)
+    # Có cuộc gọi AI MỚI kể từ lần đọc cache cuối → bỏ cache lấy số mới
+    if (not force and cached and now - cached[0] < 300
+            and _llm_usage_last_ts <= cached[0]):
+        return cached[1], None, None
+    if cached:
+        get_front_pass._cache = None
     cookies = _load_front_session()
     if not cookies:
         cookies = await _front_login(session)
