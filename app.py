@@ -1252,6 +1252,8 @@ async def get_front_model_pricing(session):
                         prices[mid] = (float(pi), float(po), it.get('display_name') or mid)
                 if prices:
                     MODEL_PRICING_CACHE['data'] = prices
+                    MODEL_PRICING_CACHE['groups'] = {it.get('model'): it.get('group_name') or 'Khác'
+                                                     for it in items if it.get('model')}
                     MODEL_PRICING_CACHE['ts'] = now
                     return prices
                 return None
@@ -1261,6 +1263,53 @@ async def get_front_model_pricing(session):
                 continue
             return None
     return None
+
+
+def _model_provider(mid, live_prices):
+    """Provider của model: lấy group_name từ pricing API, fallback theo prefix id."""
+    if live_prices and mid in live_prices:
+        return None  # provider thật sẽ lấy từ API bên dưới
+    low = mid.lower()
+    if low.startswith('claude'):
+        return 'Claude'
+    if low.startswith(('gpt', 'o1', 'o3')):
+        return 'OpenAI'
+    if low.startswith('gemini'):
+        return 'Gemini'
+    if low.startswith('glm'):
+        return 'GLM'
+    if low.startswith(('grok', 'xai')):
+        return 'xAI'
+    if low.startswith('kimi'):
+        return 'Kimi'
+    return 'Khác'
+
+
+def _build_model_sections(available, live_prices):
+    """Gom model theo provider, trả về list [(provider, [model_id...])] theo thứ tự đẹp."""
+    # provider theo API (per_token có 'group'), fallback theo prefix
+    prov_map = {}
+    if live_prices:
+        for mid, (_pi, _po, _dn) in live_prices.items():
+            prov_map[mid] = None  # điền bên dưới từ dữ liệu API gốc
+    # Lấy group từ cache raw nếu có
+    raw_groups = MODEL_PRICING_CACHE.get('groups') or {}
+    sections = {}
+    for mid in available:
+        if 'free' in mid:
+            continue
+        prov = raw_groups.get(mid) or _model_provider(mid, live_prices) or 'Khác'
+        sections.setdefault(prov, []).append(mid)
+    order = ['Claude', 'OpenAI', 'Gemini', 'GLM', 'MintRouter', 'xAI', 'Kimi', 'Nemotron', 'MiMo', 'OpenCode', 'Khác']
+    def sort_key(prov):
+        return (order.index(prov) if prov in order else len(order), prov)
+    result = []
+    for prov in sorted(sections.keys(), key=sort_key):
+        mids = sections[prov]
+        # Trong cùng provider: model ưu tiên theo MINT_MODEL_ORDER trước
+        mids.sort(key=lambda m: (MINT_MODEL_ORDER.index(m) if m in MINT_MODEL_ORDER else 999, m))
+        result.append((prov, mids))
+    return result
 
 
 def _model_button_label(mid, current, live_prices):
@@ -1281,27 +1330,49 @@ def _model_button_label(mid, current, live_prices):
 
 
 async def handle_model_command(session, chat_id):
-    """Lệnh /model: list model + giá MintRouter, inline keyboard chọn → đổi DASH_MODEL + restart bot."""
+    """Lệnh /model: list model theo provider + giá MintRouter, inline keyboard chọn → đổi DASH_MODEL + restart bot."""
     available = await fetch_available_models(session)
     current = os.getenv("DASH_MODEL", "claude-sonnet-5")
     live_prices = await get_front_model_pricing(session)
-    # Sắp xếp: order ưu tiên trước, model còn lại xếp sau; loại model free (không dùng làm main)
-    ordered = [m for m in MINT_MODEL_ORDER if m in available]
-    rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
-    ordered += rest
+    sections = _build_model_sections(available, live_prices)
+    # Flat list theo thứ tự section để phân trang
+    flat = [(prov, m) for prov, mids in sections for m in mids]
     model_page_state[chat_id] = 0
+    pages = max(1, -(-len(flat) // MODEL_PAGE_SIZE))
     price_note = "giá mới nhất từ MintRouter" if live_prices else "giá tham khảo"
-    lines = [f"🤖 *MODEL AI HIỆN TẠI: {current}*", "", f"🔁 Bấm chọn model ({price_note}, $/1M in/out):"]
-    kb_rows = []
-    for m in ordered[:MODEL_PAGE_SIZE]:
-        kb_rows.append([{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}])
+    page_models = flat[:MODEL_PAGE_SIZE]
+    text = _render_model_page(current, pages, 0, price_note, page_models, live_prices)
+    kb_rows = [[{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}]
+               for _prov, m in page_models]
     kb_rows.append([{"text": "➡️ Trang sau", "callback_data": "modelpage:1"}])
-    lines.append(f"→ Trang 1/{max(1, -(-len(ordered) // MODEL_PAGE_SIZE))}")
     await send_telegram_message(
         session, chat_id,
-        "\n".join(lines),
+        text,
         reply_markup={"inline_keyboard": kb_rows}
     )
+
+
+def _render_model_page(current, pages, page, price_note, page_models, live_prices):
+    """Text trang /model: nhóm model cùng provider vào 1 mục có tiêu đề."""
+    lines = [f"🤖 *MODEL AI HIỆN TẠI: {current}*", f"→ Trang {page + 1}/{pages} — {price_note} ($/1M in/out):", ""]
+    last_prov = None
+    for prov, m in page_models:
+        if prov != last_prov:
+            lines.append(f"━━ {prov} ━━")
+            last_prov = prov
+        pi = po = None
+        if live_prices and m in live_prices:
+            pi, po, _dn = live_prices[m]
+        elif m in MINT_MODEL_PRICES:
+            pi, po = MINT_MODEL_PRICES[m]
+        name = (live_prices.get(m, (0, 0, m))[2] if live_prices and m in live_prices
+                else MINT_MODEL_LABELS.get(m, m))
+        mark = "✅" if m == current else "•"
+        if pi is not None:
+            lines.append(f"{mark} {name} — ${pi:g}/${po:g}")
+        else:
+            lines.append(f"{mark} {name}")
+    return "\n".join(lines)
 
 
 async def handle_model_callback(session, chat_id, cb_data, message_id=None, answer_cb=None):
@@ -1315,16 +1386,14 @@ async def handle_model_callback(session, chat_id, cb_data, message_id=None, answ
         available = await fetch_available_models(session)
         current = os.getenv("DASH_MODEL", "claude-sonnet-5")
         live_prices = await get_front_model_pricing(session)
-        ordered = [m for m in MINT_MODEL_ORDER if m in available]
-        rest = [m for m in available if m not in MINT_MODEL_ORDER and 'free' not in m]
-        ordered += rest
-        pages = max(1, -(-len(ordered) // MODEL_PAGE_SIZE))
+        sections = _build_model_sections(available, live_prices)
+        flat = [(prov, m) for prov, mids in sections for m in mids]
+        pages = max(1, -(-len(flat) // MODEL_PAGE_SIZE))
         page = max(0, min(page, pages - 1))
         model_page_state[chat_id] = page
-        chunk = ordered[page * MODEL_PAGE_SIZE:(page + 1) * MODEL_PAGE_SIZE]
-        kb_rows = []
-        for m in chunk:
-            kb_rows.append([{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}])
+        chunk = flat[page * MODEL_PAGE_SIZE:(page + 1) * MODEL_PAGE_SIZE]
+        kb_rows = [[{"text": _model_button_label(m, current, live_prices), "callback_data": f"setmodel:{m}"}]
+                   for _prov, m in chunk]
         nav = []
         if page > 0:
             nav.append({"text": "⬅️ Trước", "callback_data": f"modelpage:{page - 1}"})
@@ -1332,8 +1401,8 @@ async def handle_model_callback(session, chat_id, cb_data, message_id=None, answ
             nav.append({"text": "➡️ Sau", "callback_data": f"modelpage:{page + 1}"})
         if nav:
             kb_rows.append(nav)
-        text = (f"🤖 *MODEL AI HIỆN TẠI: {current}*\n"
-                f"→ Trang {page + 1}/{pages} — bấm chọn (giá $/1M in/out)")
+        price_note = "giá mới nhất từ MintRouter" if live_prices else "giá tham khảo"
+        text = _render_model_page(current, pages, page, price_note, chunk, live_prices)
         if message_id:
             await edit_telegram_message(session, chat_id, message_id, text, reply_markup={"inline_keyboard": kb_rows})
         else:
