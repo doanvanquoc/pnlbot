@@ -3995,6 +3995,64 @@ def _fmt_micros(v):
         return "?"
 
 
+async def get_front_pass(session):
+    """Quota PLAN thật từ /v0/front/pass (daily/weekly used-limit + reset_at). Cache 5 phút.
+    Quota đếm theo GIÁ TRỊ OFFICIAL/pass-covered — KHÁC với spend_limits (metered $)."""
+    now = time.time()
+    if getattr(get_front_pass, '_cache', None) and now - get_front_pass._cache[0] < 300:
+        return get_front_pass._cache[1], None, None
+    cookies = _load_front_session()
+    if not cookies:
+        cookies = await _front_login(session)
+        if not cookies:
+            return None, None, "chưa có session (thiếu MINTROUTER_EMAIL/PASSWORD trong .env)"
+    cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with session.get("https://api.mintrouter.ai/v0/front/pass", headers={
+            "Cookie": cookie_hdr,
+            "Origin": "https://mintrouter.ai",
+            "Referer": "https://mintrouter.ai/dashboard",
+            "Accept": "application/json",
+        }, timeout=timeout) as resp:
+            if resp.status == 401:
+                # session hết hạn → login lại 1 lần
+                cookies = await _front_login(session)
+                if not cookies:
+                    return None, None, "session hết hạn, không login lại được"
+                cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+                async with session.get("https://api.mintrouter.ai/v0/front/pass", headers={
+                    "Cookie": cookie_hdr,
+                    "Origin": "https://mintrouter.ai",
+                    "Accept": "application/json",
+                }, timeout=timeout) as resp2:
+                    if resp2.status != 200:
+                        return None, None, f"HTTP {resp2.status}"
+                    data = await resp2.json(content_type=None)
+            elif resp.status != 200:
+                return None, None, f"HTTP {resp.status}"
+            else:
+                data = await resp.json(content_type=None)
+            if isinstance(data, dict):
+                get_front_pass._cache = (time.time(), data)
+                if data.get('group_name'):
+                    FRONT_OVERVIEW_CACHE['plan'] = data.get('group_name')
+                return data, None, None
+            return None, None, "Định dạng không mong đợi"
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _fmt_reset_vn(iso_str):
+    """ISO datetime UTC → 'dd/MM HH:mm (giờ VN)'."""
+    try:
+        ts = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        vn = ts.astimezone(timezone(timedelta(hours=7)))
+        return vn.strftime("%d/%m %H:%M")
+    except Exception:
+        return "?"
+
+
 async def get_front_analysis(session):
     """Token composition 30 ngày từ dashboard MintRouter (/v0/front/dashboard/analysis). Cache 5 phút."""
     now = time.time()
@@ -4026,47 +4084,50 @@ async def get_front_analysis(session):
 
 
 async def handle_usage_command(session, chat_id):
-    """Lệnh /usage: Usage PLAN MintRouter (dashboard overview qua session) + credit + key usage."""
-    data, plan, err = await get_front_overview(session)
-    if data:
-        sl = data.get('spend_limits') or {}
+    """Lệnh /usage: QUOTA PLAN MintRouter từ /v0/front/pass — daily/weekly used/limit + giờ reset."""
+    pass_data, perr = await get_front_pass(session)
+    plan = (pass_data or {}).get('group_name') or FRONT_OVERVIEW_CACHE.get('plan')
+    data = None
+    if pass_data:
         lines = [
             "📊 *QUOTA PLAN MINTROUTER*",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
         if plan:
-            lines.append(f"🎫 Plan: *{plan}*")
-        # Quota mặc định của plan (Basic: $35/ngày, $240/tuần) — enforce bởi admin cap
-        cap_5h_def = sl.get('cap_5h_suggested_default_micros') or 0
-        cap_24h_def = sl.get('cap_24h_suggested_default_micros') or 0
-        cap_7d_def = sl.get('cap_7d_suggested_default_micros') or 0
+            lines.append(f"🎫 Plan: *{plan}*"
+                         + (f" (hết hạn {_fmt_reset_vn(pass_data.get('expires_at', ''))})" if pass_data.get('expires_at') else ""))
 
-        def _row(label, spent_key, cap_def, enforced):
-            spent = float(sl.get(spent_key, 0) or 0)
-            if enforced and cap_def > 0:
-                pct = spent / cap_def * 100
-                emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
-                return (f"{emoji} {label}: {_fmt_micros(spent)} / {_fmt_micros(cap_def)} "
-                        f"({pct:.1f}%) — còn {_fmt_micros(max(cap_def - spent, 0))}")
-            return None
+        def _row(label, blk):
+            limit = float((blk or {}).get('limit', 0) or 0)
+            used = float((blk or {}).get('used', 0) or 0)
+            if limit <= 0:
+                return f"🟢 {label}: ${used:,.2f} (không giới hạn)"
+            pct = used / limit * 100
+            emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
+            return (f"{emoji} {label}: *${used:,.2f}* / ${limit:,.0f} ({pct:.1f}%) — còn ${limit - used:,.2f}")
 
-        row_5h = _row("Quota 5 giờ", 'spend_5h_micros', cap_5h_def, sl.get('cap_5h_admin_active') or sl.get('cap_5h_enabled'))
-        if not (sl.get('cap_5h_admin_active') or sl.get('cap_5h_enabled')):
-            row_5h = None  # MintRouter chưa bật quota 5h trên account này → ẩn
-        if row_5h:
-            lines.append(row_5h)
-        lines.append(_row("Quota NGÀY", 'spend_24h_micros', cap_24h_def, sl.get('cap_24h_admin_active')))
-        lines.append(_row("Quota TUẦN", 'spend_7d_micros', cap_7d_def,
-                          sl.get('cap_7d_admin_active') or sl.get('cap_24h_admin_active')))
-        kpi = data.get('kpi') or {}
-        lines.append(
-            f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
-            f"{int(kpi.get('total_tokens', 0)):,} token, "
-            f"thành công {kpi.get('success_rate', 0):.0f}%"
-        )
-        # Tokens 30 ngày (số token MỚI là usage thật; phần lớn là cache-hit rẻ)
+        lines.append(_row("Quota NGÀY", pass_data.get('daily')))
+        reset_d = (pass_data.get('daily') or {}).get('reset_at')
+        if reset_d:
+            lines.append(f"   ↻ Reset ngày: {_fmt_reset_vn(reset_d)} (giờ VN)")
+        lines.append(_row("Quota TUẦN", pass_data.get('weekly')))
+        reset_w = (pass_data.get('weekly') or {}).get('reset_at')
+        if reset_w:
+            lines.append(f"   ↻ Reset tuần: {_fmt_reset_vn(reset_w)} (giờ VN)")
+        # Tokens hôm nay + 30 ngày (dùng session còn sống nếu có)
         try:
-            adata, aerr, _ = await get_front_analysis(session)
+            data, _, _ = await get_front_overview(session)
+        except Exception:
+            data = None
+        kpi = (data or {}).get('kpi') or {}
+        if kpi:
+            lines.append(
+                f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
+                f"{int(kpi.get('total_tokens', 0)):,} token, "
+                f"thành công {kpi.get('success_rate', 0):.0f}%"
+            )
+        try:
+            adata, _, _ = await get_front_analysis(session)
             tc = (adata or {}).get('token_composition') or {}
             if tc and tc.get('total_tokens'):
                 lines.append(
@@ -4078,11 +4139,11 @@ async def handle_usage_command(session, chat_id):
             pass
         await send_telegram_message(session, chat_id, "\n".join(lines))
         return
-    # Fallback: key-usage công khai + local stats
+    # Fallback: overview spend_limits (metered $) + key-usage + local stats
     key_data, kerr = await get_go_usage(session)
     lines = ["📊 *Usage MintRouter (key)*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
-    if err:
-        lines.append(f"⚠️ Không lấy được quota plan: {err}")
+    if perr:
+        lines.append(f"⚠️ Không lấy được quota plan: {perr}")
     if key_data:
         usage = key_data.get('usage') or {}
         for label, key in (("Hôm nay", 'today'), ("7 ngày", 'rolling_7d'), ("30 ngày", 'rolling_30d')):
@@ -4092,10 +4153,10 @@ async def handle_usage_command(session, chat_id):
                 lines.append(f"• {label}: {w.get('requests', 0)} request, {int(w.get('total_tokens', 0)):,} token, ${spend:,.4f}")
     elif kerr:
         lines.append(f"⚠️ Không lấy được key usage: {kerr}")
-    local_block = _fmt_llm_usage_days(7)
-    if local_block:
-        lines.append("\n🤖 Bot tự đếm (7 ngày):\n" + local_block)
     await send_telegram_message(session, chat_id, "\n".join(lines))
+
+
+
 
 
 async def handle_scan_history_command(session, chat_id):
