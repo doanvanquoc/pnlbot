@@ -4053,6 +4053,23 @@ def _fmt_reset_vn(iso_str):
         return "?"
 
 
+def _fmt_remaining(iso_str):
+    """ISO datetime UTC → thời gian còn lại: '2 ngày 10h' / '15h20p'."""
+    try:
+        ts = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        delta = ts - datetime.now(timezone.utc)
+        secs = max(int(delta.total_seconds()), 0)
+        days, rem = divmod(secs, 86400)
+        hours, mins = divmod(rem, 3600)
+        if days > 0:
+            return f"{days} ngày {hours}h"
+        if hours > 0:
+            return f"{hours}h{mins}p"
+        return f"{mins}p"
+    except Exception:
+        return "?"
+
+
 async def get_front_analysis(session):
     """Token composition 30 ngày từ dashboard MintRouter (/v0/front/dashboard/analysis). Cache 5 phút."""
     now = time.time()
@@ -4084,64 +4101,38 @@ async def get_front_analysis(session):
 
 
 async def handle_usage_command(session, chat_id):
-    """Lệnh /usage: QUOTA PLAN MintRouter từ /v0/front/pass — daily/weekly used/limit + giờ reset."""
+    """Lệnh /usage: QUOTA PLAN MintRouter — ngắn gọn, reset hiển thị theo thời gian còn lại."""
     pass_data, _, perr = await get_front_pass(session)
     plan = (pass_data or {}).get('group_name') or FRONT_OVERVIEW_CACHE.get('plan')
-    data = None
     if pass_data:
-        lines = [
-            "📊 *QUOTA PLAN MINTROUTER*",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        ]
-        if plan:
-            lines.append(f"🎫 Plan: *{plan}*"
-                         + (f" (hết hạn {_fmt_reset_vn(pass_data.get('expires_at', ''))})" if pass_data.get('expires_at') else ""))
+        lines = [f"📊 *QUOTA PLAN* — {plan or 'MintRouter'} (còn {_fmt_remaining(pass_data.get('expires_at', ''))})"]
 
         def _row(label, blk):
-            limit = float((blk or {}).get('limit', 0) or 0)
-            used = float((blk or {}).get('used', 0) or 0)
+            blk = blk or {}
+            limit = float(blk.get('limit', 0) or 0)
+            used = float(blk.get('used', 0) or 0)
+            tail = f" — reset sau {_fmt_remaining(blk.get('reset_at', ''))}" if blk.get('reset_at') else ""
             if limit <= 0:
-                return f"🟢 {label}: ${used:,.2f} (không giới hạn)"
+                return f"🟢 {label}: ${used:,.2f}"
             pct = used / limit * 100
             emoji = "🟥" if pct >= 90 else ("🟨" if pct >= 60 else "🟩")
-            return (f"{emoji} {label}: *${used:,.2f}* / ${limit:,.0f} ({pct:.1f}%) — còn ${limit - used:,.2f}")
+            return f"{emoji} {label}: ${used:,.2f}/${limit:,.0f} ({pct:.0f}%)" + tail
 
-        lines.append(_row("Quota NGÀY", pass_data.get('daily')))
-        reset_d = (pass_data.get('daily') or {}).get('reset_at')
-        if reset_d:
-            lines.append(f"   ↻ Reset ngày: {_fmt_reset_vn(reset_d)} (giờ VN)")
-        lines.append(_row("Quota TUẦN", pass_data.get('weekly')))
-        reset_w = (pass_data.get('weekly') or {}).get('reset_at')
-        if reset_w:
-            lines.append(f"   ↻ Reset tuần: {_fmt_reset_vn(reset_w)} (giờ VN)")
-        # Tokens hôm nay + 30 ngày (dùng session còn sống nếu có)
+        lines.append(_row("Ngày", pass_data.get('daily')))
+        lines.append(_row("Tuần", pass_data.get('weekly')))
         try:
             data, _, _ = await get_front_overview(session)
-        except Exception:
-            data = None
-        kpi = (data or {}).get('kpi') or {}
-        if kpi:
-            lines.append(
-                f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
-                f"{int(kpi.get('total_tokens', 0)):,} token, "
-                f"thành công {kpi.get('success_rate', 0):.0f}%"
-            )
-        try:
-            adata, _, _ = await get_front_analysis(session)
-            tc = (adata or {}).get('token_composition') or {}
-            if tc and tc.get('total_tokens'):
-                lines.append(
-                    f"🧮 30 ngày: {int(tc.get('total_tokens', 0)):,} token "
-                    f"(in {int(tc.get('input_tokens', 0)):,}, out {int(tc.get('output_tokens', 0)):,}, "
-                    f"cache {int(tc.get('cached_tokens', 0)):,})"
-                )
+            kpi = (data or {}).get('kpi') or {}
+            if kpi:
+                lines.append(f"📈 Hôm nay: {kpi.get('total_requests', 0)} request, "
+                             f"{int(kpi.get('total_tokens', 0)):,} token, "
+                             f"thành công {kpi.get('success_rate', 0):.0f}%")
         except Exception:
             pass
         await send_telegram_message(session, chat_id, "\n".join(lines))
         return
-    # Fallback: overview spend_limits (metered $) + key-usage + local stats
     key_data, kerr = await get_go_usage(session)
-    lines = ["📊 *Usage MintRouter (key)*", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📊 *Usage MintRouter (key)*"]
     if perr:
         lines.append(f"⚠️ Không lấy được quota plan: {perr}")
     if key_data:
