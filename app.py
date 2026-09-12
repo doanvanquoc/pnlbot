@@ -1107,6 +1107,19 @@ def get_binance_signature(query_string, secret_key):
         hashlib.sha256
     ).hexdigest()
 
+
+def _signed_url(path, params, api_secret, base="https://fapi.binance.com", method_extra=None):
+    """URL Binance đã ký ĐÚNG chuẩn: params percent-encode trước rồi mới ký (Binance verify
+    trên chuỗi đã encode — ký chuỗi thô sẽ vỡ với symbol chữ TQ như 我踏马来了USDT → -1022).
+    Trả về yarl.URL(encoded=True) để aiohttp KHÔNG encode lại lần nữa (lệch chữ ký).
+    params: dict, thứ tự chèn giữ nguyên khi tạo dict."""
+    p = dict(params)
+    p['timestamp'] = int(time.time() * 1000)
+    p.setdefault('recvWindow', 10000)
+    query = urlencode(p)
+    sig = get_binance_signature(query, api_secret)
+    return yarl.URL(f"{base}{path}?{query}&signature={sig}", encoded=True)
+
 # Gửi tin nhắn Telegram
 # Mốc thời gian (epoch) đến khi hết cửa sổ flood 429 của Telegram — mọi send chia sẻ chung,
 # tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
@@ -1636,17 +1649,9 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
     """
     headers = {"X-MBX-APIKEY": api_key}
     try:
-        timestamp = int(time.time() * 1000)
-        params = [
-            f"symbol={symbol}",
-            f"timestamp={timestamp}&recvWindow=10000"
-        ]
-        query = "&".join(params)
-        sig = get_binance_signature(query, api_secret)
-        url = f"https://fapi.binance.com/fapi/v1/openOrders?{query}&signature={sig}"
+        url = _signed_url('/fapi/v1/openOrders', {'symbol': symbol}, api_secret)
 
-        # encoded=True: không để yarl decode/encode lại URL (signature phải khớp chuỗi gửi đi)
-        async with session.get(yarl.URL(url, encoded=True), headers=headers) as resp:
+        async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 orders = await resp.json()
                 if isinstance(orders, list):
@@ -1656,12 +1661,9 @@ async def cancel_dca_orders(session, api_key, api_secret, symbol):
                         if "dca" in client_order_id.lower():
                             order_id = order.get('orderId')
                             if order_id:
-                                del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}&recvWindow=10000"
-                                del_sig = get_binance_signature(del_query, api_secret)
-                                del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
+                                del_url = _signed_url('/fapi/v1/order', {'symbol': symbol, 'orderId': order_id}, api_secret)
 
-                                async with session.delete(yarl.URL(del_url, encoded=True), headers=headers) as del_resp:
+                                async with session.delete(del_url, headers=headers) as del_resp:
                                     del_data = await del_resp.json()
                                     if del_resp.status == 200:
                                         cancelled_count += 1
@@ -2602,21 +2604,20 @@ async def handle_history_command(session, chat_id, coin_name=None):
         symbol = coin_name if coin_name.endswith("USDT") else f"{coin_name}USDT"
         
     timestamp = int(time.time() * 1000)
-    params = [
-        "incomeType=REALIZED_PNL",
-        "limit=100",  # Lấy nhiều bản ghi thô hơn để sau khi gom nhóm không bị thiếu
-        f"timestamp={timestamp}&recvWindow=10000"
-    ]
+    params = {
+        'incomeType': 'REALIZED_PNL',
+        'limit': 100,
+        'timestamp': timestamp,
+        'recvWindow': 10000,
+    }
     if symbol:
-        params.insert(0, f"symbol={symbol}")
+        params['symbol'] = symbol
 
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/income?{query_string}&signature={signature}"
+    url = _signed_url('/fapi/v1/income', params, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
 
     try:
-        async with session.get(yarl.URL(url, encoded=True), headers=headers) as resp:
+        async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if not data:
@@ -7406,10 +7407,7 @@ async def get_symbol_precisions(session, symbol):
 
 # Lấy đòn bẩy tối đa của symbol
 async def get_max_leverage(session, api_key, api_secret, symbol):
-    timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&timestamp={timestamp}&recvWindow=10000"
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/leverageBracket?{query_string}&signature={signature}"
+    url = _signed_url('/fapi/v1/leverageBracket', {'symbol': symbol}, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
     try:
         async with session.get(url, headers=headers) as resp:
@@ -7429,10 +7427,7 @@ async def get_max_leverage(session, api_key, api_secret, symbol):
 
 # Cài đặt đòn bẩy
 async def set_leverage(session, api_key, api_secret, symbol, leverage):
-    timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}&recvWindow=10000"
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
+    url = _signed_url('/fapi/v1/leverage', {'symbol': symbol, 'leverage': leverage}, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
     try:
         async with session.post(url, headers=headers) as resp:
@@ -7671,15 +7666,8 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
     headers = {"X-MBX-APIKEY": api_key}
     
     # 1. Hủy các lệnh điều kiện của Algo Service
-    params = [
-        f"symbol={symbol}",
-        "algoType=CONDITIONAL",
-        f"timestamp={timestamp}&recvWindow=10000"
-    ]
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/openAlgoOrders?{query_string}&signature={signature}"
-    
+    url = _signed_url('/fapi/v1/openAlgoOrders', {'symbol': symbol, 'algoType': 'CONDITIONAL'}, api_secret)
+
     try:
         async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
@@ -7698,11 +7686,8 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                         if (is_tp and cancel_tp) or (is_sl and cancel_sl):
                             algo_id = order.get('algoId')
                             if algo_id:
-                                del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&algoId={algo_id}&timestamp={del_timestamp}&recvWindow=10000"
-                                del_sig = get_binance_signature(del_query, api_secret)
-                                del_url = f"https://fapi.binance.com/fapi/v1/algoOrder?{del_query}&signature={del_sig}"
-                                
+                                del_url = _signed_url('/fapi/v1/algoOrder', {'symbol': symbol, 'algoId': algo_id}, api_secret)
+
                                 async with session.delete(del_url, headers=headers) as del_resp:
                                     del_data = await del_resp.json()
                                     if del_resp.status == 200:
@@ -7717,15 +7702,8 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
 
     # 2. Hủy các lệnh dừng/chốt lời thông thường (Regular Orders)
     try:
-        timestamp_reg = int(time.time() * 1000)
-        params_reg = [
-            f"symbol={symbol}",
-            f"timestamp={timestamp_reg}&recvWindow=10000"
-        ]
-        query_reg = "&".join(params_reg)
-        sig_reg = get_binance_signature(query_reg, api_secret)
-        url_reg = f"https://fapi.binance.com/fapi/v1/openOrders?{query_reg}&signature={sig_reg}"
-        
+        url_reg = _signed_url('/fapi/v1/openOrders', {'symbol': symbol}, api_secret)
+
         async with session.get(url_reg, headers=headers) as resp_reg:
             if resp_reg.status == 200:
                 orders_reg = await resp_reg.json()
@@ -7743,11 +7721,8 @@ async def cancel_existing_tpsl(session, api_key, api_secret, symbol, position_si
                         if (is_tp and cancel_tp) or (is_sl and cancel_sl):
                             order_id = order.get('orderId')
                             if order_id:
-                                del_timestamp = int(time.time() * 1000)
-                                del_query = f"symbol={symbol}&orderId={order_id}&timestamp={del_timestamp}&recvWindow=10000"
-                                del_sig = get_binance_signature(del_query, api_secret)
-                                del_url = f"https://fapi.binance.com/fapi/v1/order?{del_query}&signature={del_sig}"
-                                
+                                del_url = _signed_url('/fapi/v1/order', {'symbol': symbol, 'orderId': order_id}, api_secret)
+
                                 async with session.delete(del_url, headers=headers) as del_resp:
                                     del_data = await del_resp.json()
                                     if del_resp.status == 200:
@@ -7766,28 +7741,23 @@ async def place_algo_tpsl(session, api_key, api_secret, symbol, order_side, orde
     Đặt một lệnh Algo TP/SL (TAKE_PROFIT_MARKET / STOP_MARKET) trên Binance.
     Trả về (thành_công, order_id hoặc thông báo lỗi).
     """
-    timestamp = int(time.time() * 1000)
-    params = [
-        f"symbol={symbol}",
-        f"side={order_side}",
-        f"type={order_type}",
-        f"triggerPrice={trigger_price}",
-        "algoType=CONDITIONAL",
-        f"timestamp={timestamp}&recvWindow=10000"
-    ]
+    params = {
+        'symbol': symbol,
+        'side': order_side,
+        'type': order_type,
+        'triggerPrice': trigger_price,
+        'algoType': 'CONDITIONAL',
+    }
     if quantity is not None:
-        params.append(f"quantity={quantity}")
-        params.append("reduceOnly=true")
+        params['quantity'] = quantity
+        params['reduceOnly'] = 'true'
     elif close_position:
-        params.append("closePosition=true")
+        params['closePosition'] = 'true'
     if pos_side and pos_side != 'BOTH':
-        params.append(f"positionSide={pos_side}")
-        
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/algoOrder?{query_string}&signature={signature}"
+        params['positionSide'] = pos_side
+    url = _signed_url('/fapi/v1/algoOrder', params, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
-    
+
     try:
         async with session.post(url, headers=headers) as resp:
             data = await resp.json()
@@ -7913,26 +7883,22 @@ async def handle_order_command(session, chat_id, side_type, coin_name, volume_st
     timestamp = int(time.time() * 1000)
     
     # Các tham số cho API đặt lệnh
-    params = [
-        f"symbol={symbol}",
-        f"side={side}",
-        f"type={'LIMIT' if is_limit else 'MARKET'}",
-        f"quantity={quantity}",
-        f"timestamp={timestamp}&recvWindow=10000"
-    ]
+    params = {
+        'symbol': symbol,
+        'side': side,
+        'type': 'LIMIT' if is_limit else 'MARKET',
+        'quantity': quantity,
+    }
     if is_limit:
-        params.append(f"price={limit_price}")
-        params.append("timeInForce=GTC")
+        params['price'] = limit_price
+        params['timeInForce'] = 'GTC'
         client_order_id = f"pnlbot_limit_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-        params.append(f"newClientOrderId={client_order_id}")
-        
+        params['newClientOrderId'] = client_order_id
+
     if hedge_mode:
-        params.append(f"positionSide={pos_side}")
-        
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    
-    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+        params['positionSide'] = pos_side
+
+    url = _signed_url('/fapi/v1/order', params, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
@@ -8052,12 +8018,9 @@ async def handle_leverage_command(session, chat_id, coin_name, leverage_str):
         return
         
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&leverage={leverage}&timestamp={timestamp}&recvWindow=10000"
-    signature = get_binance_signature(query_string, api_secret)
-    
-    url = f"https://fapi.binance.com/fapi/v1/leverage?{query_string}&signature={signature}"
+    url = _signed_url('/fapi/v1/leverage', {'symbol': symbol, 'leverage': leverage}, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
-    
+
     try:
         async with session.post(url, headers=headers) as resp:
             data = await resp.json()
@@ -8353,27 +8316,24 @@ async def handle_dca_command(session, chat_id, coin_name, volume_str, diff_str):
         # 3. Đặt lệnh LIMIT cùng chiều với vị thế hiện tại để DCA tăng vị thế
         order_side = 'BUY' if is_long else 'SELL'
         pos_side = side # LONG, SHORT, BOTH
-        
+
         timestamp = int(time.time() * 1000)
         client_order_id = f"pnlbot_dca_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-        params = [
-            f"symbol={symbol}",
-            f"side={order_side}",
-            "type=LIMIT",
-            f"quantity={quantity_dca}",
-            f"price={dca_price}",
-            "timeInForce=GTC",
-            f"newClientOrderId={client_order_id}",
-            f"timestamp={timestamp}&recvWindow=10000"
-        ]
-        
+        params = {
+            'symbol': symbol,
+            'side': order_side,
+            'type': 'LIMIT',
+            'quantity': quantity_dca,
+            'price': dca_price,
+            'timeInForce': 'GTC',
+            'newClientOrderId': client_order_id,
+        }
+
         if hedge_mode:
-            params.append(f"positionSide={pos_side}")
-            
-        query_string = "&".join(params)
-        signature = get_binance_signature(query_string, api_secret)
-        url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
-        
+            params['positionSide'] = pos_side
+
+        url = _signed_url('/fapi/v1/order', params, api_secret)
+
         try:
             async with session.post(url, headers=headers) as resp:
                 data = await resp.json()
@@ -8407,11 +8367,9 @@ async def handle_cancel_command(session, chat_id, coin_name, order_id_str):
         return
         
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&orderId={order_id}&timestamp={timestamp}&recvWindow=10000"
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+    url = _signed_url('/fapi/v1/order', {'symbol': symbol, 'orderId': order_id}, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
-    
+
     try:
         async with session.delete(url, headers=headers) as resp:
             data = await resp.json()
@@ -8523,24 +8481,21 @@ async def handle_close_command(session, chat_id, coin_name, side_str=None):
         
     is_long = (pos_side == 'LONG' or (pos_side == 'BOTH' and amt > 0))
     side = 'SELL' if is_long else 'BUY'
-    
+
     timestamp = int(time.time() * 1000)
-    params = [
-        f"symbol={symbol}",
-        f"side={side}",
-        "type=MARKET",
-        f"quantity={abs_amt}",
-        f"timestamp={timestamp}&recvWindow=10000",
-    ]
-    
+    params = {
+        'symbol': symbol,
+        'side': side,
+        'type': 'MARKET',
+        'quantity': abs_amt,
+    }
+
     if pos_side != 'BOTH':
-        params.append(f"positionSide={pos_side}")
+        params['positionSide'] = pos_side
     else:
-        params.append("reduceOnly=true")
-        
-    query_string = "&".join(params)
-    signature = get_binance_signature(query_string, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/order?{query_string}&signature={signature}"
+        params['reduceOnly'] = 'true'
+
+    url = _signed_url('/fapi/v1/order', params, api_secret)
     headers = {"X-MBX-APIKEY": api_key}
     
     try:
