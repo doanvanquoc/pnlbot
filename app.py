@@ -2214,13 +2214,23 @@ async def _agent_execute(session, chat_id, name, args):
                     if 'SẮP ĐÁ' in ln:
                         target_ln = ln; break
             if target_ln:
-                q_words = set(re.split(r'[^a-z0-9]+', q.lower())) - {''}
-                teams = re.findall(r'([A-Z][\w\'\.]+(?: [A-Z][\w\'\.]+){0,3})', target_ln)
-                cands = [t for t in teams if len(t) > 3
-                         and not any(w in t.lower() for w in q_words)
-                         and not re.search(r'ĐÃ|SẮP|ĐANG|Premier|League|La|Liga|Serie|Bundes|Ligue|Championship|Cup|Copa|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|September|October|November|December|January|February|March|April|May|June|July|August', t)]
-                if cands:
-                    opponent = cands[0].strip()
+                vm = re.search(r':\s*(.+?)\s+vs\s+(.+?)(?:\s+lúc|$)', target_ln)
+                if vm:
+                    home_t, away_t = vm.group(1).strip(), vm.group(2).strip()
+                    ql = q.lower().strip()
+                    q_full = (TEAM_SKY_SLUGS.get(ql) or '').replace('-', ' ')
+                    def _is_q(team_name):
+                        tn = team_name.lower()
+                        if ql in tn or (q_full and q_full in tn):
+                            return True
+                        return any(TEAM_SKY_SLUGS.get(w, '').replace('-', ' ') in tn
+                                   for w in re.split(r'[^a-z0-9]+', ql) if w in TEAM_SKY_SLUGS)
+                    if _is_q(home_t) and not _is_q(away_t):
+                        opponent = away_t
+                    elif _is_q(away_t) and not _is_q(home_t):
+                        opponent = home_t
+                    else:
+                        opponent = away_t  # mặc định: hỏi đội nhà thì đối thủ là đội khách
             if opponent:
                 opp_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
                 opp_parsed = ''
