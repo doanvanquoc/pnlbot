@@ -914,6 +914,7 @@ Sau đó:
 - Ước lượng XÁC SUẤT THẬT (%) cho kèo định chọn dựa trên tổng điểm (tổng ≥ 21/30 mới cho xác suất >60%; 18-20/30 cho 55-60%; <18/30 → KHÔNG nên chọn kèo, trả not_found hoặc chọn kèo phòng thủ khác).
 - SO SÁNH odds nhà cái: xác suất ngụ ý của odds = 1/odds. Value chỉ khi xác suất thật của mày cao hơn xác suất ngụ ý ≥ 3 điểm %.
 - CHỈ chọn kèo có dữ liệu đủ (thiếu 2+ yếu tố trên → không chọn mù).
+- QUAN TRỌNG: yếu tố nào thiếu dữ liệu web thì CHẤM THEO KIẾN THỨC BÓNG ĐÁ của mày (phong độ gần đây, danh tiếng đội, derby, mùa trước...) và ghi chú "(ước lượng)". KHÔNG BAO GIỜ trả 0 điểm cho toàn bộ — điểm 0/30 là TRẢ LỜI SAI. Tổng điểm 0 = mày không làm việc.
 """
 
 PICK_MARKETS = {
@@ -1854,7 +1855,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "- Hỏi thành tích dự đoán của bot → my_stats. "
         "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
         "Gọi tool cho tới khi có đủ dữ liệu trả lời đầy đủ (tối đa 4 lượt tool). "
-        "Cuối cùng tổng hợp trả lời ngắn gọn tiếng Việt, không markdown. "
+        "Cuối cùng tổng hợp trả lời ngắn gọn tiếng Việt. KHÔNG dùng bảng markdown (| | |) — Telegram không render, "
+        "dùng dòng đạn '• ' hoặc ' - ' cho danh sách kèo. "
         "Người dùng là ADMIN DUY NHẤT — hỏi gì về bot/AI cũng trả lời thẳng, không chối."
     )
     messages = [{"role": "system", "content": system_prompt},
