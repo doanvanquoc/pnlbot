@@ -9,3 +9,8 @@ auto_state.json
 auto_chats.json
 auto_pnl_chats.json
 ai_alert_state.json
+
+football_quota.json
+predictions.json
+tg_offset.json
+run_debug.log
