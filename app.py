@@ -1901,8 +1901,10 @@ async def _agent_execute(session, chat_id, name, args):
             "- Góc: Xỉu 9.5 (tin cậy 52%)\n"
             "Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
             "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/TRUNG QUỐC/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
-            "NẾU đội được hỏi ĐANG ĐÁ (trong dữ liệu có dòng ĐANG ĐÁ) thì phân tích TRẬN ĐANG ĐÁ đó theo diễn biến hiện tại, "
-            "không chọn trận tương lai."
+            "NẾU đội được hỏi ĐANG ĐÁ (dòng ĐANG ĐÁ) thì ƯU TIÊN TỐI ĐA phân tích TRẬN ĐANG ĐÁ: "
+            "đưa NGAY 6 kèo LIVE (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc) dựa trên tỉ số + phút hiện tại + thế trận, "
+            "ví dụ 'Celta đang dẫn 1-0 phút 53 → kèo châu Á Celta -0.5 có giá, tài xỉu line 2.5 → Xỉu nghiêng về...' — "
+            "đây là kèo người dùng có thể đánh NGAY trên app. Kèo trận tương lai chỉ để phụ, 1-2 dòng cuối."
         )
         data_parts = []
         if fetched:
