@@ -830,6 +830,8 @@ ODDS_SPORT_KEYS = {
     'French Ligue 1': 'soccer_france_ligue_one', 'ligue-1': 'soccer_france_ligue_one',
     'Champions League': 'soccer_uefa_champs_league', 'UEFA Champions League': 'soccer_uefa_champs_league',
     'Europa League': 'soccer_uefa_europa_league', 'UEFA Europa League': 'soccer_uefa_europa_league',
+    'MLS': 'soccer_usa_mls', 'mls': 'soccer_usa_mls',
+    'EFL Championship': 'soccer_efl_champ', 'efl-championship': 'soccer_efl_champ',
 }
 ODDS_BOARD_CACHE = {}  # sport_key -> (events, ts)
 odds_quota = {'month': '', 'used': 0, 'remaining': None}
