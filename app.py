@@ -1894,7 +1894,11 @@ async def _agent_execute(session, chat_id, name, args):
             "QUY TẮC: người dùng nêu 1 đội → trận gần nhất của đội đó (ĐANG ĐÁ ưu tiên tối đa, kèo LIVE theo tỉ số+phút); "
             "nêu 2 đội → trận đối đầu. PHẢI phân tích cả 2 đội trong đầu. Đủ 6 kèo. "
             "DỮ LIỆU TRẬN từ Sky Sports là CHÍNH THỨC — tin tuyệt đối, không suy diễn 'Copa del Rey' hay 'hạng dưới'. "
-            "Tiếng Việt thuần, mỗi kèo 1 dòng, CẤM bảng |, **, ###. Không hỏi lại người dùng, không chào hỏi."
+            "Tiếng Việt thuần, mỗi kèo 1 dòng, CẤM bảng |, **, ###. Không hỏi lại người dùng, không chào hỏi.\n"
+            "CỨNG LỆNH: BẮT BUỘC đưa đủ 6 kèo với lựa chọn cụ thể + tin cậy % TRONG MỌI TRƯỜNG HỢP — "
+            "dù không có odds, dù dữ liệu mỏng. Không odds thì chốt kèo theo phân tích của mày và ghi '(chưa có odds)'. "
+            "TUYỆT ĐỐI CẤM trả lời kiểu 'chưa có tỷ lệ nên không phán', 'chờ odds', 'gửi odds giúp' — đó là THẤT BẠI. "
+            "Mày là chuyên gia, chuyên gia chốt kèo bằng chuyên môn, không đòi khách đưa số liệu."
         )
         data_parts = []
         opponent = None
