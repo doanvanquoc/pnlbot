@@ -1700,6 +1700,9 @@ def _clean_tg(text):
         else:
             lines.append(ln)
     text = '\n'.join(lines)
+    # Xoá nốt mọi ký tự | sót lại + dòng chỉ toàn gạch/ngang rỗng
+    text = text.replace('|', ' ')
+    text = re.sub(r'^\s*[—–\-\.\s]{2,}\s*$', '', text, flags=re.MULTILINE)
     # bỏ dòng chứa Cyrillic (Nga) hoặc chữ Trung — rác
     out = []
     for ln in text.split('\n'):
@@ -1785,8 +1788,16 @@ def _parse_sky_fixtures(pg):
         r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
         r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+[^A-Z]{0,25}\s*In Play',
         pg)
+    # bắt luôn phút đá: "... 0 Malaga 0 36' In Play"
+    minute = re.search(
+        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([\d\+\'&#;x ]{1,15}?)\s*In Play', pg)
+    min_txt = ''
+    if minute:
+        raw_min = minute.group(5)
+        mm = re.search(r'(\d+)', raw_min)
+        min_txt = f" (phút {mm.group(1)})" if mm else ''
     for date_str, league, h, gh, a, ga in live[:6]:
-        lines.append(f"🔴 ĐANG ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}")
+        lines.append(f"🔴 ĐANG ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}{min_txt}")
     upcoming = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
         r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
@@ -1880,6 +1891,13 @@ async def _agent_execute(session, chat_id, name, args):
             "7. Chốt: kèo tự tin nhất + combo nếu có + cảnh báo rủi ro.\n"
             "Trình bày dễ đọc trên Telegram: tiêu đề in hoa, gạch đầu dòng '- ', MỖI MỤC THÔNG TIN MỘT DÒNG RIÊNG, "
             "TUYỆT ĐỐI CẤM dùng bảng markdown, ký tự | hoặc ---. KHÔNG dùng ký tự ** hay ###. "
+            "PHẦN KÈO PHẢI viết đúng mẫu này (mỗi kèo 1 dòng):\n"
+            "- 1X2: Celta thắng (tin cậy 65%)\n"
+            "- Tài xỉu 2.5: Xỉu (tin cậy 70%)\n"
+            "- Châu Á: Celta -0.5 (tin cậy 60%)\n"
+            "- BTTS: Không (tin cậy 62%)\n"
+            "- Thẻ: Tài 4.5 (tin cậy 55%)\n"
+            "- Góc: Xỉu 9.5 (tin cậy 52%)\n"
             "Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
             "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/TRUNG QUỐC/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
             "NẾU đội được hỏi ĐANG ĐÁ (trong dữ liệu có dòng ĐANG ĐÁ) thì phân tích TRẬN ĐANG ĐÁ đó theo diễn biến hiện tại, "
