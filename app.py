@@ -906,8 +906,10 @@ KEO_FRAMEWORK = """BẮT BUỘC chấm điểm 6 yếu tố sau (tối đa 5 đi
 2. ĐỐI ĐẦU (5đ): 3-5 lần gặp gần nhất, đang có sự thống trị nào không, tổng bàn trung bình các cuộc đối đầu (cho kèo tài/xỉu).
 3. ĐỘNG LỰC (5đ): trận này có ý nghĩa gì — đua vô địch/top 4/trụ hạng/cúp; đội có giữ sức cho trận lớn khác; derby; đội hết động lực cuối mùa.
 4. LỰC LƯỢNG (5đ): chấn thương/treo giò cầu thủ chủ chốt, xoay vòng đội hình, chuyển nhượng mới (chỉ dùng dữ liệu web tin cậy, KHÔNG bịa).
-5. LỐI CHƠI & THỐNG KÊ (5đ): phong cách (pressing/để bóng/phản công), xG gần đây nếu biết, góc/thẻ trung bình nếu soi kèo góc/thẻ, kiểm soát bóng.
-6. BỐI CẢNH (5đ): sân nhà/khách, lịch thi đấu dày (đá giữa tuần), thời tiết, trọng tài (nếu soi thẻ), VAR.
+5. LỐI CHƠI & THỐNG KÊ (5đ): phong cách (pressing/để bóng/phản công), xG gần đây nếu biết, kiểm soát bóng, tần suất ghi/thủng bàn.
+   - KÈO THẺ: ước lượng thẻ TB/trận của 2 đội (trọng tài nào bắt, derby hay không, đội nào hay phạm lỗi/rút đè), thẻ đỏ TB.
+   - KÈO GÓC: góc TB/trận của 2 đội (biên lấn cánh, tạt nhiều hay cầm bóng trung lộ), góc ở sân nhà/khách.
+6. BỐI CẢNH (5đ): sân nhà/khách, lịch thi đấu dày (đá giữa tuần), thời tiết, trọng tài cụ thể (tên + phong cách rút thẻ), VAR.
 Sau đó:
 - Ước lượng XÁC SUẤT THẬT (%) cho kèo định chọn dựa trên tổng điểm (tổng ≥ 21/30 mới cho xác suất >60%; 18-20/30 cho 55-60%; <18/30 → KHÔNG nên chọn kèo, trả not_found hoặc chọn kèo phòng thủ khác).
 - SO SÁNH odds nhà cái: xác suất ngụ ý của odds = 1/odds. Value chỉ khi xác suất thật của mày cao hơn xác suất ngụ ý ≥ 3 điểm %.
@@ -1215,7 +1217,11 @@ async def cmd_keo(session, chat_id, arg=None):
         "\"picks\": [ {\"market\": \"1X2\", \"selection\": \"Home\", \"prob\": 58}, "
         "{\"market\": \"Tài xỉu 2.5\", \"selection\": \"Under\", \"prob\": 55}, "
         "{\"market\": \"Asian Handicap\", \"selection\": \"Home -0.5\", \"prob\": 54}, "
-        "{\"market\": \"BTTS\", \"selection\": \"No\", \"prob\": 52} ] (TỐI THIỂU 3 KÈO: 1X2, tài xỉu, handicap; thêm BTTS/góc/thẻ nếu đủ dữ liệu), "
+        "{\"market\": \"BTTS\", \"selection\": \"No\", \"prob\": 52}, "
+        "{\"market\": \"Tài xỉu thẻ phạt\", \"selection\": \"Over 4.5\", \"prob\": 53}, "
+        "{\"market\": \"Tài xỉu phạt góc\", \"selection\": \"Under 9.5\", \"prob\": 55} ] "
+        "(BẮT BUỘC 6 KÈO: 1X2, tài xỉu bàn, Asian Handicap, BTTS, TÀI XỈU THẺ PHẠT, TÀI XỈU PHẠT GÓC; "
+        "chỉ ít hơn khi thiếu dữ liệu — ghi rõ kèo nào thiếu), "
         "\"reasoning\": \"...\"}. Nếu không xác định được trận nào: {\"not_found\": true, \"note\": \"...\"}"
     )
     pred, err = await get_ai_json(session, system,
