@@ -1655,6 +1655,65 @@ AGENT_TOOLS = [
 ]
 
 
+# Tên đội/alias → slug URL Sky Sports (để fetch lịch trận thật)
+TEAM_SKY_SLUGS = {
+    'mu': 'manchester-united', 'manutd': 'manchester-united', 'man u': 'manchester-united',
+    'mufc': 'manchester-united', 'red devils': 'manchester-united', 'quỷ đỏ': 'manchester-united',
+    'mc': 'manchester-city', 'mancity': 'manchester-city', 'man c': 'manchester-city',
+    'mcfc': 'manchester-city', 'city': 'manchester-city',
+    'ls': 'liverpool', 'liver': 'liverpool',
+    'arsenal': 'arsenal', 'pháo thủ': 'arsenal', 'gooners': 'arsenal',
+    'tot': 'tottenham', 'spurs': 'tottenham', 'hotspur': 'tottenham',
+    'chel': 'chelsea', 'the blues': 'chelsea',
+    'barca': 'barcelona', 'fcb': 'barcelona',
+    'real': 'real-madrid', 'real madrid': 'real-madrid', 'los blancos': 'real-madrid',
+    'atm': 'atletico-madrid', 'atleti': 'atletico-madrid',
+    'bvb': 'borussia-dortmund', 'dortmund': 'borussia-dortmund',
+    'bayern': 'bayern-munich', 'munich': 'bayern-munich',
+    'psg': 'paris-saint-germain',
+    'inter': 'inter-milan', 'milan': 'ac-milan', 'juve': 'juventus', 'napoli': 'napoli',
+    'sheffield united': 'sheffield-united', 'sheff utd': 'sheffield-united', 'sheffield utd': 'sheffield-united',
+    'sheffield': 'sheffield-united', 'blades': 'sheffield-united',
+    'wolves': 'wolverhampton-wanderers', 'wolverhampton': 'wolverhampton-wanderers',
+    'leeds': 'leeds-united', 'west ham': 'west-ham-united', 'newcastle': 'newcastle-united',
+    'brighton': 'brighton', 'aston villa': 'aston-villa', 'southampton': 'southampton',
+    'nottingham': 'nottingham-forest', 'forest': 'nottingham-forest',
+}
+
+
+def _sky_slug_for(query):
+    """Trích slug Sky cho câu hỏi: 'mu vs mc' → ưu tiên đội nhà trước (manchester-united).
+    Trả về (slug, matched_name) hoặc (None, None)."""
+    q = query.lower().strip()
+    q = re.sub(r'phân tích|kèo|keo|soi|nhé|nha|nhỉ|đi|giúp|với|hôm nay|tối nay', ' ', q)
+    q = re.sub(r'\s+', ' ', q).strip()
+    # Tách vs — lấy phần đầu làm đội chính
+    parts = [p.strip() for p in re.split(r'\s+vs\s+|\s+x\s+', q) if p.strip()]
+    if not parts:
+        return None, None
+    for part in parts:
+        if part in TEAM_SKY_SLUGS:
+            return TEAM_SKY_SLUGS[part], part
+    # fallback: tên đội dạng vài từ → slug
+    first = parts[0]
+    if len(first.split()) <= 3:
+        return re.sub(r'[^a-z0-9]+', '-', first).strip('-'), first
+    return None, None
+
+
+async def _fetch_team_fixtures(session, q):
+    """Fetch lịch trận thật từ Sky Sports theo tên đội trong query. Trả về text (rỗng nếu fail)."""
+    slug, name = _sky_slug_for(q)
+    if not slug:
+        return ""
+    for cand in (f"https://www.skysports.com/{slug}-fixtures",
+                 f"https://www.skysports.com/{slug}-scores-fixtures"):
+        pg = await tool_fetch_url(session, cand, max_chars=20000)
+        if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
+            return pg
+    return ""
+
+
 async def _agent_execute(session, chat_id, name, args):
     """Thực thi 1 tool agent. Trả về text kết quả."""
     if name == 'web_search':
@@ -1671,13 +1730,7 @@ async def _agent_execute(session, chat_id, name, args):
         web = await tool_web_search(session, f"{q} football next match schedule {now_str}", 6)
         fetched = ""
         # Luôn thử Sky Sports: URL chuẩn theo tên đội — trang này đọc được, đầy đủ lịch trận thật
-        slug = re.sub(r'[^a-z0-9]+', '-', q.lower()).strip('-')
-        for cand in (f"https://www.skysports.com/{slug}-fixtures",
-                     f"https://www.skysports.com/{slug}-scores-fixtures"):
-            pg = await tool_fetch_url(session, cand, max_chars=20000)
-            if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
-                fetched = pg
-                break
+        fetched = await _fetch_team_fixtures(session, q)
         if not fetched and web and not web.startswith("Không"):
             lines = web.split("\n")
             for ln in lines:
