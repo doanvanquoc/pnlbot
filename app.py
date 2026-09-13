@@ -806,6 +806,200 @@ async def get_api_prediction(session, fixture_id):
     return txt
 
 
+# ═══════════════ THE ODDS API (odds thật 1xBet/Pinnacle — free 500 credits/tháng) ═══════════════
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+ODDS_QUOTA_FILE = "odds_quota.json"
+ODDS_BOARD_TTL = 21600  # cache board 6h — pre-match odds đủ dùng, tiết kiệm quota
+ODDS_MONTHLY_BUDGET = 500
+ODDS_RESERVE = 50  # giữ lại, không xài cạn
+# league (tên Sky bracket hoặc slug TEAM_LEAGUES) → sport key
+ODDS_SPORT_KEYS = {
+    'Premier League': 'soccer_epl', 'premier-league': 'soccer_epl',
+    'Spanish La Liga': 'soccer_spain_la_liga', 'la-liga': 'soccer_spain_la_liga',
+    'Italian Serie A': 'soccer_italy_serie_a', 'serie-a': 'soccer_italy_serie_a',
+    'German Bundesliga': 'soccer_germany_bundesliga', 'bundesliga': 'soccer_germany_bundesliga',
+    'French Ligue 1': 'soccer_france_ligue_one', 'ligue-1': 'soccer_france_ligue_one',
+    'Champions League': 'soccer_uefa_champs_league', 'UEFA Champions League': 'soccer_uefa_champs_league',
+    'Europa League': 'soccer_uefa_europa_league', 'UEFA Europa League': 'soccer_uefa_europa_league',
+}
+ODDS_BOARD_CACHE = {}  # sport_key -> (events, ts)
+odds_quota = {'month': '', 'used': 0, 'remaining': None}
+_ODDS_BOOKS_PRIORITY = ('onexbet', 'pinnacle')  # 1xBet trước (m chơi 1xBet), rồi Pinnacle sharp
+
+
+def _load_odds_quota():
+    global odds_quota
+    try:
+        if os.path.exists(ODDS_QUOTA_FILE):
+            with open(ODDS_QUOTA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+            month = datetime.now(TZ_VN).strftime('%Y-%m')
+            if d.get('month') == month:
+                odds_quota = {'month': month, 'used': int(d.get('used', 0)), 'remaining': d.get('remaining')}
+                return
+    except Exception as e:
+        logger.error(f"Lỗi nạp odds quota: {e}")
+    odds_quota = {'month': datetime.now(TZ_VN).strftime('%Y-%m'), 'used': 0, 'remaining': None}
+
+
+def _save_odds_quota():
+    try:
+        with open(ODDS_QUOTA_FILE, "w", encoding="utf-8") as f:
+            json.dump(odds_quota, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Lỗi lưu odds quota: {e}")
+
+
+_load_odds_quota()
+
+
+async def odds_api_get(session, path, params=None, cost=1):
+    """GET The Odds API, track quota tháng. Trả (data, err)."""
+    key = os.getenv("ODDS_API_KEY")
+    if not key:
+        return None, "Chưa cấu hình ODDS_API_KEY trong .env"
+    month = datetime.now(TZ_VN).strftime('%Y-%m')
+    if odds_quota.get('month') != month:
+        odds_quota.update({'month': month, 'used': 0, 'remaining': None})
+    if odds_quota['used'] + cost > ODDS_MONTHLY_BUDGET - ODDS_RESERVE:
+        return None, f"Hết ngân sách Odds API tháng này ({odds_quota['used']}/{ODDS_MONTHLY_BUDGET})"
+    try:
+        q = dict(params or {})
+        q['apiKey'] = key
+        async with session.get(f"{ODDS_API_BASE}{path}", params=q,
+                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 429:
+                return None, "Odds API rate limited (429)"
+            if resp.status == 401:
+                return None, "Odds API key sai/hết hạn (401)"
+            if resp.status != 200:
+                return None, f"Odds API HTTP {resp.status}"
+            try:
+                odds_quota['used'] += int(resp.headers.get('x-requests-last') or cost)
+            except Exception:
+                odds_quota['used'] += cost
+            try:
+                if resp.headers.get('x-requests-remaining') is not None:
+                    odds_quota['remaining'] = int(resp.headers.get('x-requests-remaining'))
+            except Exception:
+                pass
+            _save_odds_quota()
+            data = await resp.json(content_type=None)
+            return data if isinstance(data, list) else [], None
+    except Exception as e:
+        return None, str(e)
+
+
+async def get_odds_board(session, sport_key, force=False):
+    """Lấy board odds 1 giải (h2h+totals, region eu, decimal) — cache 6h. Tốn 2 credits/lần fetch."""
+    now = time.time()
+    cached = ODDS_BOARD_CACHE.get(sport_key)
+    if not force and cached and now - cached[1] < ODDS_BOARD_TTL:
+        return cached[0], None
+    data, err = await odds_api_get(session, f"/sports/{sport_key}/odds",
+                                   {'regions': 'eu', 'markets': 'h2h,totals', 'oddsFormat': 'decimal'}, cost=2)
+    if err or not data:
+        return None, err or "rỗng"
+    ODDS_BOARD_CACHE[sport_key] = (data, now)
+    return data, None
+
+
+def find_odds_match(events, home, away):
+    """Tìm trận trong board theo tên 2 đội (chuẩn hóa alias)."""
+    for ev in events or []:
+        if _side_eq(home, ev.get('home_team') or '') and _side_eq(away, ev.get('away_team') or ''):
+            return ev
+    return None
+
+
+def _book_markets(ev, book_key):
+    for b in (ev or {}).get('bookmakers', []) or []:
+        if (b.get('key') or '') == book_key:
+            return b
+    return None
+
+
+def format_odds_block(ev):
+    """Render block ODDS THẬT cho AI: 1xBet + Pinnacle so line."""
+    if not ev:
+        return ""
+    lines = []
+    for bk, label in (('onexbet', '1xBet'), ('pinnacle', 'Pinnacle (sharp)')):
+        b = _book_markets(ev, bk)
+        if not b:
+            continue
+        parts = []
+        for m in b.get('markets', []) or []:
+            if m.get('key') == 'h2h':
+                o = {x.get('name'): x.get('price') for x in m.get('outcomes', []) or []}
+                hs = [v for k, v in o.items() if k == ev.get('home_team')]
+                dr = [v for k, v in o.items() if k.lower() == 'draw']
+                aw = [v for k, v in o.items() if k == ev.get('away_team')]
+                if hs or dr or aw:
+                    parts.append(f"1X2: {ev.get('home_team')} {hs[0] if hs else '?'} | Hòa {dr[0] if dr else '?'} | {ev.get('away_team')} {aw[0] if aw else '?'}")
+            elif m.get('key') == 'totals':
+                by_point = {}
+                for x in m.get('outcomes', []) or []:
+                    by_point.setdefault(x.get('point'), {})[x.get('name')] = x.get('price')
+                for pt in sorted([p for p in by_point if p is not None])[:2]:
+                    oo = by_point[pt]
+                    parts.append(f"Tài/Xỉu {pt}: Tài {oo.get('Over', '?')} | Xỉu {oo.get('Under', '?')}")
+        if parts:
+            lines.append(f"- {label} (cập nhật {str(b.get('last_update') or '')[:16].replace('T', ' ')}): " + " ; ".join(parts))
+    if not lines:
+        return ""
+    return "ODDS THẬT (decimal):\n" + "\n".join(lines)
+
+
+def odds_price_for(market_key, pick, ev):
+    """Giá 1xBet cho đúng lựa chọn AI (để lưu odds + tính EV). None nếu không khớp."""
+    try:
+        b = _book_markets(ev, 'onexbet') or _book_markets(ev, 'pinnacle')
+        if not b:
+            return None
+        sel = (pick or '').lower()
+        if market_key == '1x2':
+            for m in b.get('markets', []) or []:
+                if m.get('key') != 'h2h':
+                    continue
+                for x in m.get('outcomes', []) or []:
+                    nm = (x.get('name') or '')
+                    if nm.lower() == 'draw' and re.search(r'hòa|draw|x2\s*$|^\s*x\b|1x', sel):
+                        return float(x.get('price'))
+                    if nm == ev.get('home_team') and _side_eq(sel, nm):
+                        return float(x.get('price'))
+                    if nm == ev.get('away_team') and _side_eq(sel, nm):
+                        return float(x.get('price'))
+        elif market_key == 'tai_xiu':
+            mline = re.search(r'(\d+(?:[.,]\d+)?)', sel)
+            line = float(mline.group(1).replace(',', '.')) if mline else None
+            side = 'Over' if re.search(r'tài|over', sel) else ('Under' if re.search(r'xỉu|under', sel) else None)
+            if line is None or not side:
+                return None
+            for m in b.get('markets', []) or []:
+                if m.get('key') != 'totals':
+                    continue
+                for x in m.get('outcomes', []) or []:
+                    try:
+                        if x.get('name') == side and abs(float(x.get('point')) - line) < 0.01:
+                            return float(x.get('price'))
+                    except Exception:
+                        continue
+    except Exception:
+        return None
+    return None
+
+
+# key match_key (slug chuẩn) -> odds event, để _save_keo_batch gắn odds+EV thật
+_ODDS_BY_MATCH = {}
+
+
+def _odds_match_key(home, away):
+    ha = _canon_team_slug(home or '') or (home or '').lower().strip()
+    ab = _canon_team_slug(away or '') or (away or '').lower().strip()
+    return f"{ha}|{ab}"
+
+
 _standings_cache = {}  # league_id -> (data, timestamp)
 _team_stats_cache = {}  # (team_id, league_id) -> (data, timestamp)
 STATS_CACHE_TTL = 3600  # 1 giờ
@@ -1658,6 +1852,16 @@ async def handle_usage_command(session, chat_id):
             parts = [f"{m}: {v.get('calls', 0)} lần" for m, v in usage_today.items()]
             lines.append("🤖 Bot gọi: " + "; ".join(parts))
         lines.append(f"⚽ API-Football hôm nay: {fb_quota['used']}/{FB_DAILY_LIMIT} request")
+        try:
+            _om = odds_quota.get('month') or datetime.now(TZ_VN).strftime('%Y-%m')
+            _orem = odds_quota.get('remaining')
+            _oused = odds_quota.get('used', 0)
+            if _orem is not None:
+                lines.append(f"🎲 Odds API tháng {_om}: còn {_orem} credits (đã dùng {_oused}/{ODDS_MONTHLY_BUDGET})")
+            else:
+                lines.append(f"🎲 Odds API tháng {_om}: đã dùng {_oused}/{ODDS_MONTHLY_BUDGET} credits")
+        except Exception:
+            pass
         await send_telegram_message(session, chat_id, "\n".join(lines))
         return
     await send_telegram_message(session, chat_id, f"⚠️ Không lấy được quota: {perr}")
@@ -1676,6 +1880,13 @@ async def daily_predictions_loop(app):
         await asyncio.sleep(3600)
 
 
+def _fold(s):
+    """Gập dấu về ascii ('Coruña' → 'coruna') để so tên đội."""
+    import unicodedata
+    n = unicodedata.normalize('NFKD', str(s or '').lower())
+    return ''.join(c for c in n if not unicodedata.combining(c))
+
+
 def _side_eq(stored, lineside):
     """So khớp tên đội 2 phía (chuẩn hóa alias trước, fallback chuỗi)."""
     if not stored or not lineside:
@@ -1683,11 +1894,12 @@ def _side_eq(stored, lineside):
     cs, cl = _canon_team_slug(stored), _canon_team_slug(lineside)
     if cs and cl:
         return cs == cl
+    fs, fl = _fold(stored), _fold(lineside)
     if cs and not cl:
-        return cs.replace('-', ' ') in lineside.lower()
+        return cs.replace('-', ' ') in fl
     if cl and not cs:
-        return len(stored) >= 3 and stored.lower() in lineside.lower()
-    return len(stored) >= 4 and stored.lower() in lineside.lower()
+        return len(fs) >= 3 and fs in fl
+    return len(fs) >= 4 and fs in fl
 
 
 def _sky_extract_score(page_text, home, away):
@@ -2440,6 +2652,11 @@ def _save_keo_batch(chat_id, obj, rendered):
     KEYS = (('1x2', '1X2'), ('tai_xiu', 'Tài xỉu'), ('chau_a', 'Châu Á'), ('btts', 'BTTS'), ('the', 'Thẻ'), ('goc', 'Góc'))
     ks = obj.get('keos') or {}
     ts_now = int(time.time() * 1000)
+    _ev_match = None
+    try:
+        _ev_match = _ODDS_BY_MATCH.get(_odds_match_key(home, away))
+    except Exception:
+        _ev_match = None
     for i, (k, disp) in enumerate(KEYS):
         v = (ks.get(k) or {})
         sel = str(v.get('pick') or '').strip()
@@ -2451,10 +2668,18 @@ def _save_keo_batch(chat_id, obj, rendered):
             prob = max(1.0, min(float(v.get('pct', 50)), 99.0))
         except Exception:
             prob = 50.0
+        _price, _ev = None, None
+        if _ev_match is not None and k in ('1x2', 'tai_xiu'):
+            try:
+                _price = odds_price_for(k, sel, _ev_match)
+                if _price:
+                    _ev = round(prob / 100 * _price - 1, 3)
+            except Exception:
+                _price, _ev = None, None
         rec = {
             'match': f"{home} vs {away}", 'datetime': header[:80], 'league': header.split('—')[0].strip()[:40],
             'scores': '', 'score_total': 0,
-            'market': disp, 'selection': sel, 'prob': prob, 'odds': None, 'ev': None,
+            'market': disp, 'selection': sel, 'prob': prob, 'odds': _price, 'ev': _ev,
             'reasoning': '', 'status': 'pending', 'result': None, 'graded': None,
             'fixture_id': f"web_{ts_now}_{chat_id}_{i}",
             'date': kickoff, 'kickoff_vn': header[:40], 'home': home, 'away': away,
@@ -2636,7 +2861,10 @@ def _canon_team_slug(name):
     """Chuẩn hóa mọi biến thể tên đội → slug ('mu', 'Man Utd', 'Manchester United' → 'manchester-united')."""
     if not name:
         return None
-    n = re.sub(r'\s+', ' ', str(name).lower().replace('.', '').strip())
+    import unicodedata
+    n = unicodedata.normalize('NFKD', str(name).lower().replace('.', ''))
+    n = ''.join(c for c in n if not unicodedata.combining(c))
+    n = re.sub(r'\s+', ' ', n.strip())
     if n in TEAM_SKY_SLUGS:
         return TEAM_SKY_SLUGS[n]
     if n in SKY_SHORT_NAMES:
@@ -2771,7 +2999,8 @@ def _strip_league_prefix(name):
 def _split_vs(header):
     """'Premier League Manchester United vs Manchester City (22:30)' → ('Manchester United', 'Manchester City').
     Chống nuốt tên giải / bắt non chữ (dùng ranh giới ' vs ' + lột prefix giải)."""
-    parts = re.split(r'\s+vs\s+', str(header or ''), flags=re.I)
+    txt = re.sub(r'\[[^\]]*\]', '', str(header or ''))  # bỏ tag [Premier League], [La Liga]...
+    parts = re.split(r'\s+vs\s+', txt, flags=re.I)
     if len(parts) < 2:
         return None, None
     home = _strip_league_prefix(re.sub(r'^[^\wÀ-ỹ]+', '', parts[0]).strip())
@@ -3129,6 +3358,30 @@ async def _agent_execute(session, chat_id, name, args):
         # Gắn dòng trận mục tiêu vào data (quan trọng nhất — tránh AI phân tích nhầm trận khác)
         if target_ln and not any(target_ln in (p or '') for p in data_parts):
             data_parts.append(f"TRẬN MỤC TIÊU:\n{target_ln}")
+        # ── ODDS THẬT (The Odds API: 1xBet + Pinnacle) cho đúng trận mục tiêu ──
+        try:
+            _m = re.search(r'\[([^\]]+)\]', target_ln or '')
+            _league_bracket = _m.group(1) if _m else ''
+            _sport = ODDS_SPORT_KEYS.get(_league_bracket or '')
+            _ht2, _at2 = _sky_line_teams(target_ln or '')
+            if _sport and _ht2 and _at2:
+                _board, _berr = await get_odds_board(session, _sport)
+                if _board:
+                    _ev = find_odds_match(_board, _ht2, _at2)
+                    if _ev:
+                        _ob = format_odds_block(_ev)
+                        if _ob:
+                            data_parts.append(_ob)
+                        try:
+                            _ODDS_BY_MATCH[_odds_match_key(_ht2, _at2)] = _ev
+                        except Exception:
+                            pass
+                    else:
+                        logger.info(f"[ODDS] không thấy trận {_ht2} vs {_at2} trên board {_sport}")
+                elif _berr:
+                    logger.warning(f"[ODDS] board {_sport}: {_berr}")
+        except Exception as e:
+            logger.warning(f"[ODDS] analyze hook: {e}")
         if opponent and opponent_slug:
             opp_parsed = await _fetch_sky_by_slug(session, opponent_slug)
             if opp_parsed:
@@ -3482,6 +3735,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     "Kèo KHÔNG bắt buộc thắng theo tỉ số kịch bản, NHƯNG không được mâu thuẫn vật lý: BTTS Có mà tỉ số có đội 0 bàn; Xỉu/Tài lệch tổng bàn >1.5; 1X2 khác phe đội thắng; Châu Á thua sâu margin <-1.25.\n"
                     "Schema (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
                     + KEO_JSON_SCHEMA +
+                    "\nNếu phân tích gốc có ODDS THẬT (1xBet/Pinnacle): tính EV = pct/100 × odds − 1 cho từng kèo, "
+                    "ưu tiên kèo EV>0.05 khi chốt best; ghi odds đã dùng vào why (vd '1xBet 2.10').\n"
                     "\n\nPhân tích gốc:\n" + content[:3000])
                 jtxt, jerr = await get_ai_response(
                     session, [{"role": "user", "content": json_prompt}], max_tokens=900,
