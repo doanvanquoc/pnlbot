@@ -2484,20 +2484,16 @@ async def _agent_execute(session, chat_id, name, args):
                         target_ln = ln; break
             # Nếu query có "vs" mà không tìm thấy trận → tìm kết quả qua web search
             if not target_ln and (' vs ' in q_teams or ' v ' in q_teams):
-                # Thử match bằng alias (mu → manchester united, mc → manchester city)
-                q_aliases = set()
+                # Thử match bằng FULL alias (mu → "manchester united", mc → "manchester city")
+                q_full_names = []
                 for w in re.split(r'[^a-z0-9]+', q_teams.lower()):
                     if w in TEAM_SKY_SLUGS:
-                        full = TEAM_SKY_SLUGS[w].replace('-', ' ')
-                        q_aliases.add(full)
-                        q_aliases.update(full.split())
-                    elif len(w) >= 3:
-                        q_aliases.add(w)
+                        q_full_names.append(TEAM_SKY_SLUGS[w].replace('-', ' '))
                 for ln in fetched.split('\n'):
                     if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
                         continue
                     ln_low = ln.lower()
-                    if sum(1 for a in q_aliases if a in ln_low) >= 2:
+                    if sum(1 for full in q_full_names if full in ln_low) >= len(q_full_names):
                         target_ln = ln
                         if 'ĐANG ĐÁ' in ln:
                             break
