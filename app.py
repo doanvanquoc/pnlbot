@@ -1864,7 +1864,7 @@ async def _agent_execute(session, chat_id, name, args):
         if _an and _an.get('result'):
             _mark_status_msg(chat_id, _an['result'].get('message_id'))
         now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
-        web = await tool_web_search(session, f"{q} football next match schedule {now_str}", 6)
+        web = await tool_web_search(session, f"{q} football club match schedule {now_str}", 6)
         fetched = ""
         # Luôn thử Sky Sports: URL chuẩn theo tên đội — trang này đọc được, đầy đủ lịch trận thật
         fetched = await _fetch_team_fixtures(session, q)
@@ -1879,7 +1879,8 @@ async def _agent_execute(session, chat_id, name, args):
                     break
         system = (
             "Bạn là chuyên gia soi kèo bóng đá CHUYÊN SÂU của anh Quốc — phân tích càng kỹ càng tốt, không giới hạn độ dài. "
-            "Dữ liệu trận (lịch, kết quả gần đây) có trong tin nhắn user — dùng làm nền tảng, kết hợp kiến thức bóng đá của mày.\n"
+            "DỮ LIỆU TRẬN trong tin nhắn user lấy từ lịch thi đấu CHÍNH THỨC (Sky Sports) — tin tuyệt đối, đây là nguồn số 1. "
+            "Kết quả web_search chỉ là phụ trợ (thường rác do trùng từ khoá — bỏ qua nếu không liên quan bóng đá).\n"
             "Cấu trúc bài phân tích:\n"
             "1. Thông tin trận: giải, ngày giờ VN, sân, tính chất (derby/đua top...)\n"
             "2. Phong độ 2 đội: 5 trận gần nhất, sân nhà/khách, số bàn ghi/thủng\n"
@@ -1961,7 +1962,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
     system_prompt = (
         "Bạn là PNL FOOTBALL BOT — trợ lý bóng đá toàn diện của anh Quốc (đẹp trai, giỏi nhất quả đất). "
         "Khi người dùng hỏi, TỰ QUYẾT ĐỊNH cần tool gì: "
-        "- Muốn phân tích/dự đoán kèo một đội/trận → analyze_keo (tool đầy đủ framework, đừng tự phân tích tay). "
+        "- Muốn phân tích/dự đoán kèo một đội/trận → PHẢI gọi analyze_keo NGAY (tool có dữ liệu lịch trận thật), "
+        "TUYỆT ĐỐI KHÔNG tự web_search rồi tự kết luận kèo — kết quả web_search thường rác (trùng tên, thiếu dữ liệu). "
         "- Cần thông tin mới (phong độ, chấn thương, kết quả, lịch sử đối đầu, tin tức) → web_search rồi fetch_url nếu cần chi tiết. "
         "- Hỏi thành tích dự đoán của bot → my_stats. "
         "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
