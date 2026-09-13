@@ -2445,14 +2445,17 @@ async def _agent_execute(session, chat_id, name, args):
             # tìm đối thủ từ trận ĐANG ĐÁ hoặc SẮP ĐÁ gần nhất
             # Ưu tiên trận khớp CẢ 2 đội từ query (vd "mu vs mc" → trận có cả MU và MC)
             target_ln = None
-            q_parts = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) >= 2]
-            # Bước1: tìm trận có cả 2 đội trong query
-            for ln in fetched.split('\n'):
-                if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln:
-                    continue
-                ln_low = ln.lower()
-                if len(q_parts) >= 2 and sum(1 for w in q_parts if w in ln_low) >= 2:
-                    target_ln = ln; break
+            q_parts = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) >= 2 and w not in ('vs', 'và', 'and', 'keo', 'kèo', 'phân', 'tích', 'check', 'soi')]
+            # Bước1: tìm trận có cả 2 đội trong query (ưu tiên ĐANG ĐÁ trước)
+            if len(q_parts) >= 2:
+                for ln in fetched.split('\n'):
+                    if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
+                        continue
+                    ln_low = ln.lower()
+                    if sum(1 for w in q_parts if w in ln_low) >= 2:
+                        target_ln = ln
+                        if 'ĐANG ĐÁ' in ln:
+                            break  # ưu tiên trận đang đá
             # Bước2: fallback — trận ĐANG ĐÁ hoặc SẮP ĐÁ đầu tiên
             if not target_ln:
                 for ln in fetched.split('\n'):
