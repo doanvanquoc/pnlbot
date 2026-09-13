@@ -1762,7 +1762,12 @@ async def handle_update(session, update):
 
 
 async def ai_chat(session, chat_id, question, reply_to=None):
-    """Hỏi tự do về bóng đá — AI trả lời với ngữ cảnh: trận hôm nay + lịch sử dự đoán gần đây."""
+    """Hỏi tự do — câu liên quan bóng đá/kèo thì chuyển vào pipeline soi kèo có framework JSON
+    (thắng được persona MintRouter). Câu khác → chat thường."""
+    if re.search(r'kèo|keo|soi|tài xỉu|châu á|handicap|btts|thẻ|góc|1x2|trận|đấu|thắng|thua|dự đoán|odds|nên đánh|nên vào|đội|vô địch|cúp|derby',
+                 question.lower()):
+        await cmd_keo(session, chat_id, question[:120])
+        return
     today = datetime.now(TZ_VN).strftime('%Y-%m-%d')
     fixtures_cache = getattr(ai_chat, '_fixtures', None)
     if not fixtures_cache or fixtures_cache[0] != today or time.time() - fixtures_cache[1] > 900:
