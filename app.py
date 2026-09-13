@@ -2225,10 +2225,7 @@ def _chat_lock(chat_id):
 
 async def _handle_update_safe(session, update):
     try:
-        chat_id = (update.get('message') or {}).get('chat', {}).get('id') \
-            or (update.get('callback_query') or {}).get('message', {}).get('chat', {}).get('id')
-        async with _chat_lock(chat_id):
-            await handle_update(session, update)
+        await handle_update(session, update)
     except Exception:
         logger.exception(f"Lỗi xử lý update {update.get('update_id')}")
 
