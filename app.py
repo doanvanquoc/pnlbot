@@ -1815,6 +1815,29 @@ async def _fetch_team_fixtures(session, q):
     return ""
 
 
+
+LEAGUE_SKY_SLUGS = {
+    'Premier League': 'premier-league', 'Spanish La Liga': 'la-liga',
+    'Italian Serie A': 'serie-a', 'German Bundesliga': 'bundesliga',
+    'French Ligue 1': 'ligue-1', 'EFL Championship': 'efl-championship',
+    'Scottish Premiership': 'scottish-premier',
+}
+
+
+async def _fetch_league_fixtures(session, fetched):
+    """Từ dữ liệu lịch đội (có tên giải) → fetch lịch CẢ GIẢI từ Sky (có kết quả mọi đội, kể cả đối thủ)."""
+    m = re.search(r'\[([^\]]+)\]', fetched or '')
+    if not m:
+        return ""
+    league = m.group(1)
+    slug = LEAGUE_SKY_SLUGS.get(league)
+    if not slug:
+        return ""
+    pg = await tool_fetch_url(session, f"https://www.skysports.com/{slug}-fixtures", max_chars=20000)
+    parsed = _parse_sky_fixtures(pg) if pg else ""
+    return parsed
+
+
 async def _agent_execute(session, chat_id, name, args):
     """Thực thi 1 tool agent. Trả về text kết quả."""
     if name == 'web_search':
@@ -1862,7 +1885,21 @@ async def _agent_execute(session, chat_id, name, args):
             "NẾU đội được hỏi ĐANG ĐÁ (trong dữ liệu có dòng ĐANG ĐÁ) thì phân tích TRẬN ĐANG ĐÁ đó theo diễn biến hiện tại, "
             "không chọn trận tương lai."
         )
-        data_block = fetched[:2500] if fetched else f"Kết quả web (không có dữ liệu Sky):\n{web}"
+        data_parts = []
+        if fetched:
+            data_parts.append(f"LỊCH + KẾT QUẢ của đội được hỏi:\n{fetched}")
+            league_data = await _fetch_league_fixtures(session, fetched)
+            if league_data:
+                # lọc các trận có liên quan (cùng tên đội hoặc hôm nay/đã đá gần đây)
+                kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
+                rel = [ln for ln in league_data.split('\n')
+                       if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
+                if rel:
+                    data_parts.append("KẾT QUẢ/LỊCH CỦA ĐỐI THỦ & CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
+        if data_parts:
+            data_block = "\n\n".join(data_parts) + "\n\n(Lưu ý: các trận trên là LỊCH THI ĐẤU CHÍNH THỨC mùa 2026-27 — tin tuyệt đối, không suy diễn đội nào 'hạng dưới' hay 'Copa del Rey'.)"
+        else:
+            data_block = f"Kết quả web:\n{web}"
         text, err = await get_ai_response(session, [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}"},
