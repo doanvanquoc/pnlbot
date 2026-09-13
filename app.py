@@ -1953,12 +1953,8 @@ def _render_keo_from_json(obj):
             pct = int(pct)
         except Exception:
             pct = None
-        why = re.sub(r'\s+', ' ', str(v.get('why') or '').strip())[:45]
         if p:
-            line_txt = f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}"
-            if why:
-                line_txt += f" — {why}"
-            out.append(line_txt)
+            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}")
     if len(out) < 5:
         return None
     b = str(obj.get('best') or '').strip()
