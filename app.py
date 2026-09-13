@@ -1701,10 +1701,15 @@ def _strict_keo_format(text):
             if re.match(r'^\d+[.)\s]', ln) or ln.startswith('#'):
                 continue
             m = re.search(pat + r'[^:—\-]{0,14}[:—\-]\s*(.+)', ln, re.I)
-            if m:
+            if m and m.start() < 25:
                 val = m.group(1)
+                # chống trùng: 2 kèo khác nhau không dùng chung 1 câu
+                if val and any(val[:30].lower() in (v[0].lower() if isinstance(v, tuple) else str(v)) for v in out_k.values()):
+                    continue
                 # chỉ lấy lựa chọn: cắt trước '—', '→', 'hoặc', 'vì', '('
                 val = re.split(r'→|[—•]|\bhoặc\b|\bvì\b|\(', val)[0].strip()
+                if len(val) > 60:
+                    val = val[:60].rsplit(',', 1)[0].strip() or val[:60]
                 mm = re.search(r'(\d{2})\s*%', val)
                 stars = 0
                 if mm:
@@ -1762,7 +1767,7 @@ def _strict_keo_format(text):
         bp = max(out_k.items(), key=lambda kv: kv[1][1])
         best = f"⭐ Tự tin nhất: {bp[0]} — {bp[1][0]}"
     elif best:
-        best = '⭐ ' + re.split(r'[→—]|kèo đôi|\+ ', best.lstrip('⭐ ✅'))[0].strip()[:60]
+        best = '⭐ ' + re.sub(r'✅|\*\*|🎯', '', best).strip()[:70]
     out = [header[:110] if header else '⚽ Trận đấu']
     if live and live.strip('*# ')[:60] != (header or '')[:60].strip('*# '):
         out.append(live[:90])
@@ -1808,7 +1813,9 @@ def _clean_tg(text):
     # Xoá nốt mọi ký tự | sót lại + dòng chỉ toàn gạch/ngang rỗng
     text = text.replace('|', ' ')
     text = re.sub(r'^\s*[—–\-\.\s]{2,}\s*$', '', text, flags=re.MULTILINE)
-    # bỏ dòng chứa Cyrillic (Nga) hoặc chữ Trung — rác
+    # bỏ chữ Nga/Trung/Ả Rập/Thái... (script lạ) — trong câu
+    text = re.sub(r'[\u0400-\u04FF\u0500-\u052F\u0600-\u06FF\u0700-\u074F\u2E80-\u9FFF\uA960-\uA97F\uAC00-\uD7FF\u3040-\u30FF\uF900-\uFAFF\uFE30-\uFE4F]', '', text)
+    # bỏ dòng còn lại chứa Cyrillic/CJK (toàn dòng rác)
     out = []
     for ln in text.split('\n'):
         if re.search(r'[а-яА-ЯёЁ\u4e00-\u9fff]', ln):
