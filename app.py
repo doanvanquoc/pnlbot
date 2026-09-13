@@ -2598,11 +2598,11 @@ def _keo_logic_check(obj):
         if btts_no and both:
             errs.append(f"BTTS Không nhưng kịch bản {ga_}-{gb_} cả hai đều ghi bàn — mâu thuẫn")
         # 1X2 vẫn phải cùng phe đội thắng theo kịch bản (mâu thuẫn cứng)
-        if ga_ > gb_ and (re.search(r'x2', p12) or re.search(r'h[ôo]a', p12)):
+        if ga_ > gb_ and (re.search(r'x2', p12) or re.search(r'hòa|h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội nhà thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
-        if ga_ < gb_ and (re.search(r'1x', p12) or re.search(r'h[ôo]a', p12)):
+        if ga_ < gb_ and (re.search(r'1x', p12) or re.search(r'hòa|h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội khách thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
-        if ga_ == gb_ and not re.search(r'h[ôo]a|draw|1x|x2', p12):
+        if ga_ == gb_ and not re.search(r'hòa|h[ôo]a|draw|1x|x2', p12):
             errs.append(f"Kịch bản hòa {ga_}-{gb_} nhưng 1X2 chọn '{p12}' → phải chọn hòa/X")
         # Châu Á chỉ chặn khi THUA SÂU theo kịch bản (margin < -1.25 — gần như không bù được)
         mh = re.search(r'([+-])\s*(\d+(?:[.,]\d+)?(?:[/-]\d+)?)', pa)
@@ -2650,7 +2650,7 @@ def _keo_logic_check(obj):
     if btts_no and is_over and line is not None and line >= 3.5:
         errs.append(f"BTTS Không nhưng Tài {line} — hai đội không cùng ghi bàn mà tổng bàn ≥3.5 là ngược")
     # R4: 1X2 nghiêng hòa + Tài cao
-    if re.search(r'h[ôo]a|draw', p12) and is_over and line is not None and line >= 3.5:
+    if re.search(r'hòa|h[ôo]a|draw', p12) and is_over and line is not None and line >= 3.5:
         errs.append(f"1X2 nghiêng hòa nhưng Tài {line} — hòa thường ít bàn")
     return errs
 
@@ -3078,6 +3078,7 @@ _LEAGUE_WORDS = ('premier league', 'ngoại hạng anh', 'spanish la liga', 'la 
                  'italian serie a', 'serie a', 'german bundesliga', 'bundesliga', 'french ligue 1',
                  'ligue 1', 'efl championship', 'championship', 'uefa champions league', 'champions league',
                  'uefa europa league', 'europa league', 'v.league 1', 'v-league', 'vleague',
+                 'mls', 'american mls league',
                  'fa cup', 'league cup', 'carabao cup', 'copa del rey', 'coppa italia',
                  'dfb pokal', 'coupe de france', 'premier', 'serie', 'league', 'ligue', 'cúp')
 
@@ -3101,6 +3102,8 @@ def _split_vs(header):
     if len(parts) < 2:
         return None, None
     home = _strip_league_prefix(re.sub(r'^[^\wÀ-ỹ]+', '', parts[0]).strip())
+    if ':' in home:  # 'MLS: Chicago Fire' → 'Chicago Fire' (tên giải + hai chấm)
+        home = home.split(':')[-1].strip()
     away = re.split(r'[\(\-—:,]', parts[1].strip())[0].strip()
     away = re.sub(r'^[^\wÀ-ỹ]+', '', away).strip()
     if not home or not away or len(home) > 30 or len(away) > 30:
