@@ -1684,13 +1684,21 @@ async def _clear_status_msgs(session, chat_id):
 
 
 def _clean_tg(text):
-    """Dọn format AI → Telegram đọc đẹp: bỏ **, #, ---, cột |, khoảng trắng thừa."""
+    """Dọn format AI → Telegram đọc đẹp: bỏ **, #, ---, cột |, tiếng Nga/ryc, khoảng trắng thừa."""
     if not text:
         return text
     text = text.replace('**', '')
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'^[-=]{3,}\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\s*\|\s*', ' — ', text)
+    text = re.sub(r'\s*\|\s*', ' | ', text)
+    text = re.sub(r'(?:\s*[—\-]\s*){2,}', ' — ', text)
+    # bỏ dòng chứa ký tự Cyrillic (Nga) — rác
+    out = []
+    for ln in text.split('\n'):
+        if re.search(r'[а-яА-ЯёЁ]', ln):
+            continue
+        out.append(ln)
+    text = '\n'.join(out)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -1760,7 +1768,16 @@ def _parse_sky_fixtures(pg):
         r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+(FT|In Play)',
         pg)
     for date_str, league, h, gh, a, ga, st in results[:12]:
-        lines.append(f"ĐÃ ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}")
+        tag = "🔴 ĐANG ĐÁ" if 'In Play' in st or 'LIVE' in st else "ĐÃ ĐÁ"
+        lines.append(f"{tag} [{league}] {date_str}: {h} {gh}-{ga} {a}")
+    # Trận đang đá (có phút giữa tỉ số và 'In Play') — pattern lỏng hơn
+    live = re.findall(
+        r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
+        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
+        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+[^A-Z]{0,25}\s*In Play',
+        pg)
+    for date_str, league, h, gh, a, ga in live[:6]:
+        lines.append(f"🔴 ĐANG ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}")
     upcoming = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
         r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
@@ -1830,7 +1847,10 @@ async def _agent_execute(session, chat_id, name, args):
             "mỗi kèo nêu rõ lựa chọn + mức tin cậy % + 1 câu lý do. Kèo nào không đủ cơ sở thì nói thẳng.\n"
             "7. Chốt: kèo tự tin nhất + combo nếu có + cảnh báo rủi ro.\n"
             "Trình bày dễ đọc trên Telegram: tiêu đề in hoa, gạch đầu dòng '- ', KHÔNG dùng bảng markdown (| |), "
-            "KHÔNG dùng ký tự ** hay ###. Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể."
+            "KHÔNG dùng ký tự ** hay ###. Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
+            "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
+            "NẾU đội được hỏi ĐANG ĐÁ (trong dữ liệu có dòng ĐANG ĐÁ) thì phân tích TRẬN ĐANG ĐÁ đó theo diễn biến hiện tại, "
+            "không chọn trận tương lai."
         )
         data_block = fetched[:2500] if fetched else f"Kết quả web (không có dữ liệu Sky):\n{web}"
         text, err = await get_ai_response(session, [
