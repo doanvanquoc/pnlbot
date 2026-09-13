@@ -654,8 +654,22 @@ async def handle_model_callback(session, chat_id, cb_data, message_id=None):
 
 # ═══════════════ FOOTBALL DATA (API-Football) ═══════════════
 
+_fb_req_times = []  # timestamps các request gần đây (throttle 10 req/phút của free plan)
+
+
+def _fb_throttle():
+    """Chặn burst >9 req/phút — API-Football free plan giới hạn 10/phút."""
+    now = time.time()
+    while _fb_req_times and now - _fb_req_times[0] > 60:
+        _fb_req_times.pop(0)
+    if len(_fb_req_times) >= 9:
+        wait = 61 - (now - _fb_req_times[0])
+        return min(wait, 65)
+    return 0
+
+
 async def fb_get(session, path, params=None, budget=1):
-    """GET API-Football, trừ quota theo ngày VN. Trả về (data, None) hoặc (None, err)."""
+    """GET API-Football, trừ quota theo ngày VN + throttle 9 req/phút. Trả về (data, None) hoặc (None, err)."""
     key = os.getenv("FOOTBALL_API_KEY")
     if not key:
         return None, "Chưa cấu hình FOOTBALL_API_KEY trong .env"
@@ -665,21 +679,35 @@ async def fb_get(session, path, params=None, budget=1):
         fb_quota['used'] = 0
     if fb_quota['used'] + budget > FB_DAILY_LIMIT:
         return None, f"Hết ngân sách API-Football hôm nay ({fb_quota['used']}/{FB_DAILY_LIMIT}) — dùng lại vào ngày mai hoặc gõ ít hơn."
-    try:
-        async with session.get(f"{FOOTBALL_BASE}{path}", params=params or {},
-                               headers={"x-apisports-key": key},
-                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            fb_quota['used'] += budget
-            _save_fb_quota()
-            if resp.status != 200:
-                return None, f"HTTP {resp.status}"
-            data = await resp.json(content_type=None)
-            errors = data.get('errors')
-            if errors and errors != 0:
-                return None, f"API lỗi: {json.dumps(errors)[:150]}"
-            return data.get('response') or [], None
-    except Exception as e:
-        return None, str(e)
+    for attempt in range(3):
+        wait = _fb_throttle()
+        if wait:
+            logger.info(f"[FB] Throttle: chờ {wait:.0f}s (9 req/phút)")
+            await asyncio.sleep(wait)
+        try:
+            async with session.get(f"{FOOTBALL_BASE}{path}", params=params or {},
+                                   headers={"x-apisports-key": key},
+                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                fb_quota['used'] += budget
+                _fb_req_times.append(time.time())
+                _save_fb_quota()
+                if resp.status == 429:
+                    backoff = 65 if attempt == 0 else 120
+                    logger.warning(f"[FB] 429 rate limit — chờ {backoff}s thử lại")
+                    await asyncio.sleep(backoff)
+                    continue
+                if resp.status != 200:
+                    return None, f"HTTP {resp.status}"
+                data = await resp.json(content_type=None)
+                errors = data.get('errors')
+                if errors and errors != 0:
+                    return None, f"API lỗi: {json.dumps(errors)[:150]}"
+                return data.get('response') or [], None
+        except Exception as e:
+            if attempt == 2:
+                return None, str(e)
+            await asyncio.sleep(5)
+    return None, "API-Football rate limit dai dẳng"
 
 
 def _vn_time(iso_str):
