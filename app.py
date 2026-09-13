@@ -1821,15 +1821,21 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                 await send_telegram_message(session, chat_id, "Xong! (AI không có kết luận — thử hỏi cụ thể hơn)", reply_to=reply_to)
             return
         messages.append({"role": "assistant", "content": msg.get('content') or None, "tool_calls": tool_calls})
+        last_tool = None
         for tc in tool_calls:
             fn = tc.get('function') or {}
             name = fn.get('name', '')
+            last_tool = name
             try:
                 args = json.loads(fn.get('arguments') or '{}')
             except Exception:
                 args = {}
             result = await _agent_execute(session, chat_id, name, args)
             messages.append({"role": "tool", "tool_call_id": tc.get('id'), "content": str(result)[:3500]})
+        if last_tool == 'analyze_keo':
+            # Phân tích đã xong → buộc AI tổng hợp ngay, cấm gọi tool tiếp
+            messages.append({"role": "user", "content": "Kết quả phân tích kèo đã đầy đủ ở trên. Tổng hợp trả lời người dùng NGAY — KHÔNG gọi thêm tool nào nữa."})
+            continue
     await send_telegram_message(session, chat_id, "⚠️ AI xử lý quá nhiều bước — thử hỏi cụ thể hơn.", reply_to=reply_to)
 
 
