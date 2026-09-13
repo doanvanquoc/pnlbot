@@ -1634,7 +1634,7 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=Fal
         if not file_path:
             await send_telegram_message(session, chat_id, "❌ Không lấy được đường dẫn ảnh.")
             return
-        async with session.get(f"https://api.telegram.org/bot{token}/file/{file_path}",
+        async with session.get(f"https://api.telegram.org/file/bot{token}/{file_path}",
                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
                 await send_telegram_message(session, chat_id, f"❌ Tải ảnh thất bại HTTP {resp.status} — gửi lại ảnh nhé.")
