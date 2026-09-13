@@ -2484,6 +2484,24 @@ async def _agent_execute(session, chat_id, name, args):
                         target_ln = ln; break
             # Nếu query có "vs" mà không tìm thấy trận → tìm kết quả qua web search
             if not target_ln and (' vs ' in q_teams or ' v ' in q_teams):
+                # Thử match bằng alias (mu → manchester united, mc → manchester city)
+                q_aliases = set()
+                for w in re.split(r'[^a-z0-9]+', q_teams.lower()):
+                    if w in TEAM_SKY_SLUGS:
+                        full = TEAM_SKY_SLUGS[w].replace('-', ' ')
+                        q_aliases.add(full)
+                        q_aliases.update(full.split())
+                    elif len(w) >= 3:
+                        q_aliases.add(w)
+                for ln in fetched.split('\n'):
+                    if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
+                        continue
+                    ln_low = ln.lower()
+                    if sum(1 for a in q_aliases if a in ln_low) >= 2:
+                        target_ln = ln
+                        if 'ĐANG ĐÁ' in ln:
+                            break
+            if not target_ln and (' vs ' in q_teams or ' v ' in q_teams):
                 web_result = await tool_web_search(session, f"{q_teams} match result score {now_str}", 5)
                 if web_result and not web_result.startswith("Không"):
                     return (f"Không tìm thấy trận '{q_teams}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
