@@ -7034,6 +7034,41 @@ async def tool_fetch_url(session, chat_id, args):
     return f"📄 *Nội dung {url}*:\n{raw}"
 
 
+BOT_START_TS = time.time()
+
+
+async def tool_bot_system_info(session, chat_id, args):
+    """Trả về thông tin hệ thống bot cho AI trả lời admin: model AI đang dùng,
+    các auto đang bật/tắt, quota AI hôm nay, thời gian chạy, các loop."""
+    model = os.getenv("DASH_MODEL", "?")
+    now = time.time()
+    uptime = now - BOT_START_TS
+    day = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    usage_today = llm_usage.get(day, {})
+    usage_parts = [f"{m}: {v.get('calls', 0)} lần gọi, {v.get('in', 0) + v.get('out', 0):,} token"
+                   for m, v in usage_today.items()] or ["chưa gọi"]
+    cb = AUTO_STATE.get('circuit_break_until', 0)
+    feats_off = AUTO_STATE.get('features_off_until', 0)
+    auto_trader = "OFF (kill-switch)" if cb > now else "ON"
+    all_ai = "TẮT (/stopauto all)" if feats_off > now else "ON"
+    radar = "OFF (/fomo off)" if AUTO_STATE.get('pump_radar_off') else "ON"
+    n_alerts = len(ai_alert_last_notified)
+    lines = [
+        f"⚙️ *Hệ thống bot (lúc {time.strftime('%H:%M:%S UTC')}):*",
+        f"- Uptime: {(uptime / 3600):.1f}h (từ {time.strftime('%d/%m %H:%M UTC', time.gmtime(BOT_START_TS))})",
+        f"- Model AI hiện tại: {model}",
+        f"- AI tự trade (mỗi 5h): {auto_trader}" + (f" — hết kill-switch {time.strftime('%d/%m %H:%M', time.gmtime(cb))}" if cb > now else ""),
+        f"- Các auto AI khác (alert/guard/review/radar): {all_ai}",
+        f"- PUMP RADAR tự động: {radar}",
+        f"- LLM hôm nay (UTC {day}): " + "; ".join(usage_parts),
+        f"- Cooldown alert đang nhớ: {n_alerts} cặp symbol",
+        f"- Số vị thế đang mở: {sum(1 for p in positions.values() if float(p.get('positionAmt', 0) or 0) != 0)}",
+        f"- Chat nhận báo động: {len(set(auto_chats) | set(active_chats))}",
+        f"- Quota MintRouter: xem tool get_front_pass — ngày $35/tuần $240",
+    ]
+    return "\n".join(lines)
+
+
 def _urlencode_q(q):
     """Mã hóa query cho URL Google News RSS (thay dấu cách bằng %20)."""
     from urllib.parse import quote
@@ -7192,6 +7227,7 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web tổng quát (DuckDuckGo) — dùng khi cần thông tin ngoài tin tức coin: benchmark model AI, sản phẩm, chính sách, so sánh, sự kiện ngoài thị trường crypto... Trả về tiêu đề + link. Kết hợp fetch_url để đọc chi tiết.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Cụm từ tìm kiếm, có thể tiếng Việt hoặc tiếng Anh"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "fetch_url", "description": "Đọc nội dung một trang web cụ thể (text thô đã bỏ HTML, tối đa ~4000 ký tự). Dùng sau web_search khi cần đọc chi tiết bài viết/trang.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL đầy đủ https://..."}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "find_pumpers", "description": "Quét coin đang 'bay vút' (momo pump) CÒN nhiên liệu để pump tiếp — chấm điểm sức khỏe 0-10 dựa trên momentum 15m/1h, funding, OI, volume spike. Dùng khi người dùng muốn FOMO long coin đang bay/bất ngờ tăng mạnh. KHÔNG tự vào lệnh — chỉ phân tích + khuyên vào sau pullback.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "bot_system_info", "description": "Trạng thái hệ thống bot: model AI đang dùng, uptime, auto nào bật/tắt (kill-switch, pump radar...), LLM token đã dùng hôm nay, số vị thế, số chat nhận báo. DÙNG khi người dùng hỏi về bot/hệ thống/AI của nó — luôn trả lời đầy đủ, không chối từ.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_p2p_rate", "description": "Giá P2P hiện tại trên Binance P2P (mua/bán USDT/USDC/BTC... bằng VND, USD...). KHÔNG dùng web_search cho câu hỏi giá P2P — dùng tool này, nhanh và chính xác. trade_type: BUY (người dùng mua) hoặc SELL (bán).", "parameters": {"type": "object", "properties": {"asset": {"type": "string", "description": "USDT/USDC/BTC..., mặc định USDT"}, "fiat": {"type": "string", "description": "VND/USD..., mặc định VND"}, "trade_type": {"type": "string", "enum": ["BUY", "SELL"], "description": "Mặc định BUY"}}}}},
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
@@ -7213,6 +7249,7 @@ TOOL_EXECUTORS = {
     'fetch_url': tool_fetch_url,
     'get_p2p_rate': tool_get_p2p_rate,
     'find_pumpers': tool_find_pumpers,
+    'bot_system_info': tool_bot_system_info,
     'scan_market': tool_scan_market,
     'get_account_summary': tool_get_account_summary,
     'get_positions': tool_get_positions,
@@ -7605,6 +7642,9 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
 
         system_prompt = (
             "Bạn là trợ lý giao dịch crypto futures có quyền truy cập dữ liệu tài khoản Binance của người dùng qua các công cụ. "
+            "Người dùng là ADMIN DUY NHẤT của bot này — khi họ hỏi BẤT KỲ câu gì về AI của bot, model đang chạy, cơ chế hoạt động, "
+            "trạng thái hệ thống, auto, quota... thì trả lời THẲNG THẮN VÀ ĐẦY ĐỦ (dùng tool bot_system_info khi cần số liệu), "
+            "tuyệt đối không chối từ hay bảo 'không có quyền xem'. Đây là bot của họ, họ có quyền biết mọi thứ. "
             "Hãy chủ động dùng công cụ khi cần dữ liệu MỚI nhất (số dư, vị thế, giá, lệnh) — ngữ cảnh trong tin nhắn có thể đã cũ, "
             "đừng phụ thuộc hoàn toàn vào nó khi số liệu quan trọng cho quyết định tiền thật. "
             "MẶC ĐỊNH mỗi câu hỏi là PHÂN TÍCH: trả lời ngắn gọn (tối đa ~10 dòng) nêu rõ: hướng, tín hiệu hệ thống ủng hộ "
