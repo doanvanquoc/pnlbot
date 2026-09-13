@@ -1690,15 +1690,24 @@ def _clean_tg(text):
     text = text.replace('**', '')
     text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'^[-=]{3,}\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\s*\|\s*', ' | ', text)
-    text = re.sub(r'(?:\s*[—\-]\s*){2,}', ' — ', text)
-    # bỏ dòng chứa ký tự Cyrillic (Nga) — rác
+    # BẢNG → tách thành dòng riêng: 'A | B | C' → 'A\nB\nC' (bỏ ô rỗng)
+    lines = []
+    for ln in text.split('\n'):
+        parts = [p.strip().strip('—–-|').strip() for p in ln.split('|')]
+        parts = [p for p in parts if p and not re.fullmatch(r'[—–\-]+', p)]
+        if len(parts) > 1 and len(ln) < 200:
+            lines.extend(parts)
+        else:
+            lines.append(ln)
+    text = '\n'.join(lines)
+    # bỏ dòng chứa Cyrillic (Nga) hoặc chữ Trung — rác
     out = []
     for ln in text.split('\n'):
-        if re.search(r'[а-яА-ЯёЁ]', ln):
+        if re.search(r'[а-яА-ЯёЁ\u4e00-\u9fff]', ln):
             continue
         out.append(ln)
     text = '\n'.join(out)
+    text = re.sub(r'(?:\s*[—\-]\s*){2,}', ' — ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -1846,9 +1855,10 @@ async def _agent_execute(session, chat_id, name, args):
             "6. NHẬN ĐỊNH KÈO cho từng loại: 1X2, tài xỉu bàn, châu Á, BTTS, tài xỉu thẻ, tài xỉu góc — "
             "mỗi kèo nêu rõ lựa chọn + mức tin cậy % + 1 câu lý do. Kèo nào không đủ cơ sở thì nói thẳng.\n"
             "7. Chốt: kèo tự tin nhất + combo nếu có + cảnh báo rủi ro.\n"
-            "Trình bày dễ đọc trên Telegram: tiêu đề in hoa, gạch đầu dòng '- ', KHÔNG dùng bảng markdown (| |), "
-            "KHÔNG dùng ký tự ** hay ###. Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
-            "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
+            "Trình bày dễ đọc trên Telegram: tiêu đề in hoa, gạch đầu dòng '- ', MỖI MỤC THÔNG TIN MỘT DÒNG RIÊNG, "
+            "TUYỆT ĐỐI CẤM dùng bảng markdown, ký tự | hoặc ---. KHÔNG dùng ký tự ** hay ###. "
+            "Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
+            "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/TRUNG QUỐC/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
             "NẾU đội được hỏi ĐANG ĐÁ (trong dữ liệu có dòng ĐANG ĐÁ) thì phân tích TRẬN ĐANG ĐÁ đó theo diễn biến hiện tại, "
             "không chọn trận tương lai."
         )
