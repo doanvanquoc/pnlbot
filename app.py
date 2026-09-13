@@ -1781,71 +1781,29 @@ async def _agent_execute(session, chat_id, name, args):
             "Không tìm được trận hợp lệ: {\"not_found\": true}"
         )
         data_block = fetched[:2500] if fetched else f"Kết quả web (không có dữ liệu Sky):\n{web}"
-        pred, err = await get_ai_json(session, system,
-                                      f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}")
+        text, err = await get_ai_response(session, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}"},
+        ], max_tokens=1800, timeout_s=150)
         if err:
             return f"Lỗi phân tích: {err}"
-        if pred.get('not_found'):
-            return f"AI không tìm được trận nào khớp '{q}' — không bịa. Thử tên khác: mu, arsenal, sheffield united, real madrid..."
-        scores = pred.get('diem') or pred.get('scores') or {}
-        if scores and not isinstance(scores, dict):
-            scores = {}
-        total = 0
-        sc = []
-        for k, vn in (('phong_do', 'Phong độ'), ('doi_dau', 'Đối đầu'), ('dong_luc', 'Động lực'),
-                      ('luc_luong', 'Lực lượng'), ('loi_choi', 'Lối chơi'), ('boi_canh', 'Bối cảnh')):
-            try:
-                s = int(scores.get(k, 0))
-            except Exception:
-                s = 0
-            s = max(0, min(s, 5))
-            total += s
-            sc.append(f"{vn} {s}/5")
-        lines = [
-            f"⚽ *{pred.get('match', q)}* ({pred.get('datetime', '?')}) [{pred.get('league', '?')}]",
-            f"📊 *Bảng điểm: {total}/30* — " + " | ".join(sc), "",
-        ]
-        picks = pred.get('picks') or []
-        if isinstance(picks, dict):
-            picks = [picks]
-        if picks and isinstance(picks, list):
-            # chuẩn hóa: nếu là list string ("Cả hai đội ghi bàn") → đổi thành dict
-            picks_norm = []
-            for pk in picks:
-                if isinstance(pk, dict):
-                    picks_norm.append(pk)
-                else:
-                    picks_norm.append({'market': 'Kèo', 'selection': str(pk), 'prob': 50})
-            picks = picks_norm
-        if picks:
-            lines.append("*Dự đoán kèo:*")
-            best = max(picks, key=lambda p: float(p.get('prob') or 0))
-            for pk in picks:
-                prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
-                mark = "🔥" if pk is best else "•"
-                lines.append(f"{mark} {pk.get('market')} → *{pk.get('selection')}* ({prob:.0f}%)")
-            lines.append("")
-            lines.append(f"💡 Chắc ăn nhất: *{best.get('market')} — {best.get('selection')}*")
-        lines.append(f"Lý do: {str(pred.get('reasoning') or '')[:400]}")
-        lines.append("\n💰 Dán odds 1xBet (vd `tx2.5 1.90 1.95`) để t tính EV.")
-        # Lưu các kèo vào predictions để /kq chấm
-        ts_now = int(time.time())
-        for i, pk in enumerate(picks):
-            try:
-                prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
-            except Exception:
-                prob = 50.0
-            predictions[f"web_{ts_now}_{chat_id}_{i}"] = {
-                'match': str(pred.get('match', q)), 'datetime': str(pred.get('datetime', '?')),
-                'league': str(pred.get('league', '?')), 'scores': '', 'score_total': total,
-                'market': str(pk.get('market') or '?'), 'selection': str(pk.get('selection') or '?'),
-                'prob': prob, 'odds': None, 'ev': None,
-                'reasoning': str(pred.get('reasoning') or '')[:500], 'status': 'pending',
-                'result': None, 'graded': None, 'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
-                'kickoff_vn': str(pred.get('datetime', '?')), 'home': '', 'away': '',
-            }
+        if 'not_found' in text or 'không tìm được trận' in text.lower() or 'không tìm thấy trận' in text.lower():
+            return f"AI không tìm được trận nào khớp '{q}'. Thử tên khác: mu, arsenal, sheffield united, real madrid..."
+        # Cắt bỏ preamble "Mình sẽ kiểm tra cấu trúc workspace..." của persona MintRouter
+        idx = text.find('\n## ')
+        if idx == -1:
+            idx = text.find('\n- **')
+        if idx != -1:
+            text = text[idx + 1:].strip()
+        # Lưu 1 bản ghi pending để /kq chấm (nếu người dùng tự xác nhận thắng/thua)
+        predictions[f"web_{int(time.time())}_{chat_id}"] = {
+            'match': q, 'datetime': '?', 'league': '?', 'scores': '', 'score_total': 0,
+            'market': 'AI phân tích', 'selection': 'xem nội dung', 'prob': 50, 'odds': None, 'ev': None,
+            'reasoning': text[:400], 'status': 'pending', 'result': None, 'graded': None,
+            'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'), 'kickoff_vn': '?', 'home': '', 'away': '',
+        }
         _save_predictions()
-        return "\n".join(lines)
+        return text[:3500]
     if name == 'my_stats':
         graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
         wins = [p for p in graded if p['status'] == 'win']
