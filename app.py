@@ -859,7 +859,7 @@ async def tool_web_search(session, query, max_results=8):
     return "\n".join(lines)
 
 
-async def tool_fetch_url(session, url):
+async def tool_fetch_url(session, url, max_chars=4000):
     """Đọc nội dung 1 trang web (text thô). Fallback Jina Reader khi trang JS/anti-bot."""
     if not url.startswith(('http://', 'https://')):
         return "LỖI: url không hợp lệ."
@@ -896,7 +896,7 @@ async def tool_fetch_url(session, url):
         raw = re.sub(r'\s+', ' ', raw).strip()
     if not raw:
         return "Trang rỗng hoặc chỉ toàn script."
-    return raw[:4000]
+    return raw[:max_chars]
 
 
 # ═══════════════ FRAMEWORK PHÂN TÍCH CHUẨN (AI bắt buộc chấm từng mục) ═══════════════
@@ -1674,7 +1674,7 @@ async def _agent_execute(session, chat_id, name, args):
         slug = re.sub(r'[^a-z0-9]+', '-', q.lower()).strip('-')
         for cand in (f"https://www.skysports.com/{slug}-fixtures",
                      f"https://www.skysports.com/{slug}-scores-fixtures"):
-            pg = await tool_fetch_url(session, cand)
+            pg = await tool_fetch_url(session, cand, max_chars=20000)
             if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
                 fetched = pg
                 break
