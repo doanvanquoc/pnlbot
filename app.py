@@ -6716,29 +6716,46 @@ async def tool_web_search(session, chat_id, args):
 
 
 async def tool_fetch_url(session, chat_id, args):
-    """Đọc nội dung một trang web (text thô, đã bỏ tag HTML). Trả về tối đa ~4000 ký tự."""
+    """Đọc nội dung một trang web (text thô, đã bỏ tag HTML). Trả về tối đa ~4000 ký tự.
+    Trang cần render JS sẽ tự fallback qua Jina Reader (r.jina.ai) render rồi mới đọc."""
     url = (args.get('url') or '').strip()
     if not url.startswith(('http://', 'https://')):
         return "LỖI: url phải bắt đầu bằng http:// hoặc https://."
+    raw, ctype = None, ''
     try:
         timeout = aiohttp.ClientTimeout(total=20)
         async with session.get(url, timeout=timeout, headers={
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
             "Accept-Language": "vi,en;q=0.8",
         }) as resp:
-            if resp.status != 200:
-                return f"Không đọc được trang (HTTP {resp.status})."
-            ctype = resp.headers.get('Content-Type', '')
-            if 'html' not in ctype and 'text' not in ctype and 'json' not in ctype:
-                return f"Trang không phải text/html ({ctype.split(';')[0]}) — bỏ qua."
-            raw = await resp.text(errors='ignore')
-    except Exception as e:
-        return f"Lỗi đọc trang: {e}"
-    # Bỏ script/style/tag, giữ text
-    raw = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw, flags=re.S | re.I)
-    raw = re.sub(r'<[^>]+>', ' ', raw)
-    raw = raw.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    raw = re.sub(r'\s+', ' ', raw).strip()
+            if resp.status == 200:
+                ctype = resp.headers.get('Content-Type', '')
+                if 'html' in ctype or 'text' in ctype or 'json' in ctype:
+                    raw = await resp.text(errors='ignore')
+    except Exception:
+        raw = None
+    # Trang JS/rỗng/chống-bot → fallback Jina Reader (render trình duyệt thật, trả markdown)
+    need_jina = (raw is None or len(raw) < 800
+                 or re.search(r'enable javascript|requires javascript|just a moment|human verification|captcha', raw[:3000], re.I))
+    if need_jina:
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with session.get(f"https://r.jina.ai/{url}", timeout=timeout) as resp:
+                if resp.status == 200:
+                    md = await resp.text(errors='ignore')
+                    if len(md) > 200 and 'Human Verification' not in md[:500]:
+                        raw = md  # markdown đã sạch HTML, dùng luôn
+                        ctype = 'text/markdown'
+        except Exception:
+            pass
+    if raw is None:
+        return f"Không đọc được trang ({url or ctype or 'lỗi mạng'}) — có thể trang chặn bot."
+    if ctype and 'markdown' not in ctype:
+        # Bỏ script/style/tag, giữ text
+        raw = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw, flags=re.S | re.I)
+        raw = re.sub(r'<[^>]+>', ' ', raw)
+        raw = raw.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        raw = re.sub(r'\s+', ' ', raw).strip()
     if not raw:
         return "Trang rỗng hoặc chỉ toàn script."
     if len(raw) > 4000:
