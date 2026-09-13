@@ -980,6 +980,132 @@ async def analyze_match(session, fixture):
             'status': 'pending', 'result': None, 'graded': None}, None
 
 
+def _grade_prediction(p, fixture):
+    """Chấm kết quả dự đoán cho 1X2, tài xỉu bàn, BTTS, châu Á. Trả (status, result_txt) hoặc ('needs_stats', None) cho góc/thẻ."""
+    goals = fixture.get('goals') or {}
+    gh, ga = goals.get('home'), goals.get('away')
+    if gh is None or ga is None:
+        return None, None
+    total = gh + ga
+    market = (p.get('market') or '').lower()
+    sel = (p.get('selection') or '').lower()
+    # ── Góc/Thẻ: cần stats riêng ──
+    if 'corner' in market or 'card' in market or 'booking' in market or 'thẻ' in market or 'góc' in market:
+        return 'needs_stats', None
+    # ── 1X2 ──
+    if '1x2' in market or 'kết quả' in market:
+        home_n = (p.get('home') or '').lower()
+        away_n = (p.get('away') or '').lower()
+        if gh > ga:
+            winner = 'home'
+        elif gh < ga:
+            winner = 'away'
+        else:
+            winner = 'draw'
+        if winner == 'draw':
+            if any(w in sel for w in ('hòa', 'draw', 'x', '1x', 'x2')):
+                return 'win', f"hòa {gh}-{ga}"
+            return 'loss', f"hòa {gh}-{ga}"
+        if winner == 'home':
+            if any(w in sel for w in ('home', 'chủ', 'đội nhà', home_n[:4], '1x')):
+                return 'win', f"{p.get('home')} thắng {gh}-{ga}"
+            return 'loss', f"{p.get('home')} thắng {gh}-{ga}"
+        if winner == 'away':
+            if any(w in sel for w in ('away', 'khách', 'đội khách', away_n[:4], 'x2')):
+                return 'win', f"{p.get('away')} thắng {gh}-{ga}"
+            return 'loss', f"{p.get('away')} thắng {gh}-{ga}"
+    # ── Tài xỉu bàn ──
+    if 'tài xỉu' in market or 'over' in market or 'under' in market or 'total' in market:
+        m = re.search(r'(\d+(?:\.\d+)?)', market)
+        line = float(m.group(1)) if m else 2.5
+        is_over = any(w in sel for w in ('tài', 'over', 'trên'))
+        is_under = any(w in sel for w in ('xỉu', 'under', 'dưới'))
+        if total > line:
+            result_txt = f"tổng {total} (Tài {line})"
+            return ('win' if is_over else ('loss' if is_under else None)), result_txt
+        if total < line:
+            result_txt = f"tổng {total} (Xỉu {line})"
+            return ('win' if is_under else ('loss' if is_over else None)), result_txt
+        # half-line: no push
+        result_txt = f"tổng {total} (hòa {line})"
+        return 'push', result_txt
+    # ── BTTS ──
+    if 'btts' in market or 'both' in market or 'ghi bàn' in market or 'cả 2' in market:
+        both_scored = gh > 0 and ga > 0
+        is_yes = any(w in sel for w in ('có', 'yes', 'both'))
+        is_no = any(w in sel for w in ('không', 'no', 'none'))
+        if both_scored:
+            result_txt = f"cả 2 đều ghi bàn ({gh}-{ga})"
+            return ('win' if is_yes else ('loss' if is_no else None)), result_txt
+        result_txt = f"ít nhất 1 đội không ghi bàn ({gh}-{ga})"
+        return ('win' if is_no else ('loss' if is_yes else None)), result_txt
+    # ── Châu Á ──
+    if 'châu á' in market or 'handicap' in market or 'asian' in market or 'chấp' in market:
+        m = re.search(r'([+-]?\s*\d+(?:\.\d+)?)', sel)
+        h_val = float(m.group(1).replace(' ', '')) if m else 0
+        # xác định bên: nếu selection chứa tên đội nhà hoặc 'home' → bên nhà
+        home_n = (p.get('home') or '').lower()
+        away_n = (p.get('away') or '').lower()
+        is_home_side = any(w in sel for w in ('home', 'chủ', 'đội nhà', home_n[:4]))
+        is_away_side = any(w in sel for w in ('away', 'khách', 'đội khách', away_n[:4]))
+        if not is_home_side and not is_away_side:
+            # mặc định: nếu handicap âm → đội mạnh hơn (thường là đội đầu tiên)
+            is_home_side = True
+        if is_home_side:
+            effective = gh + h_val - ga
+        else:
+            effective = ga - h_val - gh
+        if effective > 0:
+            return 'win', f"margin {effective:+.1f}"
+        if effective < 0:
+            return 'loss', f"margin {effective:+.1f}"
+        return 'push', f"margin 0"
+    return None, None
+
+
+async def _match_stats_summary(session, fixture_id):
+    """Lấy thống kê trận đấu (góc, thẻ) từ API-Football /fixtures/statistics."""
+    data, err = await fb_get(session, "/fixtures/statistics", {'fixture': fixture_id})
+    if err or not data:
+        # fallback: thử /fixtures/events để đếm thẻ
+        evts, err2 = await fb_get(session, "/fixtures/events", {'fixture': fixture_id})
+        if err2 or not evts:
+            return None
+        yellows = {}
+        reds = {}
+        corners = {}
+        for ev in (evts if isinstance(evts, list) else []):
+            team = str(ev.get('team', {}).get('name', '?'))
+            if ev.get('type') == 'Card':
+                if ev.get('detail') == 'Yellow Card':
+                    yellows[team] = yellows.get(team, 0) + 1
+                elif ev.get('detail') == 'Red Card':
+                    reds[team] = reds.get(team, 0) + 1
+        return {'corners': corners, 'yellows': yellows, 'reds': reds}
+    corners = {}
+    yellows = {}
+    reds = {}
+    for team_stats in (data if isinstance(data, list) else []):
+        team = str(team_stats.get('team', {}).get('name', '?'))
+        for item in (team_stats.get('statistics') or []):
+            if item.get('type') == 'Corner Kicks':
+                try:
+                    corners[team] = int(item.get('value') or 0)
+                except Exception:
+                    pass
+            if item.get('type') == 'Yellow Cards':
+                try:
+                    yellows[team] = int(item.get('value') or 0)
+                except Exception:
+                    pass
+            if item.get('type') == 'Red Cards':
+                try:
+                    reds[team] = int(item.get('value') or 0)
+                except Exception:
+                    pass
+    return {'corners': corners, 'yellows': yellows, 'reds': reds}
+
+
 def _grade_stats_market(p, fixture, stats):
     """Chấm kèo góc/thẻ bằng số liệu trận (stats: {'corners': {team: n}, 'yellows': {...}, 'reds': {...}})."""
     market = (p.get('market') or '').lower()
@@ -1463,7 +1589,7 @@ async def results_loop(app):
                             continue
                         st, res = _grade_prediction(p, fx)
                         if st == 'needs_stats':
-                            stats = await _match_stats_summary(session, fx_id)
+                            stats = await _match_stats_summary(session, fid)
                             if not stats:
                                 continue  # thử lại lượt sau khi có đủ số liệu
                             st, res = _grade_stats_market(p, fx, stats)
@@ -1856,7 +1982,14 @@ def _keo_logic_check(obj):
     if ga_ is not None:
         tot = ga_ + gb_
         # Mỗi kèo phải có căn cứ riêng (lịch sử/lực lượng/đối đầu) — không ăn theo tỉ số
+        # Bỏ qua pct=0 (thiếu dữ liệu được phép không có why)
         for _k, _v in (ks or {}).items():
+            try:
+                _pct = int((_v or {}).get('pct', 0))
+            except Exception:
+                _pct = 0
+            if _pct == 0:
+                continue
             w = str((_v or {}).get('why') or '').strip()
             if len(w) < 10:
                 errs.append(f"kèo '{_k}' thiếu căn cứ riêng (why) — nêu số liệu/thống kê của chính kèo đó")
@@ -2108,32 +2241,23 @@ def _parse_sky_fixtures(pg):
     results = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
         r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
-        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+(FT|In Play)',
+        r'([A-Z][\w\' \.\-]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.\-]{1,28}?)\s+(\d+)\s+(FT|In Play)',
         pg)
     for date_str, league, h, gh, a, ga, st in results[:12]:
         tag = "🔴 ĐANG ĐÁ" if 'In Play' in st or 'LIVE' in st else "ĐÃ ĐÁ"
-        lines.append(f"{tag} [{league}] {date_str}: {h} {gh}-{ga} {a}")
-    # Trận đang đá (có phút giữa tỉ số và 'In Play') — pattern lỏng hơn
-    live = re.findall(
-        r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
-        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
-        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+[^A-Z]{0,25}\s*In Play',
-        pg)
-    # bắt luôn phút đá: "... 0 Malaga 0 36' In Play"
-    minute = re.search(
-        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([\d\+\'&#;x ]{1,15}?)\s*In Play', pg)
-    min_txt = ''
-    if minute:
-        raw_min = minute.group(5)
-        mm = re.search(r'(\d+)', raw_min)
-        min_txt = f" (phút {mm.group(1)})" if mm else ''
-    for date_str, league, h, gh, a, ga in live[:6]:
-        lines.append(f"🔴 ĐANG ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}{min_txt}")
+        # phút đá cho trận đang đá: "... 0 Malaga 0 36' In Play"
+        min_txt = ''
+        if 'In Play' in st:
+            mm = re.search(rf'{re.escape(h)}\s+{gh}\s+{re.escape(a)}\s+{ga}\s+([\d\+\'&#;x ]{{1,15}}?)\s*In Play', pg)
+            if mm:
+                m_num = re.search(r'(\d+)', mm.group(1))
+                min_txt = f" (phút {m_num.group(1)})" if m_num else ''
+        lines.append(f"{tag} [{league}] {date_str}: {h} {gh}-{ga} {a}{min_txt}")
     upcoming = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
         r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
-        r'([A-Z][\w\' \.]{1,28}?)\s+app\.football\.scores_fixtures\.are_scheduled\s+'
-        r'([A-Z][\w\' \.]{1,28}?)\s+\.\s+([\d\.]+(?:am|pm))\s+Fixture',
+        r'([A-Z][\w\' \.\-]{1,28}?)\s+app\.football\.scores_fixtures\.are_scheduled\s+'
+        r'([A-Z][\w\' \.\-]{1,28}?)\s+\.\s+([\d\.]+(?:am|pm))\s+Fixture',
         pg)
     for date_str, league, h, a, kick in upcoming[:8]:
         lines.append(f"SẮP ĐÁ [{league}] {date_str}: {h} vs {a} lúc {kick}")
@@ -2147,12 +2271,17 @@ async def _fetch_team_fixtures(session, q):
     slug, name = _sky_slug_for(q)
     if not slug:
         return ""
+    now = time.time()
+    cache_key = f"sky_team_{slug}"
+    if cache_key in _sky_cache and now - _sky_cache[cache_key][1] < SKY_CACHE_TTL:
+        return _sky_cache[cache_key][0]
     for cand in (f"https://www.skysports.com/{slug}-fixtures",
                  f"https://www.skysports.com/{slug}-scores-fixtures"):
-        pg = await tool_fetch_url(session, cand, max_chars=20000)
+        pg = await tool_fetch_url(session, cand, max_chars=30000)
         if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
             parsed = _parse_sky_fixtures(pg)
             if parsed:
+                _sky_cache[cache_key] = (parsed, now)
                 return parsed
     return ""
 
@@ -2163,7 +2292,17 @@ LEAGUE_SKY_SLUGS = {
     'Italian Serie A': 'serie-a', 'German Bundesliga': 'bundesliga',
     'French Ligue 1': 'ligue-1', 'EFL Championship': 'efl-championship',
     'Scottish Premiership': 'scottish-premier',
+    'Champions League': 'champions-league', 'UEFA Champions League': 'champions-league',
+    'Europa League': 'europa-league', 'UEFA Europa League': 'europa-league',
+    'V.League 1': 'v-league', 'V-League': 'v-league',
+    'MLS': 'mls', 'World Cup': 'world-cup', 'Euro': 'european-championship',
+    'FA Cup': 'fa-cup', 'League Cup': 'league-cup', 'Carabao Cup': 'league-cup',
+    'Copa del Rey': 'copa-del-rey', 'Coppa Italia': 'coppa-italia',
+    'DFB Pokal': 'dfb-pokal', 'Coupe de France': 'coupe-de-france',
 }
+
+_sky_cache = {}  # url -> (text, timestamp)
+SKY_CACHE_TTL = 1800  # 30 phút
 
 
 async def _fetch_league_fixtures(session, fetched):
@@ -2174,9 +2313,16 @@ async def _fetch_league_fixtures(session, fetched):
     league = m.group(1)
     slug = LEAGUE_SKY_SLUGS.get(league)
     if not slug:
-        return ""
-    pg = await tool_fetch_url(session, f"https://www.skysports.com/{slug}-fixtures", max_chars=20000)
+        # Dynamic fallback: thử slug guessed
+        slug = re.sub(r'[^a-z0-9]+', '-', league.lower()).strip('-')
+    now = time.time()
+    cache_key = f"sky_league_{slug}"
+    if cache_key in _sky_cache and now - _sky_cache[cache_key][1] < SKY_CACHE_TTL:
+        return _sky_cache[cache_key][0]
+    pg = await tool_fetch_url(session, f"https://www.skysports.com/{slug}-fixtures", max_chars=30000)
     parsed = _parse_sky_fixtures(pg) if pg else ""
+    if parsed:
+        _sky_cache[cache_key] = (parsed, now)
     return parsed
 
 
@@ -2252,18 +2398,81 @@ async def _agent_execute(session, chat_id, name, args):
                        if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
                 if rel:
                     data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
+        # ── Historical accuracy feedback: bot học từ quá khứ ──
+        hist_lines = []
+        q_tok = re.split(r'[^a-z0-9]+', q.lower())[0] if q else ''
+        team_matches = [p for p in predictions.values()
+                        if (q_tok and len(q_tok) >= 3) and (
+                            q_tok in (p.get('home') or '').lower()
+                            or q_tok in (p.get('away') or '').lower())]
+        graded_team = [p for p in team_matches if p.get('status') in ('win', 'loss')]
+        if graded_team:
+            wins_t = sum(1 for p in graded_team if p['status'] == 'win')
+            hist_lines.append(f"Bot dự đoán đội này {len(graded_team)} lần: thắng {wins_t}/{len(graded_team)} ({wins_t/len(graded_team)*100:.0f}%)")
+        by_market = {}
+        for p in predictions.values():
+            if p.get('status') in ('win', 'loss'):
+                mk = p.get('market') or '?'
+                by_market.setdefault(mk, [0, 0])
+                if p['status'] == 'win':
+                    by_market[mk][0] += 1
+                else:
+                    by_market[mk][1] += 1
+        for mk, (w, l) in sorted(by_market.items()):
+            if w + l >= 3:
+                hist_lines.append(f"Bot {mk}: {w}/{w+l} ({w/(w+l)*100:.0f}%)")
+        hist_block = ""
+        if hist_lines:
+            hist_block = "\n\nLỊCH SỬ DỰ ĐOÁN CỦA BOT (dùng để calibrate % — đừng lặp lại sai lầm cũ):\n" + "\n".join(hist_lines[:8])
         data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
-                      + "\n\n".join(data_parts)) if data_parts else (
+                      + "\n\n".join(data_parts) + hist_block) if data_parts else (
                       f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(session, f"{q} football next match {now_str}", 5))
         return ("Dữ liệu trận đấu (dùng làm nền tảng chốt 6 kèo):\n\n" + data_block)
     if name == 'my_stats':
         graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
         wins = [p for p in graded if p['status'] == 'win']
         losses = [p for p in graded if p['status'] == 'loss']
+        pushes = [p for p in graded if p['status'] == 'push']
         decided = len(wins) + len(losses)
         hit = len(wins) / decided * 100 if decided else 0
-        return (f"Đã chấm {decided} kèo: thắng {len(wins)}, thua {len(losses)} (hit-rate {hit:.0f}%). "
-                f"Chưa có kèo nào được chấm → gõ /kèo để bắt đầu." if decided else "Chưa có kèo nào được chấm.")
+        if not decided:
+            return "Chưa có kèo nào được chấm kết quả → gõ /kèo để bắt đầu."
+        lines = [f"Đã chấm {decided} kèo: {len(wins)} thắng, {len(losses)} thua, {len(pushes)} void — hit-rate {hit:.0f}%"]
+        # Theo loại kèo
+        by_market = {}
+        for p in graded:
+            mk = p.get('market') or '?'
+            by_market.setdefault(mk, [0, 0, 0])
+            if p['status'] == 'win':
+                by_market[mk][0] += 1
+            elif p['status'] == 'loss':
+                by_market[mk][1] += 1
+            else:
+                by_market[mk][2] += 1
+        lines.append("Theo loại kèo:")
+        for mk, (w, l, pp) in sorted(by_market.items()):
+            d = w + l
+            if d >= 2:
+                lines.append(f"  {mk}: {w}/{d} ({w/d*100:.0f}%)")
+        # Theo đội
+        by_team = {}
+        for p in graded:
+            for t in [p.get('home', ''), p.get('away', '')]:
+                if not t:
+                    continue
+                by_team.setdefault(t, [0, 0])
+                if p['status'] == 'win':
+                    by_team[t][0] += 1
+                elif p['status'] == 'loss':
+                    by_team[t][1] += 1
+        top_teams = sorted(by_team.items(), key=lambda x: sum(x[1]), reverse=True)[:5]
+        if top_teams:
+            lines.append("Theo đội:")
+            for t, (w, l) in top_teams:
+                d = w + l
+                if d >= 2:
+                    lines.append(f"  {t}: {w}/{d} ({w/d*100:.0f}%)")
+        return "\n".join(lines)
     return f"Lỗi: tool '{name}' không tồn tại."
 
 
@@ -2284,8 +2493,10 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "- Hỏi thành tích dự đoán của bot → my_stats. "
         "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
         "Gọi tool cho tới khi có đủ dữ liệu trả lời đầy đủ. "
-        "CỨNG LỆNH TỔNG HỢP: kết quả cuối PHẢI chứa đủ 6 kèo (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc) "
-        "với lựa chọn cụ thể + tin cậy %, kèm giờ đá + 2 đội — BẤKỂ KỂ tool trả về gì.\n"
+        f"{KEO_FRAMEWORK}\n"
+        "Kết quả cuối PHẢI có 6 dòng kèo (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc). "
+        "Nếu dữ liệu THIẾU cho kèo nào (thiếu 2+ yếu tố framework) → ghi 'Thiếu dữ liệu' với pct=0, KHÔNG đoán mò. "
+        "Nếu đủ dữ liệu → chấm điểm framework rồi mới chốt %, % phải phản ánh tổng điểm (≥21/30 → >60%; 18-20 → 55-60%; <18 → <55%). "
         "FORMAT KẾT QUẢ CUỐI (CHÍNH XÁC mẫu — không thêm/bớt):\n"
         "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
         "(🔴 LIVE phút X — tỉ số nếu đang đá)\n"
@@ -2296,10 +2507,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "- Thẻ: [Tài/Xỉu] (X%)\n"
         "- Góc: [Tài/Xỉu] (X%)\n"
         "➡️ [kèo tự tin nhất]\n\n"
-        "KHÔNG thêm bất cứ thứ gì khác: không 'dữ liệu nền', không nhận xét dài, không khuyến cáo, không 18+, không trách nhiệm, không chào hỏi, không hỏi lại. "
-        "Chỉ 8 dòng như mẫu + dòng ⭐. BỎ dòng 'Dữ liệu nền'/'Bối cảnh' — người dùng không cần."
-        "KHÔNG BAO GIỜ: nói 'chưa có tỷ lệ', 'chưa đủ dữ liệu', 'chờ odds', 'hỏi lại người dùng cần cửa nào' — "
-        "nếu tool thiếu số thì TỰ chốt theo chuyên môn của mày và ghi '(ước lượng)'. "
+        "KHÔNG thêm bất cứ thứ gì khác: không 'dữ liệu nền', không nhận xét dài, không khuyến cáo, không chào hỏi, không hỏi lại. "
+        "Chỉ 8 dòng như mẫu + dòng ➡️. "
         "Trả lời ngắn gọn tiếng Việt. KHÔNG dùng bảng markdown (| | |) — dùng dòng đạn '- '. "
         "Người dùng là ADMIN DUY NHẤT — hỏi gì cũng trả lời thẳng, không chối."
     )
