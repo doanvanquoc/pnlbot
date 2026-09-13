@@ -1701,8 +1701,32 @@ def _sky_slug_for(query):
     return None, None
 
 
+def _parse_sky_fixtures(pg):
+    """Làm sạch trang Sky Sports → danh sách trận đọc được:
+    '13/9: MU vs Man City (Premier League, 4:30pm)' + kết quả đã đá."""
+    lines = []
+    results = re.findall(
+        r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
+        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
+        r'([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.]{1,28}?)\s+(\d+)\s+(FT|In Play)',
+        pg)
+    for date_str, league, h, gh, a, ga, st in results[:12]:
+        lines.append(f"ĐÃ ĐÁ [{league}] {date_str}: {h} {gh}-{ga} {a}")
+    upcoming = re.findall(
+        r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
+        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
+        r'([A-Z][\w\' \.]{1,28}?)\s+app\.football\.scores_fixtures\.are_scheduled\s+'
+        r'([A-Z][\w\' \.]{1,28}?)\s+\.\s+([\d\.]+(?:am|pm))\s+Fixture',
+        pg)
+    for date_str, league, h, a, kick in upcoming[:8]:
+        lines.append(f"SẮP ĐÁ [{league}] {date_str}: {h} vs {a} lúc {kick}")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
 async def _fetch_team_fixtures(session, q):
-    """Fetch lịch trận thật từ Sky Sports theo tên đội trong query. Trả về text (rỗng nếu fail)."""
+    """Fetch lịch trận thật từ Sky Sports theo tên đội trong query → trả về text ĐÃ LÀM SẠCH (rỗng nếu fail)."""
     slug, name = _sky_slug_for(q)
     if not slug:
         return ""
@@ -1710,7 +1734,9 @@ async def _fetch_team_fixtures(session, q):
                  f"https://www.skysports.com/{slug}-scores-fixtures"):
         pg = await tool_fetch_url(session, cand, max_chars=20000)
         if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
-            return pg
+            parsed = _parse_sky_fixtures(pg)
+            if parsed:
+                return parsed
     return ""
 
 
