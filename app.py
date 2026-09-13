@@ -761,29 +761,37 @@ async def get_fixtures_for_date(session, date_str, only_tracked=True, force=Fals
 
 
 async def get_match_odds(session, fixture_id):
-    """Odds ĐẦY ĐỦ mọi market của nhà cái chính (Bet365) — trả về dict giữ nguyên tên market gốc:
+    """Odds ĐẦY ĐỦ mọi market — ưu tiên 1xBet (id 6), fallback Bet365 (id 8) — trả về dict giữ nguyên tên market gốc:
     {'bookmaker': str, 'markets': {'Goals Over/Under': {'Over 2.5': 1.9, 'Under 2.5': 1.98}, ...}}
     Không sàng lọc market — AI tự chọn kèo hay nhất trong những gì nhà cái mở."""
     data, err = await fb_get(session, "/odds", {'fixture': fixture_id})
     if err or not data:
         return None
+    by_id = {}
     for entry in data:
-        for bm in entry.get('bookmakers', []):
-            if bm.get('id') == 8:  # Bet365 — odds chuẩn
-                markets = {}
-                for bet in bm.get('bets', []):
-                    vals = {}
-                    for v in bet.get('values', []):
-                        try:
-                            o = float(v.get('odd', 0) or 0)
-                        except Exception:
-                            continue
-                        if o > 1.01:
-                            vals[v.get('value', '')] = o
-                    if vals:
-                        markets[bet.get('name', '?')] = vals
-                if markets:
-                    return {'bookmaker': bm.get('name', 'Bet365'), 'markets': markets}
+        for bm in entry.get('bookmakers', []) or []:
+            try:
+                by_id[int(bm.get('id'))] = bm
+            except Exception:
+                continue
+    for bid in (6, 8):  # 1xBet trước (m chơi 1xBet), rồi Bet365
+        bm = by_id.get(bid)
+        if not bm:
+            continue
+        markets = {}
+        for bet in bm.get('bets', []) or []:
+            vals = {}
+            for v in bet.get('values', []) or []:
+                try:
+                    o = float(v.get('odd', 0) or 0)
+                except Exception:
+                    continue
+                if o > 1.01:
+                    vals[v.get('value', '')] = o
+            if vals:
+                markets[bet.get('name', '?')] = vals
+        if markets:
+            return {'bookmaker': bm.get('name', '?'), 'markets': markets}
     return None
 
 
