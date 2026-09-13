@@ -9094,6 +9094,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
         
     command = text.split()[0].lower()
     command_base = command.split('@')[0]
+    arg = None  # lệnh không có tham số vẫn có biến hợp lệ (/fomo, /stopauto...)
     
     if command_base in ('/start', '/help'):
         welcome_text = (
