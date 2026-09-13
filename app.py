@@ -1901,22 +1901,61 @@ async def _agent_execute(session, chat_id, name, args):
             "- Góc: Xỉu 9.5 (tin cậy 52%)\n"
             "Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể. "
             "NGÔN NGỮ: tiếng Việt THUẦN — tuyệt đối không lẫn tiếng Anh/Nga/TRUNG QUỐC/ngôn ngữ khác vào câu, tên đội/giải giữ tiếng Anh chuẩn. "
+            "LUẬT PHÂN TÍCH: người dùng nêu 1 đội → phân tích trận gần nhất (đang đá ưu tiên) của đội đó, "
+            "NHƯNG PHẢI phân tích CẢ HAI ĐỘI trong trận đó (phong độ 2 bên) để kết luận chuẩn. "
+            "Người dùng nêu 2 đội (A vs B) → phân tích trận đối đầu, PHẢI có dữ liệu cả 2 đội. "
+            "BẮT BUỘC đủ 6 kèo cho trận mục tiêu. "
             "NẾU đội được hỏi ĐANG ĐÁ (dòng ĐANG ĐÁ) thì ƯU TIÊN TỐI ĐA phân tích TRẬN ĐANG ĐÁ: "
             "đưa NGAY 6 kèo LIVE (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc) dựa trên tỉ số + phút hiện tại + thế trận, "
             "ví dụ 'Celta đang dẫn 1-0 phút 53 → kèo châu Á Celta -0.5 có giá, tài xỉu line 2.5 → Xỉu nghiêng về...' — "
             "đây là kèo người dùng có thể đánh NGAY trên app. Kèo trận tương lai chỉ để phụ, 1-2 dòng cuối."
         )
         data_parts = []
+        opponent = None
         if fetched:
             data_parts.append(f"LỊCH + KẾT QUẢ của đội được hỏi:\n{fetched}")
+            # Xác định ĐỐI THỦ từ trận ĐANG ĐÁ hoặc SẮP ĐÁ gần nhất
+            target_ln = None
+            for ln in fetched.split('\n'):
+                if 'ĐANG ĐÁ' in ln:
+                    target_ln = ln
+                    break
+            if not target_ln:
+                for ln in fetched.split('\n'):
+                    if 'SẮP ĐÁ' in ln:
+                        target_ln = ln
+                        break
+            if target_ln:
+                # opponent = đội trong dòng KHÔNG khớp với query
+                q_words = set(re.split(r'[^a-z0-9]+', q.lower())) - {''}
+                teams_in_ln = re.findall(r'([A-Z][\w\'\.]+(?: [A-Z][\w\'\.]+){0,3})', target_ln)
+                cands = [t for t in teams_in_ln if len(t) > 3
+                         and not any(w in t.lower() for w in q_words)
+                         and not re.search(r'ĐÃ|SẮP|ĐANG|Premier|League|La|Liga|Serie|Bundesliga|Ligue|Championship|Cup|Copa|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|September|October|November|December|January|February|March|April|May|June|July|August', t)]
+                if cands:
+                    opponent = cands[0].strip()
+            # Fetch lịch ĐỐI THỦ (slug từ tên đối thủ)
+            if opponent:
+                opp_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
+                opp_data = ""
+                for cand in (f"https://www.skysports.com/{opp_slug}-fixtures",
+                             f"https://www.skysports.com/{opp_slug}-scores-fixtures"):
+                    pg = await tool_fetch_url(session, cand, max_chars=20000)
+                    parsed = _parse_sky_fixtures(pg) if pg else ""
+                    if parsed:
+                        opp_data = parsed
+                        break
+                if opp_data:
+                    data_parts.append(f"LỊCH + KẾT QUẢ của ĐỐI THỦ ({opponent}):\n{opp_data}")
             league_data = await _fetch_league_fixtures(session, fetched)
             if league_data:
-                # lọc các trận có liên quan (cùng tên đội hoặc hôm nay/đã đá gần đây)
                 kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
+                if opponent:
+                    kw += [w.lower() for w in re.split(r'[^a-z0-9]+', opponent.lower()) if len(w) > 3]
                 rel = [ln for ln in league_data.split('\n')
                        if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
                 if rel:
-                    data_parts.append("KẾT QUẢ/LỊCH CỦA ĐỐI THỦ & CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
+                    data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
         if data_parts:
             data_block = "\n\n".join(data_parts) + "\n\n(Lưu ý: các trận trên là LỊCH THI ĐẤU CHÍNH THỨC mùa 2026-27 — tin tuyệt đối, không suy diễn đội nào 'hạng dưới' hay 'Copa del Rey'.)"
         else:
