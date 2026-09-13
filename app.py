@@ -2364,8 +2364,9 @@ def _keo_logic_check(obj):
     return errs
 
 
-def _render_keo_from_json(obj):
-    """Render output kèo từ JSON schema cứng — không phụ thuộc AI biết format."""
+def _render_keo_from_json(obj, single_key=None):
+    """Render output kèo từ JSON schema cứng — không phụ thuộc AI biết format.
+    single_key: chỉ render đúng 1 kèo user hỏi (vd 'the'), bỏ dòng best."""
     if not isinstance(obj, dict):
         return None
     ks = obj.get('keos') or {}
@@ -2382,7 +2383,10 @@ def _render_keo_from_json(obj):
     live = str(obj.get('live') or '').strip()
     if live and live[:50] != out[0][:50]:
         out.append(live[:90])
-    for d, key in (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc')):
+    pairs = (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc'))
+    if single_key:
+        pairs = [(d, k) for d, k in pairs if k == single_key]
+    for d, key in pairs:
         v = ks.get(key) or {}
         p = str(v.get('pick') or '').strip()
         pct = v.get('pct')
@@ -2392,6 +2396,8 @@ def _render_keo_from_json(obj):
             pct = None
         if p and not (pct and re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', p, re.I)):
             out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}")
+    if single_key:
+        return '\n'.join(out) if len(out) >= 2 else None
     if len(out) < 5:
         return None
     b = str(obj.get('best') or '').strip()
@@ -2673,6 +2679,31 @@ def _parse_query_teams(q):
         if s and s not in slugs:
             slugs.append(s)
     return slugs
+
+
+# user hỏi 1 kèo cụ thể → (key, tên hiển thị, cửa, line). None = hỏi full.
+# vd 'xỉu 6.5 thẻ' → ('the', 'Thẻ', 'xỉu', '6.5')
+def _detect_single_market(question):
+    q = (question or '').lower()
+    m = re.search(r'(tài|xỉu|over|under)\s*(\d+(?:[.,]\d+)?)\s*(thẻ|card)', q)
+    if m:
+        return ('the', 'Thẻ', m.group(1), m.group(2).replace(',', '.'))
+    m = re.search(r'(tài|xỉu|over|under)\s*(\d+(?:[.,]\d+)?)\s*(góc|corner)', q)
+    if m:
+        return ('goc', 'Góc', m.group(1), m.group(2).replace(',', '.'))
+    m = re.search(r'(tài|xỉu|over|under)\s*(\d+(?:[.,]\d+)?)(?!\s*(thẻ|góc|card|corner))', q)
+    if m:
+        return ('tai_xiu', 'Tài xỉu', m.group(1), m.group(2).replace(',', '.'))
+    if re.search(r'\bbtts\b|both teams to score|cả 2 đội ghi bàn|cả hai đội ghi bàn|2 đội ghi bàn|hai đội ghi bàn', q):
+        return ('btts', 'BTTS', '', '')
+    if re.search(r'\b1\s*x\s*2\b', q):
+        return ('1x2', '1X2', '', '')
+    if re.search(r'chấp|handicap|châu á|asian|kèo trên|kèo dưới', q):
+        return ('chau_a', 'Châu Á', '', '')
+    m = re.search(r'([+-]\s*\d+(?:[.,]\d+)?)', q)
+    if m:
+        return ('chau_a', 'Châu Á', '', m.group(1).replace(' ', '').replace(',', '.'))
+    return None
 
 
 # Từ đầu tên đội trong header AI (vd 'Premier League Manchester United') → lột tên giải
@@ -3273,6 +3304,10 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "Gọi tool cho tới khi có đủ dữ liệu trả lời đầy đủ. "
         f"{KEO_FRAMEWORK}\n"
         "Kết quả cuối PHẢI có 6 dòng kèo (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc). "
+        "Ngoại lệ: user CHỈ hỏi 1 kèo cụ thể (vd 'xỉu 6.5 thẻ được không', 'Tài 2.5 trận này?', 'BTTS có không', 'MU -0.5') "
+        "→ CHỈ trả lời đúng kèo đó: pick phải đánh giá đúng line user hỏi + % + tối đa 1 dòng lý do cực ngắn (≤15 từ), KHÔNG phân tích full 6 kèo. "
+        "Trận đang LIVE → chốt theo phút/tỉ số hiện tại; kèo pre-match đã đóng thì nói rõ và chỉ nhận định theo diễn biến live; "
+        "KHÔNG bịa số liệu live (số thẻ/góc hiện tại) nếu data không có — ghi rõ không có số liệu. "
         "Nếu dữ liệu THIẾU cho kèo nào (thiếu 2+ yếu tố framework) → ghi 'Thiếu dữ liệu' với pct=0, KHÔNG đoán mò. "
         "Nếu đủ dữ liệu → chấm điểm framework rồi mới chốt %, % phải phản ánh tổng điểm (≥21/30 → >60%; 18-20 → 55-60%; <18 → <55%). "
         "QUY TẮC TÀI/XỈU: PHẢI ước lượng tổng bàn dự kiến TRƯỚC khi chọn (tổng bàn TB hai đội + bàn thua TB). "
@@ -3364,11 +3399,20 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             content = _clean_tg(raw)
             is_keo = bool(re.search(r'analyze_keo', str(messages), re.I)) or any(
                 w in question.lower() for w in ('kèo', 'phân tích', 'dự đoán'))
+            single = _detect_single_market(question) if is_keo else None
             rendered = None
             if is_keo and content:
                 # ÉP FORMAT TẦNG API: buộc JSON schema — AI không thể tự do đẻ bảng/câu dài
+                single_instr = ""
+                if single:
+                    _sk, _sd, _ss, _sl = single
+                    _asked = f"{_ss} {_sl}".strip()
+                    single_instr = (f"User CHỈ hỏi 1 kèo ({_sd}{f' — cụ thể là {_asked}' if _asked else ''}): "
+                                    f"TẬP TRUNG chốt đúng kèo '{_sk}', pick PHẢI trả lời đúng line user hỏi. "
+                                    f"Các kèo còn lại vẫn điền bình thường để đủ dữ liệu. ")
                 json_prompt = (
                     "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này.\n"
+                    + single_instr +
                     "QUAN TRỌNG NHẤT: scenario PHẢI dạng 'TeamNhà X-Y TeamKhách + mô tả' (vd 'MU 1-2 MC — MC cầm bóng thắng ngược') — đây là kịch bản chính để neo. "
                     "MỖI KÈO PHẢI có 'why': căn cứ RIÊNG từ dữ liệu thật của CẢ 2 ĐỘI (nếu chỉ có 1 đội trong dữ liệu là thiếu) — lịch sử nổ tài/xỉu, tỉ lệ BTTS, đối đầu, chấn thương/lực lượng, số thẻ/góc trung bình (ghi cụ thể kiểu '4/5 trận gần đây nổ tài'). "
                     "Kèo KHÔNG bắt buộc thắng theo tỉ số kịch bản, NHƯNG không được mâu thuẫn vật lý: BTTS Có mà tỉ số có đội 0 bàn; Xỉu/Tài lệch tổng bàn >1.5; 1X2 khác phe đội thắng; Châu Á thua sâu margin <-1.25.\n"
@@ -3407,7 +3451,9 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                                     pass
                         if errs:
                             logger.warning(f"[KEO-LOGIC-STILL-BAD] {errs[:2]}")
-                        rendered = _render_keo_from_json(obj)
+                        rendered = _render_keo_from_json(obj, single[0] if single else None)
+                        if rendered and single:
+                            logger.info(f"[KEO-SINGLE] {single[0]}: {rendered[:160]}")
                     except Exception:
                         rendered = None
                     if rendered:
