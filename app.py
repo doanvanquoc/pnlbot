@@ -5818,11 +5818,11 @@ def _fmt_pump_message(cands, mode="auto"):
 
 async def pump_radar_loop(app):
     """Mỗi 10 phút: quét coin đang bay vút còn nhiên liệu pump tiếp → báo Telegram.
-    Chỉ BÁO, không tự vào lệnh. /stopauto all sẽ tắt cả radar này."""
+    Chỉ BÁO, không tự vào lệnh. /stopauto all sẽ tắt cả radar này; /fomo off tắt riêng."""
     await asyncio.sleep(120)  # chờ khởi động
     while True:
         try:
-            if _ai_features_paused():
+            if _ai_features_paused() or AUTO_STATE.get('pump_radar_off'):
                 await asyncio.sleep(PUMP_RADAR_INTERVAL)
                 continue
             session = app['session']
@@ -5850,6 +5850,32 @@ async def pump_radar_loop(app):
         except Exception as e:
             logger.error(f"Lỗi trong pump_radar_loop: {e}")
         await asyncio.sleep(PUMP_RADAR_INTERVAL)
+
+
+async def handle_fomo_command(session, chat_id, arg=None):
+    """Lệnh /fomo:
+    /fomo        → quét NGAY coin đang bay vút FOMO được
+    /fomo on     → bật auto radar (quét tự động mỗi 10 phút)
+    /fomo off    → tắt auto radar (vẫn quét tay được)"""
+    arg = (arg or '').strip().lower()
+    if arg == 'on':
+        AUTO_STATE['pump_radar_off'] = False
+        _save_auto_state()
+        await send_telegram_message(session, chat_id,
+            "🚀 *Đã BẬT auto PUMP RADAR* — quét tự động mỗi 10 phút.\n"
+            "Coin bay vút còn nhiên liệu (điểm ≥8) sẽ báo kèm lệnh FOMO ngay. Tắt: `/fomo off`")
+        return
+    if arg == 'off':
+        AUTO_STATE['pump_radar_off'] = True
+        _save_auto_state()
+        await send_telegram_message(session, chat_id,
+            "🔇 *Đã TẮT auto PUMP RADAR.* Quét tay vẫn dùng được: gõ `/fomo` bất kỳ lúc nào.")
+        return
+    await send_telegram_message(session, chat_id, "🚀 Đang quét coin bay vút... (chờ ~1 phút)")
+    cands = await detect_pump_candidates(session, limit=8)
+    msg = _fmt_pump_message(cands, mode="manual") if cands else \
+        "Không có coin nào tăng ≥15%/24h đủ thanh khoản — thị trường đang lặng."
+    await send_telegram_message(session, chat_id, msg)
 
 
 async def ai_signal_alert_loop(app):
@@ -8996,7 +9022,7 @@ async def telegram_webhook_handler(request):
             '/close', '/c', '/tp', '/sl', '/tpsl', '/leverage', '/lev',
             '/long', '/l', '/short', '/s', '/chart', '/dca', '/auto', '/autopnl', '/stats', '/trail',
             '/ai', '/analyze', '/a', '/history', '/lichsu', '/his', '/liq',
-            '/review', '/ai', '/usage', '/scans', '/scan', '/kq', '/ketqua', '/risk', '/stopauto', '/fund', '/model'
+            '/review', '/ai', '/usage', '/scans', '/scan', '/kq', '/ketqua', '/risk', '/stopauto', '/fund', '/model', '/fomo'
         }
         if command_base in supported_commands:
             should_delete = True
@@ -9100,6 +9126,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "🛑 `/stopauto` - Kill switch AI: dừng AI tự trade 24h. `/stopauto all` = TẮT TẤT CẢ auto AI (trade+alert+guard+review). `/stopauto close` = đóng luôn vị thế AI. `/stopauto off` = bật lại.\n"
             "⏳ `/fund` - Tổng funding trả/thu 7 ngày theo coin + cảnh báo vị thế đang cháy funding.\n"
             "🤖 `/model` - Xem danh sách model AI + giá (/1M token), bấm chọn model mới (bot tự restart).\n"
+            "🚀 `/fomo` - Quét NGAY coin đang bay vút còn nhiên liệu pump tiếp (kèm lệnh FOMO khi điểm ≥8). `/fomo on/off` - bật/tắt auto radar 10 phút.\n"
             "📊 `/usage` - Xem số dư và mức dùng quota AI (24h/7 ngày/30 ngày).\n"
             "🤖⚡ *AI Auto-Trader*: mỗi 5h AI tự quét thị trường, CHỈ tự vào lệnh khi có tín hiệu 5 sao (điểm ≥ 6.0) + đủ margin, tự đặt TP/SL theo số dư và báo vào đây; ngược lại im lặng hoặc báo khi không đủ margin.\n"
             "🤖 `/ai <câu hỏi hoặc tên coin>` - Trợ lý AI toàn diện: phân tích coin (`/ai btc`), trả lời mọi câu hỏi về thị trường và tài khoản (số dư, vị thế, lịch sử lệnh, PnL), tự tìm coin có cơ hội tốt nhất và đặt/hủy/đóng lệnh theo yêu cầu (luôn có bước xác nhận). Ví dụ: `/ai xem vị thế của tôi`, `/ai tìm coin tỉ lệ ăn cao nhất rồi long 400u`.\n"
@@ -9378,6 +9405,9 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
 
     elif command_base == '/model':
         await handle_model_command(request.app['session'], chat_id)
+
+    elif command_base == '/fomo':
+        await handle_fomo_command(request.app['session'], chat_id, arg)
         
     elif command_base == '/liq':
         await handle_liq_command(request.app['session'], chat_id)
