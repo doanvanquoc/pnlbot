@@ -1243,12 +1243,34 @@ def _load_chats():
         logger.error(f"Lỗi nạp auto_chats: {e}")
 
 
+TG_OFFSET_FILE = "tg_offset.json"
+
+
+def _load_tg_offset():
+    try:
+        if os.path.exists(TG_OFFSET_FILE):
+            with open(TG_OFFSET_FILE, "r", encoding="utf-8") as f:
+                return int(json.load(f).get('offset', 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _save_tg_offset(offset):
+    try:
+        with open(TG_OFFSET_FILE, "w", encoding="utf-8") as f:
+            json.dump({'offset': offset}, f)
+    except Exception:
+        pass
+
+
 async def telegram_polling_loop(app):
     session = app['session']
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    offset = 0
+    # Nhớ offset QUA RESTART: không thì callback lệnh restart bị xử lý lại vô hạn (crash-loop)
+    offset = _load_tg_offset()
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-    logger.info("Bắt đầu long polling Telegram updates...")
+    logger.info(f"Bắt đầu long polling Telegram updates... (offset={offset})")
     while True:
         try:
             async with session.post(url, json={"timeout": 50, "offset": offset,
@@ -1266,6 +1288,7 @@ async def telegram_polling_loop(app):
                     continue
                 for update in data.get('result', []):
                     offset = update['update_id'] + 1
+                    _save_tg_offset(offset)
                     u_kind = 'callback' if update.get('callback_query') else (
                         'msg:' + ((update.get('message') or {}).get('text') or '')[:40])
                     logger.info(f"[TG] update #{update['update_id']} {u_kind}")
