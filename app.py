@@ -1172,8 +1172,27 @@ async def cmd_keo(session, chat_id, arg=None):
     await send_telegram_message(session, chat_id, f"🧠 AI đang tự tìm trận + phân tích '{query}'... (chờ 30-90 giây)")
     await send_chat_action(session, chat_id)
     now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
-    search_q = f"football {query} match schedule {now_str}"
+    search_q = f"{query} football next match schedule {now_str}"
     web = await tool_web_search(session, search_q, 6)
+    # Bước 1b: đọc thêm nội dung 1 trang tốt nhất (trang đội bóng/tin tức) để AI có dữ liệu thật
+    fetched = ""
+    if web and not web.startswith("Không"):
+        lines = web.split("\n")
+        best_url = None
+        for ln in lines:
+            m = re.search(r'https?://\S+', ln)
+            if m:
+                u = m.group(0).rstrip('.,)')
+                if any(d in u for d in ('manutd.com', 'afc.co.uk', 'liverpoolfc.com', 'chelseafc.com', 'spurs', 'arsenal.com',
+                                         'fcbarcelona.com', 'realmadrid.com', 'city.com', 'mancity.com',
+                                         'bbc.com/sport', 'skysports.com', 'espn.com', 'theguardian.com', '90min.com',
+                                         'goal.com', 'flashscore', 'sofascore', 'livescore', 'aiscore', 'fotmob')):
+                    best_url = u
+                    break
+        if not best_url:
+            best_url = lines[1].split('—')[-1].strip() if '—' in lines[1] else None
+        if best_url and best_url.startswith('http'):
+            fetched = await tool_fetch_url(session, best_url)
     system = (
         "Bạn là PNL FOOTBALL BOT — chuyên gia soi kèo bóng đá (bot do anh Quốc đẹp trai tự tay code). "
         "Nhiệm vụ: dựa vào kết quả web + kiến thức bóng đá, xác định trận đấu SẮP TỚI hoặc liên quan nhất của đội được hỏi "
@@ -1572,6 +1591,63 @@ def _help_text():
     )
 
 
+async def cmd_analyze_odds_image(session, chat_id, photo, caption=''):
+    """Screenshot 1xBet → tải ảnh → AI vision đọc odds + phân tích kèo + EV."""
+    await send_telegram_message(session, chat_id, "📸 Đang đọc odds từ ảnh + phân tích... (chờ ~30 giây)")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    try:
+        file_id = photo[-1]['file_id']  # ảnh lớn nhất
+        async with session.get(f"https://api.telegram.org/bot{token}/getFile",
+                               params={'file_id': file_id}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            fd = await resp.json()
+        file_path = fd.get('result', {}).get('file_path')
+        if not file_path:
+            await send_telegram_message(session, chat_id, "❌ Không tải được ảnh.")
+            return
+        async with session.get(f"https://api.telegram.org/bot{token}/file/{file_path}",
+                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            raw = await resp.read()
+    except Exception as e:
+        await send_telegram_message(session, chat_id, f"❌ Lỗi tải ảnh: {e}")
+        return
+    import base64
+    data_url = f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"
+    caption_txt = caption.strip()[:300]
+    prompt = (
+        "Phân tích kèo bóng đá từ ảnh screenshot nhà cái:\n"
+        "1) Đọc chính xác: trận đấu, thời gian, các dòng kèo + odds (1X2, châu Á, tài xỉu, góc, thẻ...)\n"
+        "2) Chỉ rõ kèo nào mày cho là VALUE NHẤT (odds cao so với xác suất thật mày đánh giá), nêu xác suất % mày ước lượng.\n"
+        "3) EV ước tính = xác suất × odds − 1.\n"
+        "Trả lời gọn: trận đấu + kèo chọn + odds + xác suất + EV + lý do ngắn. Tiếng Việt, không markdown."
+        + (f"\n\nGhi chú của người dùng: {caption_txt}" if caption_txt else "")
+    )
+    api_key = os.getenv("DASH_TOKEN")
+    model = os.getenv("DASH_MODEL", "glm-5.3")
+    payload = {"model": model, "messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+        "max_tokens": 1200, "temperature": 0.3}
+    try:
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions", json=payload,
+                                headers={"Authorization": f"Bearer {api_key}",
+                                         "Content-Type": "application/json"},
+                                timeout=timeout) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                await send_telegram_message(session, chat_id, f"⚠️ AI lỗi HTTP {resp.status}: {body[:120]}")
+                return
+            data = await resp.json()
+            record_llm_usage(model, data.get('usage'))
+            content = (data.get('choices', [{}])[0].get('message') or {}).get('content') or ''
+    except Exception as e:
+        await send_telegram_message(session, chat_id, f"⚠️ Lỗi gọi AI: {e}")
+        return
+    await send_telegram_message(session, chat_id, "📊 *AI ĐỌC ODDS TỪ ẢNH:*\n\n" + content.strip()[:3800])
+
+
 async def handle_update(session, update):
     msg = update.get('message')
     cb = update.get('callback_query')
@@ -1597,10 +1673,16 @@ async def handle_update(session, update):
         return
     chat_id = msg.get('chat', {}).get('id')
     text = (msg.get('text') or '').strip()
-    if not chat_id or not text:
+    photo = msg.get('photo') or []
+    if not chat_id or (not text and not photo):
         return
     auto_chats.add(chat_id)
     _save_chats()
+
+    # 📸 Ảnh (screenshot 1xBet...) → AI đọc odds + phân tích kèo trực tiếp
+    if photo and not text:
+        await cmd_analyze_odds_image(session, chat_id, photo, msg.get('caption') or '')
+        return
 
     parts = text.split(maxsplit=1)
     command_base = parts[0].split('@')[0].lower()
