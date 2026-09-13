@@ -1767,18 +1767,16 @@ def _strict_keo_format(text):
                 break
     if not best and out_k:
         bp = max(out_k.items(), key=lambda kv: kv[1][1])
-        best = f"⭐ Tự tin nhất: {bp[0]} — {bp[1][0]}"
+        best = f"➡️ Tự tin nhất: {bp[0]} — {bp[1][0]}"
     elif best:
-        best = '⭐ ' + re.sub(r'✅|\*\*|🎯', '', best).strip()[:70]
+        best = '➡️ ' + re.sub(r'✅|\*\*|🎯|⭐', '', best).strip()[:70]
     out = [header[:110] if header else '⚽ Trận đấu']
     if live and live.strip('*# ')[:60] != (header or '')[:60].strip('*# '):
         out.append(live[:90])
-    def sn(n):
-        return '⭐' * max(1, min(n, 5)) if n else ''
     for disp in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc'):
         if disp in out_k:
             val, stars = out_k[disp]
-            out.append(f"- {disp}: {val}{' ' + sn(stars) if sn(stars) else ''}")
+            out.append(f"- {disp}: {val}")
     if best:
         out.append(best[:90])
     return '\n'.join(out)
@@ -1813,23 +1811,20 @@ def _render_keo_from_json(obj):
     live = str(obj.get('live') or '').strip()
     if live and live[:50] != out[0][:50]:
         out.append(live[:90])
-    def sn(p):
-        return '⭐' * max(1, min(p // 15, 5)) if isinstance(p, int) else ''
     for d, key in (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc')):
         p, pct = pick(key)
         if p:
-            s = sn(pct) if pct else ''
-            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}{' ' + s if s else ''}")
+            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}")
     if len(out) < 5:
         return None
     b = str(obj.get('best') or '').strip()
     if b:
-        out.append(f"⭐ Tự tin nhất: {b[:70]}")
+        out.append(f"➡️ Tự tin nhất: {b[:70]}")
     return '\n'.join(out)
 
 
 KEO_JSON_SCHEMA = (
-    '{"header": "[giải] TeamA vs TeamB (giờ VN)", "live": "🔴 LIVE phút X — tỉ số hoặc rỗng", '
+    '{"header": "[giải] TeamA vs TeamB (giờ VN)", "kickoff": "YYYY-MM-DD", "live": "🔴 LIVE phút X — tỉ số hoặc rỗng", '
     '"keos": {"1x2": {"pick": "đội/cửa thắng", "pct": 70}, '
     '"tai_xiu": {"pick": "Tài 2.5 hoặc Xỉu 2.5", "pct": 65}, '
     '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60}, '
@@ -1837,6 +1832,42 @@ KEO_JSON_SCHEMA = (
     '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60}, '
     '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55}}, '
     '"best": "kèo tự tin nhất"}')
+
+def _save_keo_batch(chat_id, obj, rendered):
+    """Lưu 6 kèo vừa phân tích (manual hoặc auto) vào predictions.json để chấm điểm + /tk."""
+    header = str(obj.get('header') or '')
+    m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
+    home, away = (m.group(1).strip(), m.group(2).strip()) if m else ('?', '?')
+    kickoff = str(obj.get('kickoff') or '')[:10] or datetime.now(TZ_VN).strftime('%Y-%m-%d')
+    match_key = f"{home.lower()}|{away.lower()}|{kickoff}"
+    # tránh lưu trùng: trận này + market này đã pending thì bỏ qua
+    for p in predictions.values():
+        if p.get('match_key') == match_key and p.get('status') == 'pending':
+            return
+    KEYS = (('1x2', '1X2'), ('tai_xiu', 'Tài xỉu'), ('chau_a', 'Châu Á'), ('btts', 'BTTS'), ('the', 'Thẻ'), ('goc', 'Góc'))
+    ks = obj.get('keos') or {}
+    ts_now = int(time.time())
+    for i, (k, disp) in enumerate(KEYS):
+        v = (ks.get(k) or {})
+        sel = str(v.get('pick') or '').strip()
+        if not sel:
+            continue
+        try:
+            prob = max(1.0, min(float(v.get('pct', 50)), 99.0))
+        except Exception:
+            prob = 50.0
+        rec = {
+            'match': f"{home} vs {away}", 'datetime': header[:80], 'league': header.split('—')[0].strip()[:40],
+            'scores': '', 'score_total': 0,
+            'market': disp, 'selection': sel, 'prob': prob, 'odds': None, 'ev': None,
+            'reasoning': '', 'status': 'pending', 'result': None, 'graded': None,
+            'fixture_id': f"web_{ts_now}_{chat_id}_{i}",
+            'date': kickoff, 'kickoff_vn': header[:40], 'home': home, 'away': away,
+            'match_key': match_key, 'source': 'ai',
+        }
+        predictions[rec['fixture_id']] = rec
+    _save_predictions()
+
 
 
 def _clean_tg(text):
@@ -2105,7 +2136,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "- BTTS: [Có/Không] (X%)\n"
         "- Thẻ: [Tài/Xỉu] (X%)\n"
         "- Góc: [Tài/Xỉu] (X%)\n"
-        "⭐ [kèo tự tin nhất]\n\n"
+        "➡️ [kèo tự tin nhất]\n\n"
         "KHÔNG thêm bất cứ thứ gì khác: không 'dữ liệu nền', không nhận xét dài, không khuyến cáo, không 18+, không trách nhiệm, không chào hỏi, không hỏi lại. "
         "Chỉ 8 dòng như mẫu + dòng ⭐. BỎ dòng 'Dữ liệu nền'/'Bối cảnh' — người dùng không cần."
         "KHÔNG BAO GIỜ: nói 'chưa có tỷ lệ', 'chưa đủ dữ liệu', 'chờ odds', 'hỏi lại người dùng cần cửa nào' — "
@@ -2184,6 +2215,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     if rendered:
                         logger.info(f"[KEO-JSON-OK] {rendered[:200]}")
             if rendered:
+                _save_keo_batch(chat_id, obj, rendered)
                 content = rendered
             else:
                 content = _strict_keo_format(content)
