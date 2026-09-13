@@ -1244,7 +1244,13 @@ async def telegram_polling_loop(app):
                     continue
                 for update in data.get('result', []):
                     offset = update['update_id'] + 1
-                    asyncio.create_task(handle_update(session, update))
+                    u_kind = 'callback' if update.get('callback_query') else (
+                        'msg:' + ((update.get('message') or {}).get('text') or '')[:40])
+                    logger.info(f"[TG] update #{update['update_id']} {u_kind}")
+                    try:
+                        await handle_update(session, update)
+                    except Exception:
+                        logger.exception(f"Lỗi xử lý update {update.get('update_id')}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1256,6 +1262,7 @@ async def telegram_polling_loop(app):
 
 async def on_startup(app):
     logger.info("⚽ PNL FOOTBALL BOT khởi động...")
+    app['session'] = aiohttp.ClientSession()
     _load_fb_quota()
     _load_predictions()
     _load_llm_usage()
