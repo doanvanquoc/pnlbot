@@ -995,8 +995,31 @@ def _normalize_team(s):
 
 
 async def find_fixture_by_team(session, query):
-    """Tìm trận của đội theo tên/alias trong 5 ngày tới (rồi 2 ngày qua).
+    """Tìm trận theo tên đội. Hỗ trợ 'mu', 'man utd', hoặc 'mu vs mc' (tách vs/x tìm từng bên).
     Trả về (fixture, None) hoặc (None, list gợi ý 'A vs B' đang có)."""
+    for q in re.split(r'\s+vs\s+|\s+x\s+', query.strip().lower()):
+        if q.strip():
+            fx, _ = await _find_one_team(session, q.strip())
+            if fx:
+                return fx, None
+    # Không khớp → gợi ý các trận đang có
+    today = datetime.now(TZ_VN)
+    seen, suggestions = [], []
+    for offset in range(0, 3):
+        date_str = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
+        fixtures, err = await get_fixtures_for_date(session, date_str)
+        if err or not fixtures:
+            continue
+        for fx in fixtures[:30]:
+            s = f"{fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
+            if s not in seen:
+                seen.append(s)
+                suggestions.append(s)
+    return None, suggestions[:15]
+
+
+async def _find_one_team(session, query):
+    """Tìm trận theo 1 tên đội (alias + viết tắt đầu chữ)."""
     q = query.strip().lower()
     q_norm = _normalize_team(q)
     for alias, full in TEAM_ALIASES.items():
@@ -1020,10 +1043,9 @@ async def find_fixture_by_team(session, query):
         for fx in fixtures:
             h = _normalize_team(fx['teams']['home']['name'])
             a = _normalize_team(fx['teams']['away']['name'])
-            qn = _normalize_team(q)
             initials_h = ''.join(w[0] for w in re.split(r'[^a-z0-9]+', fx['teams']['home']['name'].lower()) if w)
             initials_a = ''.join(w[0] for w in re.split(r'[^a-z0-9]+', fx['teams']['away']['name'].lower()) if w)
-            if (qn in h or qn in a or qn == initials_h or qn == initials_a) and len(qn) >= 2:
+            if (q_norm in h or q_norm in a or q_norm == initials_h or q_norm == initials_a) and len(q_norm) >= 2:
                 return fx, None
     return None, suggestions[:20]
 
