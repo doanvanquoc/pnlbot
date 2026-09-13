@@ -1999,6 +1999,17 @@ def _keo_logic_check(obj):
         if line is not None and (is_over or is_under) and abs(tot - line) > 1.5:
             side_s = 'Tài' if is_over else 'Xỉu'
             errs.append(f"{side_s} {line} quá xa kịch bản {ga_}-{gb_} (tổng {tot}) — chọn cửa gần kịch bản hơn")
+        # Ép Tài/Xỉu phải khớp estimated_total_goals từ JSON
+        est_total = obj.get('estimated_total_goals')
+        if est_total is not None and line is not None and (is_over or is_under):
+            try:
+                est = float(est_total)
+                if is_over and est < line - 0.3:
+                    errs.append(f"Tài {line} nhưng ước tính tổng bàn chỉ {est} — PHẢI chọn Xỉu hoặc đổi kịch bản")
+                if is_under and est > line + 0.3:
+                    errs.append(f"Xỉu {line} nhưng ước tính tổng bàn là {est} — PHẢI chọn Tài hoặc đổi kịch bản")
+            except Exception:
+                pass
         both = ga_ > 0 and gb_ > 0
         if btts_yes and not both and max(ga_, gb_) >= 2:
             errs.append(f"BTTS Có nhưng kịch bản {ga_}-{gb_} có đội không ghi bàn ≥2 — đổi BTTS hoặc đổi kịch bản")
@@ -2107,7 +2118,8 @@ KEO_JSON_SCHEMA = (
     '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60, "why": "lịch sử đối đầu + chênh lực lượng"}, '
     '"btts": {"pick": "Có hoặc Không", "pct": 60, "why": "tỉ lệ BTTS nổ của 2 đội + thủng lưới gần đây"}, '
     '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60, "why": "quy luật derby/kỳ vọng trọng tài + số thẻ trung bình"}, '
-    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55, "why": "lối chơi biên/kiem soát + số góc trung bình"}}, '
+    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55, "why": "lối chơi biên/kiem soát + số góc trung bình"}, '
+    '"estimated_total_goals": 2.5}, '
     '"best": "kèo tự tin nhất"}')
 
 def _save_keo_batch(chat_id, obj, rendered):
@@ -2504,6 +2516,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "Nếu tổng bàn dự kiến > 2.8 → chọn Tài. "
         "Nếu 2.5-2.8 → xem lịch sử đối đầu (nhiều bàn → Tài, ít bàn → Xỉu). "
         "KHÔNG BAO GIỜ chọn Tài khi tổng bàn dự kiến < 2.2 — đó là kèo THUA. "
+        "BẮT BUỘC: JSON phải có field 'estimated_total_goals' (số thập phân, vd 2.3) — đây là ước tính tổng bàn cả trận. "
         "FORMAT KẾT QUẢ CUỐI (CHÍNH XÁC mẫu — không thêm/bớt):\n"
         "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
         "(🔴 LIVE phút X — tỉ số nếu đang đá)\n"
