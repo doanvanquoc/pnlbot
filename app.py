@@ -1647,6 +1647,32 @@ async def handle_update(session, update):
             await ai_agent_loop(session_http, chat_id, text, msg.get('message_id'))
 
 
+async def delete_telegram_message(session, chat_id, message_id):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not message_id:
+        return
+    try:
+        async with session.post(f"https://api.telegram.org/bot{token}/deleteMessage",
+                                json={"chat_id": chat_id, "message_id": message_id},
+                                timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            await resp.read()
+    except Exception:
+        pass
+
+
+_status_msgs = {}  # chat_id -> [message_id]
+
+
+def _mark_status_msg(chat_id, message_id):
+    if message_id:
+        _status_msgs.setdefault(chat_id, []).append(message_id)
+
+
+async def _clear_status_msgs(session, chat_id):
+    for mid in _status_msgs.pop(chat_id, []):
+        await delete_telegram_message(session, chat_id, mid)
+
+
 # ═══════════════ AGENT LOOP (AI tự đọc câu hỏi → tự chọn tool — như PNL bot cũ) ═══════════════
 AGENT_TOOLS = [
     {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web (Bing, free). Dùng khi cần biết: trận đấu sắp tới của đội, phong độ, tin chấn thương, kết quả, odds, lịch sử đối đầu...", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
@@ -1752,7 +1778,9 @@ async def _agent_execute(session, chat_id, name, args):
         if not q:
             return "LỖI: cần tên đội."
         await send_chat_action(session, chat_id)
-        await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
+        _an = await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
+        if _an and _an.get('result'):
+            _mark_status_msg(chat_id, _an['result'].get('message_id'))
         now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
         web = await tool_web_search(session, f"{q} football next match schedule {now_str}", 6)
         fetched = ""
@@ -1818,7 +1846,9 @@ async def _agent_execute(session, chat_id, name, args):
 async def ai_agent_loop(session, chat_id, question, reply_to=None):
     """AI đọc câu hỏi → TỰ quyết định tool (web_search/fetch_url/analyze_keo/my_stats) → lặp tới khi đủ dữ liệu."""
     await send_chat_action(session, chat_id)
-    await send_telegram_message(session, chat_id, "🧠 Đang suy nghĩ và tự tra cứu... (vài chục giây)")
+    _thinking = await send_telegram_message(session, chat_id, "🧠 Đang suy nghĩ và tự tra cứu... (vài chục giây)")
+    if _thinking and _thinking.get('result'):
+        _mark_status_msg(chat_id, _thinking['result'].get('message_id'))
     system_prompt = (
         "Bạn là PNL FOOTBALL BOT — trợ lý bóng đá toàn diện của anh Quốc (đẹp trai, giỏi nhất quả đất). "
         "Khi người dùng hỏi, TỰ QUYẾT ĐỊNH cần tool gì: "
@@ -1860,6 +1890,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     if resp.status != 200:
                         body = await resp.text()
                         await send_telegram_message(session, chat_id, f"⚠️ AI lỗi HTTP {resp.status}: {body[:120]}", reply_to=reply_to)
+                        await _clear_status_msgs(session, chat_id)
                         return
                     data = await resp.json()
                     record_llm_usage(model, data.get('usage'))
@@ -1867,10 +1898,12 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             except Exception as e:
                 if attempt == 2:
                     await send_telegram_message(session, chat_id, f"⚠️ AI lỗi: {e}", reply_to=reply_to)
+                    await _clear_status_msgs(session, chat_id)
                     return
                 await asyncio.sleep(5)
         if data is None:
             await send_telegram_message(session, chat_id, "⚠️ AI lỗi liên tiếp — thử lại sau ít phút.", reply_to=reply_to)
+            await _clear_status_msgs(session, chat_id)
             return
         msg = (data.get('choices', [{}])[0].get('message') or {})
         tool_calls = msg.get('tool_calls') or []
@@ -1880,6 +1913,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                 await send_telegram_message(session, chat_id, content, reply_to=reply_to)
             else:
                 await send_telegram_message(session, chat_id, "Xong! (AI không có kết luận — thử hỏi cụ thể hơn)", reply_to=reply_to)
+            await _clear_status_msgs(session, chat_id)
             return
         messages.append({"role": "assistant", "content": msg.get('content') or None, "tool_calls": tool_calls})
         last_tool = None
@@ -1898,6 +1932,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             messages.append({"role": "user", "content": "Kết quả phân tích kèo đã đầy đủ ở trên. Tổng hợp trả lời người dùng NGAY — KHÔNG gọi thêm tool nào nữa."})
             continue
     await send_telegram_message(session, chat_id, "⚠️ AI xử lý quá nhiều bước — thử hỏi cụ thể hơn.", reply_to=reply_to)
+    await _clear_status_msgs(session, chat_id)
 
 
 async def ai_chat(session, chat_id, question, reply_to=None):
