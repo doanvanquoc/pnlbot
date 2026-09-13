@@ -899,7 +899,20 @@ async def tool_fetch_url(session, url):
     return raw[:4000]
 
 
-# ═══════════════ ĐỌC TRẬN + AI DỰ ĐOÁN (AI for one) ═══════════════
+# ═══════════════ FRAMEWORK PHÂN TÍCH CHUẨN (AI bắt buộc chấm từng mục) ═══════════════
+KEO_FRAMEWORK = """BẮT BUỘC chấm điểm 6 yếu tố sau (tối đa 5 điểm mỗi yếu tố, ghi rõ lý do 1 dòng):
+
+1. PHONG ĐỘ (5đ): kết quả 5 trận gần nhất, riêng phong độ sân nhà/khách, số bàn ghi/thủng trung bình mỗi trận.
+2. ĐỐI ĐẦU (5đ): 3-5 lần gặp gần nhất, đang có sự thống trị nào không, tổng bàn trung bình các cuộc đối đầu (cho kèo tài/xỉu).
+3. ĐỘNG LỰC (5đ): trận này có ý nghĩa gì — đua vô địch/top 4/trụ hạng/cúp; đội có giữ sức cho trận lớn khác; derby; đội hết động lực cuối mùa.
+4. LỰC LƯỢNG (5đ): chấn thương/treo giò cầu thủ chủ chốt, xoay vòng đội hình, chuyển nhượng mới (chỉ dùng dữ liệu web tin cậy, KHÔNG bịa).
+5. LỐI CHƠI & THỐNG KÊ (5đ): phong cách (pressing/để bóng/phản công), xG gần đây nếu biết, góc/thẻ trung bình nếu soi kèo góc/thẻ, kiểm soát bóng.
+6. BỐI CẢNH (5đ): sân nhà/khách, lịch thi đấu dày (đá giữa tuần), thời tiết, trọng tài (nếu soi thẻ), VAR.
+Sau đó:
+- Ước lượng XÁC SUẤT THẬT (%) cho kèo định chọn dựa trên tổng điểm (tổng ≥ 21/30 mới cho xác suất >60%; 18-20/30 cho 55-60%; <18/30 → KHÔNG nên chọn kèo, trả not_found hoặc chọn kèo phòng thủ khác).
+- SO SÁNH odds nhà cái: xác suất ngụ ý của odds = 1/odds. Value chỉ khi xác suất thật của mày cao hơn xác suất ngụ ý ≥ 3 điểm %.
+- CHỈ chọn kèo có dữ liệu đủ (thiếu 2+ yếu tố trên → không chọn mù).
+"""
 
 PICK_MARKETS = {
     'HOME': '1X2 đội nhà thắng', 'DRAW': '1X2 hòa', 'AWAY': '1X2 đội khách thắng',
@@ -1195,15 +1208,15 @@ async def cmd_keo(session, chat_id, arg=None):
             fetched = await tool_fetch_url(session, best_url)
     system = (
         "Bạn là PNL FOOTBALL BOT — chuyên gia soi kèo bóng đá (bot do anh Quốc đẹp trai tự tay code). "
-        "Nhiệm vụ: dựa vào kết quả web + kiến thức bóng đá, xác định trận đấu SẮP TỚI hoặc liên quan nhất của đội được hỏi "
-        "(ai đấu ai, ngày giờ VN, giải gì), phân tích phong độ, đối đầu, lối chơi, động lực. "
-        "Chọn MỘT kèo mày tự tin nhất (1X2 / tài xỉu / châu Á / BTTS...) kèm xác suất % và lý do ngắn. "
+        "Dùng framework phân tích bên dưới để CHẤM TỪNG YẾU TỐ trước khi chốt kèo — không bao giờ chốt kèo khi thiếu dữ liệu.\n"
+        f"{KEO_FRAMEWORK}\n"
         "Trả về JSON: {\"match\": \"A vs B\", \"datetime\": \"ngày giờ giờ VN\", \"league\": \"...\", "
+        "\"scores\": {\"phong_do\": 4, \"doi_dau\": 3, \"dong_luc\": 5, \"luc_luong\": 4, \"loi_choi\": 3, \"boi_canh\": 4}, "
         "\"market\": \"1X2 hoặc Tài xỉu 2.5 hoặc Asian Handicap...\", \"selection\": \"chi tiết kèo\", \"prob\": 55, "
         "\"reasoning\": \"...\"}. Nếu không xác định được trận nào: {\"not_found\": true, \"note\": \"...\"}"
     )
     pred, err = await get_ai_json(session, system,
-                                  f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {query}.\n\nKết quả web:\n{web}")
+                                  f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {query}.\n\nKết quả web:\n{web}\n\nNội dung trang đã đọc:\n{fetched[:2500]}")
     if err:
         await send_telegram_message(session, chat_id, f"❌ AI lỗi: {err}")
         return
@@ -1211,10 +1224,24 @@ async def cmd_keo(session, chat_id, arg=None):
         await send_telegram_message(session, chat_id,
             f"🤷 AI không xác định được trận nào cho '{query}'. Thử: /kèo mu, /kèo real madrid, /kèo mu vs mc.")
         return
+    scores = pred.get('scores') or {}
+    total = 0
+    score_lines = []
+    for k, vn in (('phong_do', 'Phong độ'), ('doi_dau', 'Đối đầu'), ('dong_luc', 'Động lực'),
+                  ('luc_luong', 'Lực lượng'), ('loi_choi', 'Lối chơi'), ('boi_canh', 'Bối cảnh')):
+        try:
+            s = int(scores.get(k, 0))
+        except Exception:
+            s = 0
+        total += max(0, min(s, 5))
+        score_lines.append(f"• {vn}: {max(0, min(s, 5))}/5")
+    score_txt = "\n".join(score_lines)
     record = {
         'match': str(pred.get('match') or query),
         'datetime': str(pred.get('datetime') or '?'),
         'league': str(pred.get('league') or '?'),
+        'scores': score_txt,
+        'score_total': total,
         'market': str(pred.get('market') or '?'),
         'selection': str(pred.get('selection') or '?'),
         'prob': max(1.0, min(float(pred.get('prob', 50)), 99.0)),
@@ -1614,11 +1641,12 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption=''):
     data_url = f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"
     caption_txt = caption.strip()[:300]
     prompt = (
-        "Phân tích kèo bóng đá từ ảnh screenshot nhà cái:\n"
-        "1) Đọc chính xác: trận đấu, thời gian, các dòng kèo + odds (1X2, châu Á, tài xỉu, góc, thẻ...)\n"
-        "2) Chỉ rõ kèo nào mày cho là VALUE NHẤT (odds cao so với xác suất thật mày đánh giá), nêu xác suất % mày ước lượng.\n"
-        "3) EV ước tính = xác suất × odds − 1.\n"
-        "Trả lời gọn: trận đấu + kèo chọn + odds + xác suất + EV + lý do ngắn. Tiếng Việt, không markdown."
+        "Phân tích kèo bóng đá từ ảnh screenshot nhà cái. "
+        "Đọc chính xác: trận đấu, thời gian, MỌI dòng kèo + odds trong ảnh (1X2, châu Á, tài xỉu, góc, thẻ...). "
+        f"{KEO_FRAMEWORK}\n"
+        "Sau khi chấm đủ 6 yếu tố: chọn MỘT kèo có dữ liệu đủ nhất + giá trị nhất, nêu xác suất thật %, odds, "
+        "EV = xác suất × odds − 1. Chỉ nói kèo nào EV ≥ +3% mới đáng đánh. "
+        "Trả lời: trận đấu → bảng điểm 6 yếu tố → kèo chọn + odds + xác suất + EV + lý do. Tiếng Việt, không markdown."
         + (f"\n\nGhi chú của người dùng: {caption_txt}" if caption_txt else "")
     )
     api_key = os.getenv("DASH_TOKEN")
