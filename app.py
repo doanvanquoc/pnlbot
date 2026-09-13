@@ -892,6 +892,8 @@ def _format_standings(standings, team_name):
 
 def _decode_bing_href(href):
     href = href.replace('&amp;', '&')
+    if href.startswith('/ck/'):
+        href = 'https://www.bing.com' + href
     if href.startswith('https://www.bing.com/ck/'):
         m = re.search(r'u=a1([A-Za-z0-9\-_]+)', href)
         if m:
@@ -1091,16 +1093,18 @@ def _grade_prediction(p, fixture):
                 return 'win', f"hòa {gh}-{ga}"
             return 'loss', f"hòa {gh}-{ga}"
         if winner == 'home':
-            if any(w in sel for w in ('home', 'chủ', 'đội nhà', home_n[:4], '1x')):
+            hn4 = home_n[:4]
+            if any(w in sel for w in ('home', 'chủ', 'đội nhà', '1x')) or (hn4 and hn4 in sel):
                 return 'win', f"{p.get('home')} thắng {gh}-{ga}"
             return 'loss', f"{p.get('home')} thắng {gh}-{ga}"
         if winner == 'away':
-            if any(w in sel for w in ('away', 'khách', 'đội khách', away_n[:4], 'x2')):
+            an4 = away_n[:4]
+            if any(w in sel for w in ('away', 'khách', 'đội khách', 'x2')) or (an4 and an4 in sel):
                 return 'win', f"{p.get('away')} thắng {gh}-{ga}"
             return 'loss', f"{p.get('away')} thắng {gh}-{ga}"
-    # ── Tài xỉu bàn ──
+    # ── Tài xỉu bàn (line nằm ở selection: 'Tài 2.5'; fallback market) ──
     if 'tài xỉu' in market or 'over' in market or 'under' in market or 'total' in market:
-        m = re.search(r'(\d+(?:\.\d+)?)', market)
+        m = re.search(r'(\d+(?:\.\d+)?)', sel) or re.search(r'(\d+(?:\.\d+)?)', market)
         line = float(m.group(1)) if m else 2.5
         is_over = any(w in sel for w in ('tài', 'over', 'trên'))
         is_under = any(w in sel for w in ('xỉu', 'under', 'dưới'))
@@ -1130,8 +1134,9 @@ def _grade_prediction(p, fixture):
         # xác định bên: nếu selection chứa tên đội nhà hoặc 'home' → bên nhà
         home_n = (p.get('home') or '').lower()
         away_n = (p.get('away') or '').lower()
-        is_home_side = any(w in sel for w in ('home', 'chủ', 'đội nhà', home_n[:4]))
-        is_away_side = any(w in sel for w in ('away', 'khách', 'đội khách', away_n[:4]))
+        hn4, an4 = home_n[:4], away_n[:4]
+        is_home_side = any(w in sel for w in ('home', 'chủ', 'đội nhà')) or (hn4 and hn4 in sel)
+        is_away_side = any(w in sel for w in ('away', 'khách', 'đội khách')) or (an4 and an4 in sel)
         if not is_home_side and not is_away_side:
             # mặc định: nếu handicap âm → đội mạnh hơn (thường là đội đầu tiên)
             is_home_side = True
@@ -1197,20 +1202,20 @@ def _grade_stats_market(p, fixture, stats):
     sel_low = sel.lower()
     corners_total = sum((stats.get('corners') or {}).values())
     cards_total = sum((stats.get('yellows') or {}).values()) + sum((stats.get('reds') or {}).values())
-    if 'corner' in market:
+    if 'corner' in market or 'góc' in market or 'goc' in market:
         m = re.search(r'(\d+\.5|\d+)', sel_low)
         line = float(m.group(1)) if m else 9.5
-        if 'over' in sel_low or 'trên' in sel_low:
+        if 'over' in sel_low or 'trên' in sel_low or 'tài' in sel_low:
             return ('win' if corners_total > line else ('push' if corners_total == line else 'loss')), f"tổng góc {corners_total}"
-        if 'under' in sel_low or 'dưới' in sel_low:
+        if 'under' in sel_low or 'dưới' in sel_low or 'xỉu' in sel_low:
             return ('win' if corners_total < line else ('push' if corners_total == line else 'loss')), f"tổng góc {corners_total}"
         return None, None
-    if 'card' in market or 'booking' in market:
+    if 'card' in market or 'booking' in market or 'thẻ' in market:
         m = re.search(r'(\d+\.5|\d+)', sel_low)
         line = float(m.group(1)) if m else 3.5
-        if 'over' in sel_low:
+        if 'over' in sel_low or 'tài' in sel_low:
             return ('win' if cards_total > line else ('push' if cards_total == line else 'loss')), f"tổng thẻ {cards_total}"
-        if 'under' in sel_low:
+        if 'under' in sel_low or 'xỉu' in sel_low:
             return ('win' if cards_total < line else ('push' if cards_total == line else 'loss')), f"tổng thẻ {cards_total}"
         return None, None
     return None, None
@@ -1462,7 +1467,10 @@ async def cmd_keo(session, chat_id, arg=None):
     dt = str(pred.get('datetime') or '?')
     league = str(pred.get('league') or '?')
     picks = pred.get('picks') or []
-    ts_now = int(time.time())
+    ts_now = int(time.time() * 1000)
+    _mh = re.search(r'(.+?)\s+vs\s+(.+)', match_info, re.I)
+    _home, _away = (_mh.group(1).strip(), _mh.group(2).strip()) if _mh else ('', '')
+    _mk = f"{_home.lower()}|{_away.lower()}|{datetime.now(TZ_VN).strftime('%Y-%m-%d')}" if _home and _away else ''
     for i, pk in enumerate(picks):
         try:
             prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
@@ -1478,7 +1486,7 @@ async def cmd_keo(session, chat_id, arg=None):
             'status': 'pending', 'result': None, 'graded': None,
             'fixture_id': f"web_{ts_now}_{chat_id}_{i}",
             'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
-            'kickoff_vn': dt, 'home': '', 'away': '',
+            'kickoff_vn': dt, 'home': _home, 'away': _away, 'match_key': _mk,
         }
         predictions[rec['fixture_id']] = rec
     _save_predictions()
@@ -1526,8 +1534,25 @@ async def handle_odds_reply(session, chat_id, text):
                 if p.get('status') == 'pending' and p.get('fixture_id', '').startswith('web_')]
     if not pendings:
         return False
-    p = max(pendings, key=lambda x: x.get('graded') or 0) if False else pendings[-1]
     market, line, odds = parsed
+    if not odds:
+        return False
+    # chọn kèo pending gần nhất ĐÚNG loại market đã dán (tránh gán nhầm kèo)
+    def _mtype(mk):
+        mk = (mk or '').lower()
+        if '1x2' in mk:
+            return '1x2'
+        if 'btts' in mk:
+            return 'btts'
+        if 'tài xỉu' in mk or 'over' in mk or 'under' in mk:
+            if any(x in mk for x in ('thẻ', 'góc', 'card', 'corner')):
+                return 'stats'
+            return 'ou'
+        if 'châu á' in mk or 'handicap' in mk or 'asian' in mk or 'chấp' in mk:
+            return 'hdc'
+        return ''
+    cands = [p for p in pendings if _mtype(p.get('market')) == market]
+    p = cands[-1] if cands else pendings[-1]
     if market == '1x2':
         sel = (p.get('selection') or '').lower()
         idx = 0 if ('home' in sel or 'chủ' in sel or 'đội nhà' in sel) else (2 if ('away' in sel or 'khách' in sel or 'đội khách' in sel) else 1)
@@ -1539,6 +1564,12 @@ async def handle_odds_reply(session, chat_id, text):
             p['market'] = f"Tài xỉu {line}"
         sel = (p.get('selection') or '').lower()
         if ('xỉu' in sel or 'under' in sel) and len(odds) > 1:
+            p['odds'] = odds[1]
+        else:
+            p['odds'] = odds[0]
+    elif market == 'btts':
+        sel = (p.get('selection') or '').lower()
+        if ('không' in sel or ' no' in sel or sel == 'no') and len(odds) > 1:
             p['odds'] = odds[1]
         else:
             p['odds'] = odds[0]
@@ -1645,6 +1676,100 @@ async def daily_predictions_loop(app):
         await asyncio.sleep(3600)
 
 
+def _side_eq(stored, lineside):
+    """So khớp tên đội 2 phía (chuẩn hóa alias trước, fallback chuỗi)."""
+    if not stored or not lineside:
+        return False
+    cs, cl = _canon_team_slug(stored), _canon_team_slug(lineside)
+    if cs and cl:
+        return cs == cl
+    if cs and not cl:
+        return cs.replace('-', ' ') in lineside.lower()
+    if cl and not cs:
+        return len(stored) >= 3 and stored.lower() in lineside.lower()
+    return len(stored) >= 4 and stored.lower() in lineside.lower()
+
+
+def _sky_extract_score(page_text, home, away):
+    """Tìm dòng ĐÃ ĐÁ của đúng cặp đội trong text Sky đã parse → (gh, ga, line) hoặc None."""
+    if not page_text:
+        return None
+    for ln in page_text.split('\n'):
+        if 'ĐÃ ĐÁ' not in ln:
+            continue
+        ha, hb = _sky_line_teams(ln)
+        if not ha or not hb:
+            continue
+        if not (_side_eq(home, ha) and _side_eq(away, hb)):
+            continue
+        m = re.search(r'(\d+)\s*-\s*(\d+)', ln)
+        if m:
+            return int(m.group(1)), int(m.group(2)), ln
+    return None
+
+
+async def _api_fixture_id(session, home, away, date):
+    """Map trận (tên đội + ngày) → API-Football fixture id (để lấy stats góc/thẻ)."""
+    if not date:
+        return None
+    try:
+        fixtures, err = await get_fixtures_for_date(session, date, only_tracked=False, force=False)
+    except Exception:
+        return None
+    if err or not fixtures:
+        return None
+    for fx in fixtures:
+        h = (fx.get('teams', {}).get('home', {}).get('name') or '')
+        a = (fx.get('teams', {}).get('away', {}).get('name') or '')
+        if _side_eq(home, h) and _side_eq(away, a):
+            try:
+                return str(fx['fixture']['id'])
+            except Exception:
+                return None
+    return None
+
+
+async def _grade_web_group(session, home, away, preds):
+    """Chấm 1 trận của kèo web_ bằng tỉ số thật từ Sky. Trả list (p, status, result)."""
+    pages = []
+    for tm in (home, away):
+        slug = _canon_team_slug(tm or '') or (re.sub(r'[^a-z0-9]+', '-', (tm or '').lower()).strip('-') or None)
+        if slug:
+            try:
+                pg = await _fetch_sky_by_slug(session, slug)
+            except Exception:
+                pg = ""
+            if pg:
+                pages.append(pg)
+    found = None
+    for pg in pages:
+        found = _sky_extract_score(pg, home, away)
+        if found:
+            break
+    if not found:
+        return []
+    gh, ga, _ln = found
+    fx = {'goals': {'home': gh, 'away': ga}}
+    out = []
+    for p in preds:
+        try:
+            st, res = _grade_prediction(p, fx)
+        except Exception:
+            st, res = None, None
+        if st == 'needs_stats':
+            fx_id = await _api_fixture_id(session, home, away, p.get('date'))
+            stats = await _match_stats_summary(session, fx_id) if fx_id else None
+            if stats:
+                try:
+                    st, res = _grade_stats_market(p, fx, stats)
+                except Exception:
+                    st, res = None, None
+            else:
+                st, res = None, None  # giữ pending, chờ API quota
+        out.append((p, st, res))
+    return out
+
+
 async def results_loop(app):
     """Mỗi giờ: chấm kết quả các dự đoán pending của hôm qua (và hôm nay nếu đá xong)."""
     session = app['session']
@@ -1687,6 +1812,52 @@ async def results_loop(app):
                                 await send_telegram_message(
                                     session, cid,
                                     f"{mark} {p['home']} vs {p['away']} — chọn {p['market']} → {res}{odd_txt}")
+                # ── kèo web_ (analyze_keo/cmd_keo): fixture_id không map API → chấm qua Sky ──
+                web_groups = {}
+                for fid, p in list(pending.items()):
+                    if not str(fid).startswith('web_') or p.get('status') != 'pending':
+                        continue
+                    d = p.get('date')
+                    if not d or d not in (today, yest):
+                        continue
+                    home = (p.get('home') or '').strip()
+                    away = (p.get('away') or '').strip()
+                    if (not home or home == '?') or (not away or away == '?'):
+                        mm = re.search(r'(.+?)\s+vs\s+(.+)', p.get('match') or '', re.I)
+                        if mm:
+                            if not home or home == '?':
+                                home = mm.group(1).strip()
+                            if not away or away == '?':
+                                away = mm.group(2).strip()
+                    if not home or not away or home == '?' or away == '?':
+                        continue
+                    key = p.get('match_key') or f"{home.lower()}|{away.lower()}|{d}"
+                    web_groups.setdefault(key, {'home': home, 'away': away, 'preds': []})['preds'].append(p)
+                for key, g in web_groups.items():
+                    try:
+                        graded = await _grade_web_group(session, g['home'], g['away'], g['preds'])
+                    except Exception as e:
+                        logger.warning(f"[KQ-web] {key}: {e}")
+                        continue
+                    marks = []
+                    for p, st, res in graded:
+                        if not st or st == 'needs_stats':
+                            continue
+                        p['status'] = st
+                        p['result'] = res
+                        p['graded'] = time.time()
+                        marks.append((p, st, res))
+                    if marks:
+                        nw = sum(1 for _, st, _ in marks if st == 'win')
+                        nl = sum(1 for _, st, _ in marks if st == 'loss')
+                        blines = []
+                        for p, st, res in marks:
+                            icon = "✅" if st == 'win' else ("❌" if st == 'loss' else "🤝")
+                            blines.append(f"{icon} {p['market']}: {p['selection']}" + (f" ({res})" if res else ""))
+                        for cid in list(auto_chats):
+                            await send_telegram_message(
+                                session, cid,
+                                f"📋 KQ {g['home']} vs {g['away']}: {nw} thắng / {nl} thua\n" + "\n".join(blines))
                 _save_predictions()
         except asyncio.CancelledError:
             raise
@@ -2008,38 +2179,53 @@ def _keo_logic_check(obj):
     errs = []
     ks = obj.get('keos') or {}
     header = str(obj.get('header') or '')
-    m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
-    ta, tb = (m.group(1).strip().lower(), m.group(2).strip().lower()) if m else ('', '')
+    _ha, _hb = _split_vs(header)
+    if _ha and _hb:
+        ta, tb = _ha.lower(), _hb.lower()
+    else:
+        m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
+        ta, tb = (m.group(1).strip().lower(), m.group(2).strip().lower()) if m else ('', '')
+        ta, tb = _strip_league_prefix(ta), _strip_league_prefix(tb)
+    ta_slug = _canon_team_slug(ta) if ta else None
+    tb_slug = _canon_team_slug(tb) if tb else None
     def side(txt):
-        t = txt.lower()
+        t = txt or ''
+        sl = _resolve_team_part(t)
+        if sl and ta_slug and sl == ta_slug:
+            return 'A'
+        if sl and tb_slug and sl == tb_slug:
+            return 'B'
+        tl = t.lower()
         for s, grp in ((ta, 'A'), (tb, 'B')):
-            if s and s.split()[0] in t:
+            if s and s.split()[0] in tl:
                 return grp
         return None
     p12 = str((ks.get('1x2') or {}).get('pick') or '').lower()
     pa = str((ks.get('chau_a') or {}).get('pick') or '').lower()
     ptx = str((ks.get('tai_xiu') or {}).get('pick') or '').lower()
     pb = str((ks.get('btts') or {}).get('pick') or '').lower()
-    # line tài xỉu
+    # line tài xỉu (vd 'Tài 2.5', 'Xỉu 2.75', '2.5/3')
     ml = re.search(r'(\d+(?:[.,]\d+)?[-/]\d+|\d+(?:[.,]\d+)?)', ptx)
     line = None
     if ml:
-        raw = ml.group(1)
-        if re.match(r'\d+[/-]\d+$', raw := raw if False else raw):
-            pass
+        raw = ml.group(1).replace(',', '.')
         try:
             parts = re.split(r'[/-]', raw)
-            line = float(parts[0]) + (float(parts[1]) if len(parts) == 2 else 0) / 1 if False else (
-                (float(parts[0]) + float(parts[1])) / 2 if len(parts) == 2 else float(parts[0]))
+            if len(parts) == 2:
+                line = (float(parts[0]) + float(parts[1])) / 2
+            else:
+                line = float(parts[0])
         except Exception:
             line = None
     is_over = bool(re.search(r't[àaả]i|over|l[êe]n', ptx))
     is_under = bool(re.search(r'x[ỉi]u|under|xu[ốo]ng', ptx))
-    btts_yes = bool(re.search(r'c[ôo]|yes|ghi b[àa]n', pb)) and not bool(re.search(r'kh[ôo]ng|no', pb))
+    btts_yes = bool(re.search(r'có|cả|yes|ghi bàn', pb)) and not bool(re.search(r'không|no', pb))
     btts_no = bool(re.search(r'kh[ôo]ng|no', pb))
     lean_hdc = side(pa)
     # R-1: CẤM placeholder có pct>0 và pct=100 ('Không đặt kèo (100%)' là bịa)
     for _k, _v in (ks or {}).items():
+        if not isinstance(_v, dict):
+            continue  # key phụ (vd estimated_total_goals) — bỏ qua
         _pp = str((_v or {}).get('pick') or '')
         try:
             _pc = int((_v or {}).get('pct', 0))
@@ -2052,9 +2238,9 @@ def _keo_logic_check(obj):
     # R0: kịch bản phải có tỉ số cụ thể — mọi kèo phải khớp tỉ số này
     # format bắt buộc: 'TeamNhà X-Y TeamKhách' (hoặc có tên đội kèm tỉ số) → map đúng phe
     ps = str(obj.get('scenario') or '')
-    ms = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+(\d+)\s*[-:]\s*(\d+)\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)', ps)
+    ms = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+(\d{1,2})\s*[-:]\s*(\d{1,2})\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*(?:—|–|,)|$)', ps)
     if not ms:
-        ms = re.search(r'(\d+)\s*[-:]\s*(\d+)', ps)
+        ms = re.search(r'(?<!\d)(\d{1,2})\s*-\s*(\d{1,2})(?!\d)', ps)
         if not ms:
             errs.append("scenario thiếu tỉ số dự đoán cụ thể dạng 'TeamNhà X-Y TeamKhách' (vd 'MU 1-2 MC') — mọi kèo phải suy ra từ tỉ số này")
             ga_, gb_ = None, None
@@ -2074,11 +2260,15 @@ def _keo_logic_check(obj):
             ga_, gb_ = n2, n1
         else:
             ga_, gb_ = n1, n2
+    if ga_ is not None and (ga_ > 12 or gb_ > 12 or ga_ + gb_ > 15):
+        ga_, gb_ = None, None  # tỉ số vô lý (vd bắt nhầm giờ/phút) → coi như thiếu scenario
     if ga_ is not None:
         tot = ga_ + gb_
         # Mỗi kèo phải có căn cứ riêng (lịch sử/lực lượng/đối đầu) — không ăn theo tỉ số
         # Bỏ qua pct=0 (thiếu dữ liệu được phép không có why)
         for _k, _v in (ks or {}).items():
+            if not isinstance(_v, dict):
+                continue
             try:
                 _pct = int((_v or {}).get('pct', 0))
             except Exception:
@@ -2088,12 +2278,16 @@ def _keo_logic_check(obj):
             w = str((_v or {}).get('why') or '').strip()
             if len(w) < 10:
                 errs.append(f"kèo '{_k}' thiếu căn cứ riêng (why) — nêu số liệu/thống kê của chính kèo đó")
-        # Mâu thuẫn vật lý với kịch bản (kịch bản là ước tính trung tâm — sai lệch ≤1 bàn chấp nhận)
-        if line is not None and (is_over or is_under) and abs(tot - line) > 1.5:
-            side_s = 'Tài' if is_over else 'Xỉu'
-            errs.append(f"{side_s} {line} quá xa kịch bản {ga_}-{gb_} (tổng {tot}) — chọn cửa gần kịch bản hơn")
-        # Ép Tài/Xỉu phải khớp estimated_total_goals từ JSON
+        # Mâu thuẫn vật lý với kịch bản (kịch bản là ước tính trung tâm — lệch 1 bàn chấp nhận, lệch 2+ là ngược)
+        if line is not None:
+            if is_over and not is_under and tot < line - 1:
+                errs.append(f"Tài {line} nhưng kịch bản {ga_}-{gb_} (tổng {tot}) thấp hơn nhiều — chọn cửa gần kịch bản hơn")
+            if is_under and not is_over and tot > line + 1:
+                errs.append(f"Xỉu {line} nhưng kịch bản {ga_}-{gb_} (tổng {tot}) cao hơn nhiều — chọn cửa gần kịch bản hơn")
+        # Ép Tài/Xỉu phải khớp estimated_total_goals từ JSON (top-level hoặc trong keos)
         est_total = obj.get('estimated_total_goals')
+        if est_total is None and isinstance((ks or {}).get('estimated_total_goals'), (int, float)):
+            est_total = ks.get('estimated_total_goals')
         if est_total is not None and line is not None and (is_over or is_under):
             try:
                 est = float(est_total)
@@ -2104,8 +2298,8 @@ def _keo_logic_check(obj):
             except Exception:
                 pass
         both = ga_ > 0 and gb_ > 0
-        if btts_yes and not both and max(ga_, gb_) >= 2:
-            errs.append(f"BTTS Có nhưng kịch bản {ga_}-{gb_} có đội không ghi bàn ≥2 — đổi BTTS hoặc đổi kịch bản")
+        if btts_yes and not both:
+            errs.append(f"BTTS Có nhưng kịch bản {ga_}-{gb_} có đội không ghi bàn — đổi BTTS hoặc đổi kịch bản")
         if btts_no and both:
             errs.append(f"BTTS Không nhưng kịch bản {ga_}-{gb_} cả hai đều ghi bàn — mâu thuẫn")
         # 1X2 vẫn phải cùng phe đội thắng theo kịch bản (mâu thuẫn cứng)
@@ -2211,24 +2405,31 @@ KEO_JSON_SCHEMA = (
     '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60, "why": "lịch sử đối đầu + chênh lực lượng"}, '
     '"btts": {"pick": "Có hoặc Không", "pct": 60, "why": "tỉ lệ BTTS nổ của 2 đội + thủng lưới gần đây"}, '
     '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60, "why": "quy luật derby/kỳ vọng trọng tài + số thẻ trung bình"}, '
-    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55, "why": "lối chơi biên/kiem soát + số góc trung bình"}, '
-    '"estimated_total_goals": 2.5}, '
+    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55, "why": "lối chơi biên/kiem soát + số góc trung bình"}}, '
+    '"estimated_total_goals": 2.5, '
     '"best": "kèo tự tin nhất"}')
 
 def _save_keo_batch(chat_id, obj, rendered):
     """Lưu 6 kèo vừa phân tích (manual hoặc auto) vào predictions.json để chấm điểm + /tk."""
     header = str(obj.get('header') or '')
-    m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
-    home, away = (m.group(1).strip(), m.group(2).strip()) if m else ('?', '?')
-    kickoff = str(obj.get('kickoff') or '')[:10] or datetime.now(TZ_VN).strftime('%Y-%m-%d')
+    _ha2, _hb2 = _split_vs(header)
+    if _ha2 and _hb2:
+        home, away = _ha2, _hb2
+    else:
+        m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
+        home, away = (m.group(1).strip(), m.group(2).strip()) if m else ('?', '?')
+    kickoff = str(obj.get('kickoff') or '')[:10]
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', kickoff):
+        kickoff = datetime.now(TZ_VN).strftime('%Y-%m-%d')
     match_key = f"{home.lower()}|{away.lower()}|{kickoff}"
-    # tránh lưu trùng: trận này + market này đã pending thì bỏ qua
-    for p in predictions.values():
-        if p.get('match_key') == match_key and p.get('status') == 'pending':
-            return
+    # tránh lưu trùng: trận này đã pending thì bỏ qua (bỏ qua khi chưa rõ đội)
+    if home != '?' and away != '?':
+        for p in predictions.values():
+            if p.get('match_key') == match_key and p.get('status') == 'pending':
+                return
     KEYS = (('1x2', '1X2'), ('tai_xiu', 'Tài xỉu'), ('chau_a', 'Châu Á'), ('btts', 'BTTS'), ('the', 'Thẻ'), ('goc', 'Góc'))
     ks = obj.get('keos') or {}
-    ts_now = int(time.time())
+    ts_now = int(time.time() * 1000)
     for i, (k, disp) in enumerate(KEYS):
         v = (ks.get(k) or {})
         sel = str(v.get('pick') or '').strip()
@@ -2470,6 +2671,40 @@ def _parse_query_teams(q):
     return slugs
 
 
+# Từ đầu tên đội trong header AI (vd 'Premier League Manchester United') → lột tên giải
+_LEAGUE_WORDS = ('premier league', 'ngoại hạng anh', 'spanish la liga', 'la liga', 'laliga',
+                 'italian serie a', 'serie a', 'german bundesliga', 'bundesliga', 'french ligue 1',
+                 'ligue 1', 'efl championship', 'championship', 'uefa champions league', 'champions league',
+                 'uefa europa league', 'europa league', 'v.league 1', 'v-league', 'vleague',
+                 'fa cup', 'league cup', 'carabao cup', 'copa del rey', 'coppa italia',
+                 'dfb pokal', 'coupe de france', 'premier', 'serie', 'league', 'ligue', 'cúp')
+
+
+def _strip_league_prefix(name):
+    n = (name or '').strip()
+    low = n.lower()
+    for lw in sorted(_LEAGUE_WORDS, key=len, reverse=True):
+        if low.startswith(lw):
+            rest = n[len(lw):].lstrip(' :—-,.')
+            if rest:
+                return rest
+    return n
+
+
+def _split_vs(header):
+    """'Premier League Manchester United vs Manchester City (22:30)' → ('Manchester United', 'Manchester City').
+    Chống nuốt tên giải / bắt non chữ (dùng ranh giới ' vs ' + lột prefix giải)."""
+    parts = re.split(r'\s+vs\s+', str(header or ''), flags=re.I)
+    if len(parts) < 2:
+        return None, None
+    home = _strip_league_prefix(re.sub(r'^[^\wÀ-ỹ]+', '', parts[0]).strip())
+    away = re.split(r'[\(\-—:,]', parts[1].strip())[0].strip()
+    away = re.sub(r'^[^\wÀ-ỹ]+', '', away).strip()
+    if not home or not away or len(home) > 30 or len(away) > 30:
+        return None, None
+    return home, away
+
+
 def _sky_line_teams(line):
     """Tách 2 đội từ 1 dòng lịch Sky đã parse → (home, away) tên gốc, hoặc (None, None)."""
     m = re.search(r':\s*(.+?)\s+vs\s+(.+?)(?:\s+lúc|$)', line)
@@ -2678,7 +2913,6 @@ async def _agent_execute(session, chat_id, name, args):
         if not q_raw:
             return "LỖI: cần tên đội."
         q = q_raw
-        q_teams = q_raw
         await send_chat_action(session, chat_id)
         _an = await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
         if _an and _an.get('result'):
@@ -2715,7 +2949,7 @@ async def _agent_execute(session, chat_id, name, args):
             cands = []
             for pg in pages:
                 for ln in pg.split('\n'):
-                    if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
+                    if 'ĐANG ĐÁ' not in ln and 'NGHỈ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
                         continue
                     ha, hb = _sky_line_teams(ln)
                     if not ha or not hb:
@@ -2731,7 +2965,7 @@ async def _agent_execute(session, chat_id, name, args):
                                 if s.replace('-', ' ') in lnl:
                                     pair.add(s)
                     if pair == want:
-                        prio = 0 if 'ĐANG ĐÁ' in ln else (1 if 'SẮP ĐÁ' in ln else 2)
+                        prio = 0 if ('ĐANG ĐÁ' in ln or 'NGHỈ' in ln) else (1 if 'SẮP ĐÁ' in ln else 2)
                         cands.append((prio, ln))
             if cands:
                 cands.sort(key=lambda x: x[0])
@@ -2743,7 +2977,7 @@ async def _agent_execute(session, chat_id, name, args):
             for pg in pages:
                 is_league_pg = bool(league_data) and pg is league_data
                 for ln in pg.split('\n'):
-                    if 'ĐANG ĐÁ' not in ln:
+                    if 'ĐANG ĐÁ' not in ln and 'NGHỈ' not in ln:
                         continue
                     if is_league_pg and slug_a:
                         ha, hb = _sky_line_teams(ln)
@@ -2776,6 +3010,7 @@ async def _agent_execute(session, chat_id, name, args):
             if web_result and not web_result.startswith("Không"):
                 return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
                         f"Kết quả tìm kiếm:\n{web_result[:1500]}")
+            return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports — thử lại sau hoặc hỏi đội khác.")
         if target_ln:
             # Nếu trận đã đá → trả kết quả luôn, không phân tích
             if 'ĐÃ ĐÁ' in target_ln:
@@ -2797,6 +3032,9 @@ async def _agent_execute(session, chat_id, name, args):
                     opponent, opponent_slug = away_t, cb  # mặc định: đối thủ là đội khách
         if opponent and not opponent_slug:
             opponent_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
+        # Gắn dòng trận mục tiêu vào data (quan trọng nhất — tránh AI phân tích nhầm trận khác)
+        if target_ln and not any(target_ln in (p or '') for p in data_parts):
+            data_parts.append(f"TRẬN MỤC TIÊU:\n{target_ln}")
         if opponent and opponent_slug:
             opp_parsed = await _fetch_sky_by_slug(session, opponent_slug)
             if opp_parsed:
@@ -2807,6 +3045,8 @@ async def _agent_execute(session, chat_id, name, args):
                 data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
         if league_data:
             kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
+            for _sl in [s for s in (q_slugs or []) if s]:
+                kw += [w for w in _sl.replace('-', ' ').split() if len(w) > 3 and w not in kw]
             if opponent:
                 kw += [w.lower() for w in re.split(r'[^a-z0-9]+', opponent.lower()) if len(w) > 3]
             rel = [ln for ln in league_data.split('\n')
