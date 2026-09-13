@@ -2522,24 +2522,56 @@ async def _agent_execute(session, chat_id, name, args):
                 league_id = matched_fx['league']['id']
                 home_name = matched_fx['teams']['home']['name']
                 away_name = matched_fx['teams']['away']['name']
-                # Standings
-                standings = await get_standings(session, league_id)
-                if standings:
-                    st_h = _format_standings(standings, home_name)
-                    st_a = _format_standings(standings, away_name)
-                    if st_h:
-                        api_data_parts.append(f"BXH {home_name}: {st_h}")
-                    if st_a:
-                        api_data_parts.append(f"BXH {away_name}: {st_a}")
-                # Team stats (goals scored/conceded, clean sheets, cards)
-                stats_h = await get_team_stats(session, home_id, league_id)
-                stats_a = await get_team_stats(session, away_id, league_id)
-                formatted_h = _format_team_stats(stats_h, home_name)
-                formatted_a = _format_team_stats(stats_a, away_name)
-                if formatted_h:
-                    api_data_parts.append(formatted_h)
-                if formatted_a:
-                    api_data_parts.append(formatted_a)
+                # Standings — lỗi thì bỏ qua, không chết
+                try:
+                    standings = await get_standings(session, league_id)
+                    if standings:
+                        st_h = _format_standings(standings, home_name)
+                        st_a = _format_standings(standings, away_name)
+                        if st_h:
+                            api_data_parts.append(f"BXH {home_name}: {st_h}")
+                        if st_a:
+                            api_data_parts.append(f"BXH {away_name}: {st_a}")
+                except Exception as e:
+                    logger.warning(f"[analyze_keo] standings error: {e}")
+                # Team stats — lỗi thì bỏ qua
+                try:
+                    stats_h = await get_team_stats(session, home_id, league_id)
+                    stats_a = await get_team_stats(session, away_id, league_id)
+                    formatted_h = _format_team_stats(stats_h, home_name)
+                    formatted_a = _format_team_stats(stats_a, away_name)
+                    if formatted_h:
+                        api_data_parts.append(formatted_h)
+                    if formatted_a:
+                        api_data_parts.append(formatted_a)
+                except Exception as e:
+                    logger.warning(f"[analyze_keo] team stats error: {e}")
+                # Odds — lỗi thì bỏ qua
+                try:
+                    fixture_id = str(matched_fx['fixture']['id'])
+                    odds = await get_match_odds(session, fixture_id)
+                    if odds and odds.get('markets'):
+                        mk_lines = []
+                        for name, vals in odds['markets'].items():
+                            vs = ", ".join(f"{k}: {v}" for k, v in list(vals.items())[:8])
+                            mk_lines.append(f"- {name}: {vs}")
+                        api_data_parts.append(f"Odds {odds.get('bookmaker', '?')}:\n" + "\n".join(mk_lines))
+                except Exception as e:
+                    logger.warning(f"[analyze_keo] odds error: {e}")
+                # H2H — lỗi thì bỏ qua
+                try:
+                    h2h = await get_h2h_summary(session, home_id, away_id)
+                    if h2h:
+                        api_data_parts.append(h2h)
+                except Exception as e:
+                    logger.warning(f"[analyze_keo] h2h error: {e}")
+                # API prediction — lỗi thì bỏ qua
+                try:
+                    api_pred = await get_api_prediction(session, fixture_id)
+                    if api_pred:
+                        api_data_parts.append(api_pred)
+                except Exception as e:
+                    logger.warning(f"[analyze_keo] api prediction error: {e}")
         except Exception as e:
             logger.warning(f"[analyze_keo] API-Football data error: {e}")
         # ── Historical accuracy feedback: bot học từ quá khứ ──
