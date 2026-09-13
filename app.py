@@ -6654,6 +6654,98 @@ async def tool_search_news(session, chat_id, args):
         return f"Không tìm được tin tức về {q} (lỗi: {e})."
 
 
+def _decode_bing_href(href):
+    """Bing trả link redirect /ck/a?...&u=a1<base64-url>... → giải mã về URL thật."""
+    href = href.replace('&amp;', '&')
+    if href.startswith('https://www.bing.com/ck/'):
+        m = re.search(r'u=a1([A-Za-z0-9\-_]+)', href)
+        if m:
+            b64 = m.group(1)
+            b64 += '=' * (-len(b64) % 4)
+            import base64
+            try:
+                return base64.urlsafe_b64decode(b64).decode('utf-8', 'ignore')
+            except Exception:
+                return href
+    return href
+
+
+async def _web_search_bing(session, query, max_results=8):
+    """Tìm web bằng Bing (không cần API key, không bị chặn như DuckDuckGo).
+    Trả về list (title, url, snippet) hoặc None khi fail/chống-bot."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with session.get("https://www.bing.com/search",
+                               params={'q': query, 'count': max_results},
+                               headers={
+                                   "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+                                   "Accept-Language": "vi,en;q=0.8",
+                               }, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text(errors='ignore')
+    except Exception:
+        return None
+    results = []
+    for m in re.finditer(r'<li class="b_algo".*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>(.*?)</li>', html, re.S):
+        href, title_html, rest = m.groups()
+        title = re.sub(r'<[^>]+>', '', title_html).strip()
+        href = _decode_bing_href(href)
+        snip_m = re.search(r'<p[^>]*>(.*?)</p>', rest, re.S)
+        snip = re.sub(r'<[^>]+>', '', snip_m.group(1)).strip() if snip_m else ''
+        if title and href.startswith('http'):
+            results.append((title, href, snip))
+        if len(results) >= max_results:
+            break
+    return results or None
+
+
+async def tool_web_search(session, chat_id, args):
+    """Tìm kiếm web tổng quát (Bing, miễn phí). Trả về tiêu đề + link + snippet."""
+    q = (args.get('query') or '').strip()
+    if not q:
+        return "LỖI: cần query."
+    results = await _web_search_bing(session, q)
+    if not results:
+        return f"Không tìm thấy kết quả web nào cho '{q}'."
+    lines = [f"🔎 *Kết quả web cho '{q}'*:"]
+    for i, (title, href, snip) in enumerate(results, 1):
+        lines.append(f"{i}. {title} — {href}" + (f"\n   {snip[:160]}" if snip else ""))
+    lines.append("\n💡 Dùng fetch_url để đọc chi tiết một trang nếu cần.")
+    return "\n".join(lines)
+
+
+async def tool_fetch_url(session, chat_id, args):
+    """Đọc nội dung một trang web (text thô, đã bỏ tag HTML). Trả về tối đa ~4000 ký tự."""
+    url = (args.get('url') or '').strip()
+    if not url.startswith(('http://', 'https://')):
+        return "LỖI: url phải bắt đầu bằng http:// hoặc https://."
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with session.get(url, timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "Accept-Language": "vi,en;q=0.8",
+        }) as resp:
+            if resp.status != 200:
+                return f"Không đọc được trang (HTTP {resp.status})."
+            ctype = resp.headers.get('Content-Type', '')
+            if 'html' not in ctype and 'text' not in ctype and 'json' not in ctype:
+                return f"Trang không phải text/html ({ctype.split(';')[0]}) — bỏ qua."
+            raw = await resp.text(errors='ignore')
+    except Exception as e:
+        return f"Lỗi đọc trang: {e}"
+    # Bỏ script/style/tag, giữ text
+    raw = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw, flags=re.S | re.I)
+    raw = re.sub(r'<[^>]+>', ' ', raw)
+    raw = raw.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    raw = re.sub(r'\s+', ' ', raw).strip()
+    if not raw:
+        return "Trang rỗng hoặc chỉ toàn script."
+    if len(raw) > 4000:
+        raw = raw[:4000] + "…"
+    return f"📄 *Nội dung {url}*:\n{raw}"
+
+
 def _urlencode_q(q):
     """Mã hóa query cho URL Google News RSS (thay dấu cách bằng %20)."""
     from urllib.parse import quote
@@ -6746,6 +6838,8 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "analyze_coin", "description": "Phân tích chuyên sâu MỘT coin cụ thể: chỉ báo đa khung 15m/1h/4h/1d + rule engine + nhận định AI kèm TP/SL. Dùng khi người dùng hỏi về xu hướng hoặc khả năng vào lệnh của một coin. KHÔNG dùng khi người dùng muốn tìm cơ hội trên toàn thị trường (dùng scan_market).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string", "description": "Ví dụ BTCUSDT hoặc btc"}}, "required": ["symbol"]}}},
     {"type": "function", "function": {"name": "get_price", "description": "Tra giá realtime + % thay đổi 24h của một hoặc nhiều coin bất kỳ trên Binance Futures.", "parameters": {"type": "object", "properties": {"symbols": {"type": "array", "items": {"type": "string"}, "description": "Danh sách symbol, ví dụ ['SOLUSDT', 'DOGEUSDT']"}}, "required": ["symbols"]}}},
     {"type": "function", "function": {"name": "search_news", "description": "Tìm tin tức/sự kiện mới nhất về một coin từ Google News (miễn phí). Dùng khi người dùng hỏi tin tức, lý do coin tăng/giảm, sự kiện, tin cộng đồng. Kết quả chỉ THAM KHẢO, không phải tín hiệu mua bán.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Tên coin hoặc chủ đề, ví dụ 'Bitcoin ETF' hoặc 'SOL'"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web tổng quát (DuckDuckGo) — dùng khi cần thông tin ngoài tin tức coin: benchmark model AI, sản phẩm, chính sách, so sánh, sự kiện ngoài thị trường crypto... Trả về tiêu đề + link. Kết hợp fetch_url để đọc chi tiết.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Cụm từ tìm kiếm, có thể tiếng Việt hoặc tiếng Anh"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "fetch_url", "description": "Đọc nội dung một trang web cụ thể (text thô đã bỏ HTML, tối đa ~4000 ký tự). Dùng sau web_search khi cần đọc chi tiết bài viết/trang.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL đầy đủ https://..."}}, "required": ["url"]}}},
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_positions", "description": "Danh sách vị thế futures đang mở: entry, mark, PnL, đòn bẩy, giá thanh lý.", "parameters": {"type": "object", "properties": {}}}},
@@ -6762,6 +6856,8 @@ TOOL_EXECUTORS = {
     'analyze_coin': tool_analyze_coin,
     'get_price': tool_get_price,
     'search_news': tool_search_news,
+    'web_search': tool_web_search,
+    'fetch_url': tool_fetch_url,
     'scan_market': tool_scan_market,
     'get_account_summary': tool_get_account_summary,
     'get_positions': tool_get_positions,
@@ -7182,6 +7278,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
             "hỏi về TIN TỨC/sự kiện/lý do coin tăng giảm/tin cộng đồng -> search_news (kết quả chỉ tham khảo, không phải tín hiệu); "
+            "câu hỏi ngoài thị trường (benchmark AI, sản phẩm, chính sách, so sánh...) -> web_search rồi fetch_url đọc chi tiết trang. "
             "câu hỏi về tài khoản -> các tool get_account/get_positions/get_open_orders/get_order_history/get_income_history. "
             "QUAN TRỌNG về TP/SL: TP/SL của vị thế thường là lệnh ĐIỀU KIỆN riêng (STOP_MARKET/TAKE_PROFIT_MARKET qua Algo Service), "
             "KHÔNG gắn trên vị thế. Khi đánh giá vị thế có TP/SL hay chưa, PHẢI xem kết quả get_open_orders hoặc phần 'TP/SL điều kiện' "
