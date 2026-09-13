@@ -1686,70 +1686,98 @@ async def _clear_status_msgs(session, chat_id):
 
 def _strict_keo_format(text):
     """Chuẩn hóa output: header + LIVE + 6 dòng '- Kèo: chọn ⭐' + ⭐ best.
-    Sao = tin cậy (≥75:5⭐, ≥65:4, ≥58:3, ≥52:2, còn lại 1). Bỏ ngoặc %, bỏ bảng/rác."""
+    Nhận mọi dạng AI đẻ: '- 1X2: ...', '**1️⃣ Kèo 1X2:** ...', bảng dọc, bảng |."""
     if not text:
         return text
     t = _clean_tg(text)
     lines = [l.strip() for l in t.split('\n') if l.strip()]
     header = live = None
-    out_k = []
+    out_k = {}
     specs = [('1X2', r'1\s*[xX]\s*2'), ('Tài xỉu', r't[aàảá]i\s*x[ỉiu]u'), ('Châu Á', r'ch[âaàáả]u\s*[áaàả]'),
-             ('BTTS', r'(?:btts|cả\s*2\s*đ[ôo]i\s*ghi)'), ('Thẻ', r'th[ẻe]'), ('Góc', r'g[óo]c')]
+             ('BTTS', r'(?:btts|c[aàả]2\s*đ[ôo]i\s*ghi|cả\s*hai\s*đ[ôo]i\s*ghi)'), ('Thẻ', r'th[ẻe]'), ('Góc', r'(?:ph[ạảa]t\s*)?g[óo]c')]
     for disp, pat in specs:
-        val = None
-        stars = 0
+        # 1) dòng có 'Kèo <market>: <chọn>' hoặc '<market>: <chọn>'
         for ln in lines:
-            m = re.match(r'^[-•]?\s*' + pat + r'[^:—\-]*[:—\-]\s*(.+)', ln, re.I)
-            if not m:
-                # dạng cột dọc: dòng chỉ toàn tên kèo → lấy dòng sau có nội dung
-                if re.match(r'^[-•]?\s*' + pat + r'[\s:—\-]*$|^[\d\.]+\)?$', ln, re.I) and not val:
-                    continue
-            if m and m.group(1):
-                val = m.group(1).strip()
-                mm = re.search(r'\((\d{2})\s*%\)', val)
-                if not mm:
-                    mm = re.search(r'(\d{2})\s*%', val)
+            if re.match(r'^\d+[.)\s]', ln) or ln.startswith('#'):
+                continue
+            m = re.search(pat + r'[^:—\-]{0,14}[:—\-]\s*(.+)', ln, re.I)
+            if m:
+                val = m.group(1)
+                # chỉ lấy lựa chọn: cắt trước '—', '→', 'hoặc', 'vì', '('
+                val = re.split(r'→|[—•]|\bhoặc\b|\bvì\b|\(', val)[0].strip()
+                mm = re.search(r'(\d{2})\s*%', val)
+                stars = 0
                 if mm:
                     p = int(mm.group(1))
                     stars = 5 if p >= 75 else 4 if p >= 65 else 3 if p >= 58 else 2 if p >= 52 else 1
-                    val = re.sub(r'[\(\[]?[\d]{2}\s*%[\)\]]?', '', val)
-                val = re.sub(r'[⭐✅🔥💡⭐]+', '', val).strip(' :—-|')
+                    val = re.sub(r'[\(]?[\d]{1,2}\s*%[\)]?', '', val)
+                val = re.sub(r'[⭐✅🔥⚽🟥]+', '', val).strip(' :—-—')
                 if val:
-                    out_k.append((disp, val, stars))
+                    out_k[disp] = (val, stars)
                 break
-        if not val:
-            # tìm dạng dọc: dòng tên kèo riêng → dòng kế là lựa chọn
+        else:
+            # 2) bảng dọc: dòng tên kèo (ngắn) → dòng sau là lựa chọn
             for k, ln in enumerate(lines):
-                if re.match(r'^[-•]?\s*' + pat + r'.{0,14}$', ln, re.I) and len(ln) < 25:
+                if re.match(r'^[-••1-9️ \[\]]*\s*(?:t[ạảàa]i\s*x[ỉi]u\s*)?' + pat + r'.{0,16}$', ln, re.I) and len(ln) < 30:
                     nxt = lines[k + 1] if k + 1 < len(lines) else ''
-                    if nxt and not any(re.match(r'^[-•]?\s*' + p2, nxt, re.I) for _d2, p2 in specs):
-                        stars_l = len(re.findall(r'⭐', nxt))
-                        val2 = re.sub(r'⭐+', '', nxt).strip(' :—-|')
-                        if val2 and len(val2) > 1:
-                            out_k.append((disp, val2, stars_l))
+                    _is_mk = any(re.match(r'^[-•]?\s*(?:t[ạảàa]i\s*x[ỉi]u\s*)?' + p2 + r'.{0,16}$', nxt, re.I) for _d, p2 in specs)
+                    if nxt and not re.match(r'^\d+[.)\s]', nxt) and not _is_mk and not nxt.startswith(('⚠', '💡', '📌', '✅', '⚽', '---', '#')):
+                        stars = len(re.findall(r'⭐', nxt))
+                        val = re.sub(r'⭐+[\s]*$|✅\s*$', '', nxt).strip(' :—-—')
+                        if val:
+                            out_k[disp] = (val, stars)
                         break
+    # header + live
+    header = next((ln for ln in lines if '⚽' in ln and ('vs' in ln.lower() or 'chiến' in ln.lower() or 'derby' in ln.lower())), None)
+    if not header:
+        header = next((ln for ln in lines if ' vs ' in ln.lower() and any(
+            g in ln for g in ('League', 'Liga', 'Serie', 'Bundes', 'Ligue', 'Premier', 'Championship'))), None)
+    if not header:
+        header = next((ln for ln in lines if 'derby' in ln.lower() and ('mu' in ln.lower() or 'united' in ln.lower())), None)
+    if not header:
+        header = next((ln for ln in lines if ' vs ' in ln.lower()), None)
+    if not header:
+        header = next((ln for ln in lines if re.search(r'[a-z]{3,}\s+vs\s+[a-z]{3,}', ln.lower())), '⚽ Trận đấu')
+    live = next((ln for ln in lines if 'LIVE' in ln.upper() or '🔴' in ln), None)
+    # best
     best = None
     for ln in lines:
-        if ln.startswith('⭐') and len(ln) > 3 and 'Tự tin' in ln:
-            best = ln
+        if re.match(r'^\d+[.)]\s', ln):
+            c = re.sub(r'^\d+[.)]\s*|\*\*', '', ln).strip()
+            c = re.split(r'[—:]', c)[0].strip()
+            if c and len(c) < 50:
+                best = c
             break
+    if not best:
+        for ln in lines:
+            if 'tự tin nhất' in ln.lower():
+                best = re.split(r'[:：]', ln, 1)[-1].strip(' *')
+                break
+    if not best:
+        for ln in lines:
+            if 'kèo vàng' in ln.lower() and len(ln) < 80:
+                best = re.split(r'[:：]', ln, 1)[-1].strip(' *')
+                break
     if not best and out_k:
-        bp = max(out_k, key=lambda x: x[2])
-        best = f"⭐ Tự tin nhất: {bp[1]}"
-    header = next((ln for ln in lines if (' vs ' in ln.lower() or '⚽' in ln) and any(
-        g in ln for g in ('League', 'Liga', 'Serie', 'Bundes', 'Ligue', 'erby', 'Premier', 'Championship', 'Copa'))), None)
-    if not header:
-        header = next((ln for ln in lines if ' vs ' in ln.lower()), '⚽ Trận đấu')
-    live = next((ln for ln in lines if 'LIVE' in ln.upper() or '🔴' in ln), None)
-    out = [header[:110]]
-    if live:
+        bp = max(out_k.items(), key=lambda kv: kv[1][1])
+        best = f"⭐ Tự tin nhất: {bp[0]} — {bp[1][0]}"
+    elif best:
+        best = '⭐ ' + re.split(r'[→—]|kèo đôi|\+ ', best.lstrip('⭐ ✅'))[0].strip()[:60]
+    out = [header[:110] if header else '⚽ Trận đấu']
+    if live and live.strip('*# ')[:60] != (header or '')[:60].strip('*# '):
         out.append(live[:90])
-    for disp, val, stars in out_k[:6]:
-        s = '⭐' * max(1, min(stars, 5)) if stars else ''
-        out.append(f"- {disp}: {val}{' ' + s if s else ''}")
+    def sn(n):
+        return '⭐' * max(1, min(n, 5)) if n else ''
+    for disp in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc'):
+        if disp in out_k:
+            val, stars = out_k[disp]
+            out.append(f"- {disp}: {val}{' ' + sn(stars) if sn(stars) else ''}")
     if best:
-        out.append(best[:80])
+        out.append(best[:90])
     return '\n'.join(out)
+
+
+
 
 
 
@@ -2079,7 +2107,27 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         msg = (data.get('choices', [{}])[0].get('message') or {})
         tool_calls = msg.get('tool_calls') or []
         if not tool_calls:
-            content = _strict_keo_format(_clean_tg(msg.get('content') or ''))
+            raw = (msg.get('content') or '')
+            logger.info(f"[KEO-RAW]\n{raw[:1500]}")
+            content = _clean_tg(raw)
+            # ÉP FORMAT: thiếu kèo nào trong 6 kèo chuẩn → bắt AI chép lại đúng mẫu
+            need = [d for d in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc')
+                    if not re.search(r'^\s*[-|•]?\s*(?:tài xỉu\s*)?' + re.escape(d), content, re.I | re.M)]
+            is_keo = bool(re.search(r'analyze_keo', str(messages), re.I)) or any(
+                w in question.lower() for w in ('kèo', 'phân tích', 'dự đoán'))
+            if is_keo and need:
+                fix_prompt = (
+                    f"Câu trả lời trước của mày SAI FORMAT — thiếu: {', '.join(need)}.\n"
+                    "Chép lại ĐÚNG theo mẫu sau, ĐỦ 6 kèo, mỗi kèo MỘT DÒNG '- Tên kèo: chọn (X%)', KHÔNG bảng |, KHÔNG **, KHÔNG giải thích dài, KHÔNG thêm bớt:\n"
+                    "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
+                    "- 1X2: [chọn] (X%)\n- Tài xỉu 2.5: [Tài/Xỉu] (X%)\n- Châu Á: [kèo] (X%)\n"
+                    "- BTTS: [Có/Không] (X%)\n- Thẻ: [Tài/Xỉu] (X%)\n- Góc: [Tài/Xỉu] (X%)\n"
+                    "⭐ [kèo tự tin nhất]\n\nCâu trả lời cũ:\n" + content[:2500])
+                fixed, err = await get_ai_response(session, [{"role": "user", "content": fix_prompt}], max_tokens=700)
+                if fixed:
+                    logger.info(f"[KEO-FIX]\n{fixed[:800]}")
+                    content = fixed
+            content = _strict_keo_format(content)
             if content:
                 await send_telegram_message(session, chat_id, content, reply_to=reply_to)
             else:
