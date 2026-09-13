@@ -1683,6 +1683,54 @@ async def _clear_status_msgs(session, chat_id):
 
 
 
+
+def _strict_keo_format(text):
+    """Chỉ giữ 8 dòng chuẩn: ⚽ header (+LIVE) + 6 dòng '- X:' + ⭐. Cắt mọi thứ khác.
+    Lấy kèo từ dòng dạng '- 1X2: ...' — dòng kèo phân tán/ô bảng sẽ bị ghép lại."""
+    if not text:
+        return text
+    # chuẩn hóa: ghép cột dọc (Kèo\nLựa chọn\n...) thành '- market: selection (sao)'
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    kèo = {}
+    order = []
+    MARKETS = ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc')
+    header = None
+    live = None
+    best = None
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        low = ln.lower()
+        # header: dòng chứa 'vs' + tên giải hoặc ⚽
+        if header is None and ('vs' in low or '⚽' in ln) and any(g in ln for g in ('League', 'Liga', 'Serie', 'Bundes', 'Ligue', 'derby', 'Derby', 'Premier', 'Championship')):
+            header = ln[:120]
+        elif 'LIVE' in ln or ('phút' in ln and 'ĐANG' in ln):
+            live = ln
+        elif ln.startswith('⭐') and len(ln) < 40:
+            if not best:
+                best = ln
+        for mk in MARKETS:
+            if low.startswith(mk.lower()) and mk not in kèo:
+                # kèo line: '1X2  City thắng... ⭐⭐⭐' hoặc '1X2: ...'
+                content = ln[len(mk):].lstrip(' :—-')
+                stars = ''.join(re.findall(r'⭐', ln))
+                content = re.sub(r'⭐+', '', content).strip()
+                kèo[mk] = f"{content}{' (' + str(len(stars)) + '/5)' if stars else ''}"
+                order.append(mk)
+        i += 1
+    if not kèo:
+        # fallback: giữ nguyên text nếu không parse được kèo nào
+        return text
+    out = [header or '⚽ Trận đấu']
+    if live:
+        out.append(live)
+    for mk in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc'):
+        if mk in kèo:
+            out.append(f"- {mk}: {kèo[mk]}")
+    out.append(best or ('⭐ ' + max(kèo.items(), key=lambda kv: kv[1].count('/5'))[0] if False else ('⭐ ' + (order[-1] if order else ''))))
+    return '\n'.join(out)
+
+
 def _clean_tg(text):
     """Dọn format AI → Telegram đọc đẹp: bỏ **, #, ---, cột |, tiếng Nga/ryc, khoảng trắng thừa."""
     if not text:
@@ -2002,7 +2050,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         msg = (data.get('choices', [{}])[0].get('message') or {})
         tool_calls = msg.get('tool_calls') or []
         if not tool_calls:
-            content = _clean_tg(msg.get('content') or '').strip()
+            content = _strict_keo_format(_clean_tg(msg.get('content') or ''))
             if content:
                 await send_telegram_message(session, chat_id, content, reply_to=reply_to)
             else:
