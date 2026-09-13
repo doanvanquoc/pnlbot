@@ -5754,11 +5754,27 @@ async def detect_pump_candidates(session, limit=6):
                 if oi is None:
                     oi = 0.0
                 score, reasons = _pump_score(res_15m, res_1h, change, funding, oi, res_1h.get('taker_ratio'))
+                support15 = res_15m.get('support')
+                resistance15 = res_15m.get('resistance')
+                # Kế hoạch FOMO ngay: scalp momentum — SL ≤2.5% dưới entry (không lấy support xa),
+                # TP = kháng cự 15m gần nhất (≤6%) hoặc +3%; giữ R:R hợp lý cho đuổi giá.
+                entry_now = res_1h.get('close')
+                if entry_now:
+                    fomo_sl = res_15m.get('support')
+                    if not fomo_sl or not (entry_now * 0.94 < fomo_sl < entry_now * 0.995):
+                        fomo_sl = entry_now * 0.975
+                    tp_c = res_15m.get('resistance')
+                    if not tp_c or not (entry_now * 1.005 < tp_c < entry_now * 1.06):
+                        tp_c = entry_now * 1.03
+                    fomo_tp = tp_c
+                else:
+                    fomo_sl, fomo_tp = res_1h.get('sl'), res_1h.get('tp')
                 return {'symbol': sym, 'change24': change, 'score': score, 'reasons': reasons,
                         'signal15m': res_15m.get('signal'), 'signal1h': res_1h.get('signal'),
                         'confidence': res_1h.get('confidence'), 'funding': funding, 'oi_change': oi,
                         'close': res_1h.get('close'), 'tp': res_1h.get('tp'), 'sl': res_1h.get('sl'),
-                        'vwap15m': res_15m.get('vwap')}
+                        'vwap15m': res_15m.get('vwap'), 'support15m': support15,
+                        'resistance15m': resistance15, 'fomo_tp': fomo_tp, 'fomo_sl': fomo_sl}
             except Exception as e:
                 logger.warning(f"[PUMP-RADAR] Lỗi phân tích {sym}: {e}")
                 return None
@@ -5769,23 +5785,33 @@ async def detect_pump_candidates(session, limit=6):
 
 
 def _fmt_pump_message(cands, mode="auto"):
-    """Format tin báo pump radar."""
+    """Format tin báo pump radar — kèm KẾ HOẠCH FOMO NGAY (entry/SL/TP cụ thể)."""
     if not cands:
         return None
     lines = ["🚀 *PUMP RADAR — coin đang bay vút, còn nhiên liệu pump tiếp*"]
     for c in cands[:PUMP_MAX_ITEMS]:
-        r_txt = " · ".join(c['reasons'][:3])
         sym_disp = display_symbol(c['symbol'])
+        r_txt = " · ".join(c['reasons'][:3])
+        hot = c['score'] >= 8.0
         lines.append(
-            f"\n• *{sym_disp}* — điểm sức khỏe {c['score']:.1f}/10 🔥\n"
+            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {'🔥🔥 FOMO NGAY ĐƯỢC' if hot else '🔥'}\n"
             f"  Giá {format_price(c['close'])} (+{c['change24']:.1f}%/24h) | 15m {c['signal15m']} / 1h {c['signal1h']} ({c['confidence']})\n"
             f"  {r_txt}\n"
-            f"  TP gợi ý {format_price(c['tp'])} | SL {format_price(c['sl'])}"
         )
+        if hot:
+            rr = abs((c['fomo_tp'] or 0) - c['close']) / (abs(c['close'] - (c['fomo_sl'] or c['close'])) + 1e-10)
+            lines.append(
+                f"  ⚡ *FOMO ngay* (điểm ≥8, momentum chưa gãy): entry MARKET {format_price(c['close'])}, "
+                f"TP {format_price(c['fomo_tp'])} (R:R 1:{rr:.1f}), SL {format_price(c['fomo_sl'])} (stop scalp -2.5%). "
+                f"Size ≤ 5% vốn, chốt nửa lệnh khi +2%"
+            )
+        else:
+            lines.append(
+                f"  ⏳ *Chờ pullback* về VWAP 15m {format_price(c['vwap15m'])} rồi long — TP {format_price(c['tp'])}, SL {format_price(c['sl'])}"
+            )
     lines.append(
-        "\n⚠️ *Quy tắc FOMO an toàn:* KHÔNG đuổi nến đang chạy — chờ pullback về VWAP 15m/EMA9 rồi vào, "
-        "size ≤ 5-10% vốn, SL ngay dưới đáy nến bùng nổ. Coin đã bay >60%/24h là nhảy dù, lợi nhuận kèm rủi ro cao."
-        + ("" if mode == "auto" else " (bạn vừa yêu cầu quét)")
+        "\n⚠️ Điểm ≥8 = FOMO được vì mọi tầng momentum còn nguyên + nhiên liệu squeeze; 6.5-8 = đuổi giá dễ móm, chờ pullback; <5 = cháy đuồi bỏ qua. "
+        "Coin bay >60%/24h luôn chia nhỏ vào 2 lần, không all-in."
     )
     return "\n".join(lines)
 
@@ -6971,20 +6997,29 @@ def _urlencode_q(q):
 
 async def tool_find_pumpers(session, chat_id, args):
     """Quét coin đang 'bay vút' CÒN nhiên liệu pump tiếp (funding, OI, momentum 15m/1h, volume).
-    Trả về top coins xếp theo điểm sức khỏe 0-10 + TP/SL gợi ý + cảnh báo FOMO."""
+    Trả về top coins xếp theo điểm sức khỏe 0-10 + kế hoạch FOMO ngay (entry/SL/TP) khi điểm ≥8."""
     cands = await detect_pump_candidates(session, limit=8)
     if not cands:
         return "Hiện không có coin nào tăng ≥15%/24h đủ thanh khoản để phân tích pump-continuation."
     lines = ["🚀 *Coin đang bay vút — xếp theo điểm 'còn nhiên liệu pump tiếp'* (0-10):"]
     for c in cands[:6]:
         sym_disp = display_symbol(c['symbol'])
+        hot = c['score'] >= 8.0
         lines.append(
-            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {'🔥' if c['score'] >= 6.5 else ''}\n"
+            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {'🔥🔥 FOMO NGAY ĐƯỢC' if hot else '🔥'}\n"
             f"  Giá {format_price(c['close'])} (+{c['change24']:.1f}%/24h) | 15m {c['signal15m']} / 1h {c['signal1h']} ({c['confidence']})\n"
             f"  {' · '.join(c['reasons'][:3])}\n"
-            f"  TP {format_price(c['tp'])} | SL {format_price(c['sl'])} | VWAP 15m {format_price(c['vwap15m'])}"
         )
-    lines.append("\n⚠️ Khuyên người dùng: KHÔNG đuổi nến — chờ pullback về VWAP 15m/EMA9, size ≤ 5-10% vốn, SL dưới đáy nến bùng nổ. Điểm < 5 = đã cháy đuồi, bỏ qua.")
+        if hot:
+            lines.append(
+                f"  ⚡ *FOMO ngay*: entry MARKET {format_price(c['close'])}, TP {format_price(c['fomo_tp'])}, "
+                f"SL {format_price(c['fomo_sl'])} — size ≤5% vốn, chốt nửa lệnh khi +2%"
+            )
+        else:
+            lines.append(
+                f"  ⏳ Chờ pullback về VWAP 15m {format_price(c['vwap15m'])} — TP {format_price(c['tp'])}, SL {format_price(c['sl'])}"
+            )
+    lines.append("\n⚠️ Điểm ≥8 = mọi tầng momentum còn nguyên → FOMO được với rule trên; 6.5-8 = đuổi giá dễ móm; <5 = cháy đuồi bỏ qua. Không all-in con nào.")
     return "\n".join(lines)
 
 
