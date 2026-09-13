@@ -1665,12 +1665,34 @@ _status_msgs = {}  # chat_id -> [message_id]
 
 def _mark_status_msg(chat_id, message_id):
     if message_id:
+        # Thay thế tuần tự: tin trạng thái mới sẽ xoá tin trạng thái cũ ngay lập tức
+        prev = _status_msgs.get(chat_id, [])
+        if prev:
+            import asyncio as _aio
+            sess = app_session  # session toàn cục gán lúc on_startup
+            if sess:
+                for mid in prev:
+                    _aio.ensure_future(delete_telegram_message(sess, chat_id, mid))
+            _status_msgs[chat_id] = []
         _status_msgs.setdefault(chat_id, []).append(message_id)
 
 
 async def _clear_status_msgs(session, chat_id):
     for mid in _status_msgs.pop(chat_id, []):
         await delete_telegram_message(session, chat_id, mid)
+
+
+
+def _clean_tg(text):
+    """Dọn format AI → Telegram đọc đẹp: bỏ **, #, ---, cột |, khoảng trắng thừa."""
+    if not text:
+        return text
+    text = text.replace('**', '')
+    text = re.sub(r'^#{1,6}\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[-=]{3,}\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*\|\s*', ' — ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 # ═══════════════ AGENT LOOP (AI tự đọc câu hỏi → tự chọn tool — như PNL bot cũ) ═══════════════
@@ -1796,23 +1818,25 @@ async def _agent_execute(session, chat_id, name, args):
                     fetched = await tool_fetch_url(session, m.group(0).rstrip('.,)'))
                     break
         system = (
-            "Bạn là chuyên gia soi kèo bóng đá. Lịch trận + kết quả đã có ở tin nhắn user — dùng nó làm dữ liệu chính. "
-            "Chấm 6 yếu tố MỖI YẾU TỐ 1-5 ĐIỂM: phong_do (form 5 trận, sân nhà/khách), doi_dau (gặp gần nhất, derby), "
-            "dong_luc (đua vô địch/trụ hạng/cúp/derby), luc_luong (chấn thương/đội hình mạnh), loi_choi (tấn công/phòng ngự, "
-            "góc/thẻ khi soi kèo đó), boi_canh (sân nhà/khách, lịch dày). Dữ liệu thiếu thì dùng kiến thức bóng đá của mày "
-            "và ghi chú '(ước lượng)'. KHÔNG BAO GIỜ để điểm 0/30 — luôn cho điểm thực tế. "
-            "Sau đó chọn 4-6 kèo tự tin nhất: 1X2, tài xỉu bàn, Asian Handicap, BTTS, tài xỉu thẻ, tài xỉu góc "
-            "(kèo nào thiếu cơ sở thì bỏ, không cần đủ 6). Xác suất prob (%) phản ánh đúng mức chắc chắn. "
-            "Chỉ trả JSON DUY NHẤT: {\"match\":\"A vs B\",\"datetime\":\"13/09 22:30 VN\",\"league\":\"PL\","
-            "\"diem\":{\"phong_do\":4,\"doi_dau\":3,\"dong_luc\":5,\"luc_luong\":4,\"loi_choi\":3,\"boi_canh\":4},"
-            "\"picks\":[{\"market\":\"1X2\",\"selection\":\"Home\",\"prob\":58}],\"reasoning\":\"2-3 câu\"}. "
-            "Không tìm được trận hợp lệ: {\"not_found\": true}"
+            "Bạn là chuyên gia soi kèo bóng đá CHUYÊN SÂU của anh Quốc — phân tích càng kỹ càng tốt, không giới hạn độ dài. "
+            "Dữ liệu trận (lịch, kết quả gần đây) có trong tin nhắn user — dùng làm nền tảng, kết hợp kiến thức bóng đá của mày.\n"
+            "Cấu trúc bài phân tích:\n"
+            "1. Thông tin trận: giải, ngày giờ VN, sân, tính chất (derby/đua top...)\n"
+            "2. Phong độ 2 đội: 5 trận gần nhất, sân nhà/khách, số bàn ghi/thủng\n"
+            "3. Lịch sử đối đầu: kết quả các lần gặp, xu hướng bàn thắng\n"
+            "4. Động lực & bối cảnh: mục tiêu mùa giải, lịch thi đấu, yếu tố tâm lý\n"
+            "5. Lực lượng & lối chơi: đội hình, chấn thương (nếu biết), phong cách, điểm yếu\n"
+            "6. NHẬN ĐỊNH KÈO cho từng loại: 1X2, tài xỉu bàn, châu Á, BTTS, tài xỉu thẻ, tài xỉu góc — "
+            "mỗi kèo nêu rõ lựa chọn + mức tin cậy % + 1 câu lý do. Kèo nào không đủ cơ sở thì nói thẳng.\n"
+            "7. Chốt: kèo tự tin nhất + combo nếu có + cảnh báo rủi ro.\n"
+            "Trình bày dễ đọc trên Telegram: tiêu đề in hoa, gạch đầu dòng '- ', KHÔNG dùng bảng markdown (| |), "
+            "KHÔNG dùng ký tự ** hay ###. Dữ liệu thiếu thì ghi '(ước lượng)' — tuyệt đối không bịa số liệu cụ thể."
         )
         data_block = fetched[:2500] if fetched else f"Kết quả web (không có dữ liệu Sky):\n{web}"
         text, err = await get_ai_response(session, [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}"},
-        ], max_tokens=1800, timeout_s=150)
+        ], max_tokens=4000, timeout_s=180)
         if err:
             return f"Lỗi phân tích: {err}"
         if 'not_found' in text or 'không tìm được trận' in text.lower() or 'không tìm thấy trận' in text.lower():
@@ -1831,7 +1855,7 @@ async def _agent_execute(session, chat_id, name, args):
             'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'), 'kickoff_vn': '?', 'home': '', 'away': '',
         }
         _save_predictions()
-        return text[:3500]
+        return _clean_tg(text)[:4000]
     if name == 'my_stats':
         graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
         wins = [p for p in graded if p['status'] == 'win']
@@ -1863,7 +1887,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
     )
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Bạn là PNL FOOTBALL BOT của anh Quốc — trợ lý bóng đá, không phải trợ lý lập trình MintRouter.\n\nCâu hỏi: {question}"}]
-    for _ in range(5):
+    for _ in range(8):
         api_key = os.getenv("DASH_TOKEN")
         model = os.getenv("DASH_MODEL", "glm-5.3")
         data = None
@@ -1872,7 +1896,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                 timeout = aiohttp.ClientTimeout(total=150)
                 async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
                                         json={"model": model, "messages": messages, "tools": AGENT_TOOLS,
-                                              "temperature": 0.3, "max_tokens": 2000},
+                                              "temperature": 0.3, "max_tokens": 4000},
                                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                                         timeout=timeout) as resp:
                     if resp.status in (502, 503, 504):
@@ -1908,7 +1932,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         msg = (data.get('choices', [{}])[0].get('message') or {})
         tool_calls = msg.get('tool_calls') or []
         if not tool_calls:
-            content = (msg.get('content') or '').strip()
+            content = _clean_tg(msg.get('content') or '').strip()
             if content:
                 await send_telegram_message(session, chat_id, content, reply_to=reply_to)
             else:
@@ -2095,9 +2119,14 @@ async def _handle_update_safe(session, update):
 
 # ═══════════════ STARTUP ═══════════════
 
+app_session = None
+
+
 async def on_startup(app):
+    global app_session
     logger.info("⚽ PNL FOOTBALL BOT khởi động...")
     app['session'] = aiohttp.ClientSession()
+    app_session = app['session']
     _load_fb_quota()
     _load_predictions()
     _load_llm_usage()
