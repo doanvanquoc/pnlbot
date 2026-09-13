@@ -804,7 +804,102 @@ async def get_api_prediction(session, fixture_id):
     return txt
 
 
-# ═══════════════ ĐỌC TRẬN + AI DỰ ĐOÁN ═══════════════
+# ═══════════════ WEB TOOLS (AI tự tìm kiếm — Bing miễn phí) ═══════════════
+
+def _decode_bing_href(href):
+    href = href.replace('&amp;', '&')
+    if href.startswith('https://www.bing.com/ck/'):
+        m = re.search(r'u=a1([A-Za-z0-9\-_]+)', href)
+        if m:
+            b64 = m.group(1)
+            b64 += '=' * (-len(b64) % 4)
+            import base64
+            try:
+                return base64.urlsafe_b64decode(b64).decode('utf-8', 'ignore')
+            except Exception:
+                return href
+    return href
+
+
+async def _web_search_bing(session, query, max_results=8):
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with session.get("https://www.bing.com/search",
+                               params={'q': query, 'count': max_results},
+                               headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+                                        "Accept-Language": "vi,en;q=0.8"},
+                               timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text(errors='ignore')
+    except Exception:
+        return None
+    results = []
+    for m in re.finditer(r'<li class="b_algo".*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>(.*?)</li>', html, re.S):
+        href, title_html, rest = m.groups()
+        title = re.sub(r'<[^>]+>', '', title_html).strip()
+        href = _decode_bing_href(href)
+        snip_m = re.search(r'<p[^>]*>(.*?)</p>', rest, re.S)
+        snip = re.sub(r'<[^>]+>', '', snip_m.group(1)).strip() if snip_m else ''
+        if title and href.startswith('http'):
+            results.append((title, href, snip))
+        if len(results) >= max_results:
+            break
+    return results or None
+
+
+async def tool_web_search(session, query, max_results=8):
+    """Tìm web (Bing, free). Trả về text: title + url + snippet."""
+    results = await _web_search_bing(session, query, max_results)
+    if not results:
+        return f"Không tìm thấy kết quả web nào cho '{query}'."
+    lines = [f"🔎 Kết quả web cho '{query}':"]
+    for i, (title, href, snip) in enumerate(results, 1):
+        lines.append(f"{i}. {title} — {href}" + (f"\n   {snip[:160]}" if snip else ""))
+    return "\n".join(lines)
+
+
+async def tool_fetch_url(session, url):
+    """Đọc nội dung 1 trang web (text thô). Fallback Jina Reader khi trang JS/anti-bot."""
+    if not url.startswith(('http://', 'https://')):
+        return "LỖI: url không hợp lệ."
+    raw, ctype = None, ''
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with session.get(url, timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "Accept-Language": "vi,en;q=0.8"}) as resp:
+            if resp.status == 200:
+                ctype = resp.headers.get('Content-Type', '')
+                if 'html' in ctype or 'text' in ctype or 'json' in ctype:
+                    raw = await resp.text(errors='ignore')
+    except Exception:
+        raw = None
+    need_jina = (raw is None or len(raw) < 800
+                 or re.search(r'enable javascript|requires javascript|just a moment|human verification|captcha', (raw or '')[:3000], re.I))
+    if need_jina:
+        try:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with session.get(f"https://r.jina.ai/{url}", timeout=timeout) as resp:
+                if resp.status == 200:
+                    md = await resp.text(errors='ignore')
+                    if len(md) > 200 and 'Human Verification' not in md[:500]:
+                        raw, ctype = md, 'text/markdown'
+        except Exception:
+            pass
+    if raw is None:
+        return f"Không đọc được trang ({url}) — bị chặn hoặc lỗi mạng."
+    if ctype and 'markdown' not in ctype:
+        raw = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw, flags=re.S | re.I)
+        raw = re.sub(r'<[^>]+>', ' ', raw)
+        raw = raw.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        raw = re.sub(r'\s+', ' ', raw).strip()
+    if not raw:
+        return "Trang rỗng hoặc chỉ toàn script."
+    return raw[:4000]
+
+
+# ═══════════════ ĐỌC TRẬN + AI DỰ ĐOÁN (AI for one) ═══════════════
 
 PICK_MARKETS = {
     'HOME': '1X2 đội nhà thắng', 'DRAW': '1X2 hòa', 'AWAY': '1X2 đội khách thắng',
@@ -1069,65 +1164,112 @@ async def send_chat_action(session, chat_id, action='typing'):
 
 
 async def cmd_keo(session, chat_id, arg=None):
+    """/kèo <tên đội>: AI tự tìm trận qua web + phân tích. Sau đó bot hỏi odds 1xBet để tính EV."""
     query = (arg or '').strip()
     if not query:
         await send_telegram_message(session, chat_id, "Nhập tên đội: `/kèo mu`, `/kèo arsenal`, `/kèo mu vs mc`...")
         return
-    # Lấy danh sách trận 4 ngày (cache 10 phút — chỉ 1 call API)
-    await send_telegram_message(session, chat_id, f"⏳ Đang xử lý '{query}'...")
-    all_fx = []
-    today = datetime.now(TZ_VN)
-    for offset in range(0, 4):
-        dstr = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
-        fxs, err = await get_fixtures_for_date(session, dstr)
-        if err:
-            await send_telegram_message(session, chat_id, f"❌ Lỗi dữ liệu trận: {err}")
-            return
-        all_fx.extend(fxs or [])
-    if not all_fx:
-        await send_telegram_message(session, chat_id, "Không có trận nào trong 4 ngày tới (các giải theo dõi).")
-        return
-    # AI ĐỨNG ĐẦU: tự hiểu mọi tên (mu, quỷ đỏ, tên Việt, tiếng Anh...) và chọn trận
-    fx_list = "\n".join(f"ID {fx['fixture']['id']} | {_vn_time(fx['fixture']['date'])} | {fx['league'].get('name', '?')} | {fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
-                        for fx in all_fx[:45])
+    await send_telegram_message(session, chat_id, f"🧠 AI đang tự tìm trận + phân tích '{query}'... (chờ 30-90 giây)")
     await send_chat_action(session, chat_id)
-    chosen, jerr = await get_ai_json(
-        session,
-        "Bạn là trợ lý tìm trận của PNL FOOTBALL BOT. Người dùng gõ tên đội kiểu lóng/viết tắt/tiếng Việt "
-        "(mu=Man United, quỷ đỏ=Man United, barca=Barcelona, mc=Man City...). "
-        "Nhiệm vụ: chọn TRẬN ĐẤU liên quan nhất tới yêu cầu. "
-        "Ưu tiên trận SẮP ĐÁ (trong tương lai), cùng giải lớn. Trả về JSON: {\"fixture_id\": số} hoặc {\"not_found\": true}.",
-        f"Người dùng tìm: '{query}'\n\nDanh sách trận:\n{fx_list}")
-    fixture = None
-    if not jerr and chosen and not chosen.get('not_found'):
-        fid = str(chosen.get('fixture_id', ''))
-        for fx in all_fx:
-            if str(fx['fixture']['id']) == fid:
-                fixture = fx
-                break
-    if not fixture:
-        msg = f"🤷 Không tìm được trận nào khớp '{query}'.\n\n*Trận đang có trong 3 ngày tới:*\n"
-        seen = []
-        for fx in all_fx[:20]:
-            s = f"{fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
-            if s not in seen:
-                seen.append(s)
-                msg += f"• {s}\n"
-        await send_long_message(session, chat_id, msg)
-        return
-    await send_chat_action(session, chat_id)
-    await send_telegram_message(
-        session, chat_id,
-        f"⚽ *ĐANG SOI: {fixture['teams']['home']['name']} vs {fixture['teams']['away']['name']}*\n"
-        f"({_vn_time(fixture['fixture']['date'])}) — đang lấy odds, đối đầu, phân tích AI... chờ ~1 phút")
-    pred, err = await analyze_match(session, fixture)
+    now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
+    search_q = f"football {query} match schedule {now_str}"
+    web = await tool_web_search(session, search_q, 6)
+    system = (
+        "Bạn là PNL FOOTBALL BOT — chuyên gia soi kèo bóng đá (bot do anh Quốc đẹp trai tự tay code). "
+        "Nhiệm vụ: dựa vào kết quả web + kiến thức bóng đá, xác định trận đấu SẮP TỚI hoặc liên quan nhất của đội được hỏi "
+        "(ai đấu ai, ngày giờ VN, giải gì), phân tích phong độ, đối đầu, lối chơi, động lực. "
+        "Chọn MỘT kèo mày tự tin nhất (1X2 / tài xỉu / châu Á / BTTS...) kèm xác suất % và lý do ngắn. "
+        "Trả về JSON: {\"match\": \"A vs B\", \"datetime\": \"ngày giờ giờ VN\", \"league\": \"...\", "
+        "\"market\": \"1X2 hoặc Tài xỉu 2.5 hoặc Asian Handicap...\", \"selection\": \"chi tiết kèo\", \"prob\": 55, "
+        "\"reasoning\": \"...\"}. Nếu không xác định được trận nào: {\"not_found\": true, \"note\": \"...\"}"
+    )
+    pred, err = await get_ai_json(session, system,
+                                  f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {query}.\n\nKết quả web:\n{web}")
     if err:
-        await send_telegram_message(session, chat_id, f"❌ Lỗi phân tích: {err}")
+        await send_telegram_message(session, chat_id, f"❌ AI lỗi: {err}")
         return
-    predictions[pred['fixture_id']] = pred
+    if pred.get('not_found'):
+        await send_telegram_message(session, chat_id,
+            f"🤷 AI không xác định được trận nào cho '{query}'. Thử: /kèo mu, /kèo real madrid, /kèo mu vs mc.")
+        return
+    record = {
+        'match': str(pred.get('match') or query),
+        'datetime': str(pred.get('datetime') or '?'),
+        'league': str(pred.get('league') or '?'),
+        'market': str(pred.get('market') or '?'),
+        'selection': str(pred.get('selection') or '?'),
+        'prob': max(1.0, min(float(pred.get('prob', 50)), 99.0)),
+        'odds': None, 'ev': None,
+        'reasoning': str(pred.get('reasoning') or '')[:500],
+        'status': 'pending', 'result': None, 'graded': None,
+        'fixture_id': f"web_{int(time.time())}_{chat_id}",
+        'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
+        'kickoff_vn': str(pred.get('datetime') or '?'),
+        'home': '', 'away': '',
+    }
+    predictions[record['fixture_id']] = record
     _save_predictions()
-    lines = ["⚽ *PHÂN TÍCH KÈO*", _pred_line(pred)]
-    await send_telegram_message(session, chat_id, "\n\n".join(lines))
+    await send_telegram_message(session, chat_id,
+        "⚽ *KÈO AI CHỌN:*\n"
+        f"Trận: {record['match']} ({record['datetime']}) [{record['league']}]\n"
+        f"→ *{record['market']} — {record['selection']}* (xác suất {record['prob']:.0f}%)\n"
+        f"Lý do: {record['reasoning']}\n\n"
+        "💰 *Dán odds 1xBet của trận này vào* để bot tính EV chính xác (mày đang mở app mà).\n"
+        "Vd: `tx2.5 1.90 1.95`, `1x2 2.40 3.60 2.80`, `hdc 1.85 2.00`")
+
+
+def _parse_odds_msg(text):
+    """Nhận diện tin nhắn chứa odds dán từ app: 'tx2.5 1.90 1.95', '1x2 2.40 3.60 2.80'..."""
+    t = text.lower().strip()
+    m = re.match(r'^(tx|tài|xỉu|over|under)?\s*(\d+(?:\.\d+)?)\s*[:=]?\s*([\d\.\s,]+)$', t)
+    if m:
+        odds = [float(x) for x in re.findall(r'\d+(?:\.\d+)?', m.group(3))]
+        return 'ou', float(m.group(2)), odds
+    m = re.match(r'^(1x2|hdc|btts)\s*[:=]?\s*([\d\.\s,]+)$', t)
+    if m:
+        odds = [float(x) for x in re.findall(r'\d+(?:\.\d+)?', m.group(2))]
+        return m.group(1), None, odds
+    return None
+
+
+async def handle_odds_reply(session, chat_id, text):
+    """Mày dán odds → tính EV cho dự đoán AI pending gần nhất. Trả về True nếu xử lý được."""
+    parsed = _parse_odds_msg(text)
+    if not parsed:
+        return False
+    pendings = [p for p in predictions.values()
+                if p.get('status') == 'pending' and p.get('fixture_id', '').startswith('web_')]
+    if not pendings:
+        return False
+    p = max(pendings, key=lambda x: x.get('graded') or 0) if False else pendings[-1]
+    market, line, odds = parsed
+    if market == '1x2':
+        sel = (p.get('selection') or '').lower()
+        idx = 0 if ('home' in sel or 'chủ' in sel or 'đội nhà' in sel) else (2 if ('away' in sel or 'khách' in sel or 'đội khách' in sel) else 1)
+        if idx >= len(odds):
+            return False
+        p['odds'] = odds[idx]
+    elif market == 'ou':
+        if line > 0:
+            p['market'] = f"Tài xỉu {line}"
+        sel = (p.get('selection') or '').lower()
+        if ('xỉu' in sel or 'under' in sel) and len(odds) > 1:
+            p['odds'] = odds[1]
+        else:
+            p['odds'] = odds[0]
+    else:
+        return False
+    if not p['odds']:
+        return False
+    p['ev'] = round(p['prob'] / 100 * p['odds'] - 1, 3)
+    _save_predictions()
+    ev = p['ev']
+    badge = "💰 VALUE — đáng đánh" if ev > 0.05 else ("⚖️ cân bằng" if ev > -0.05 else "⚠️ KÈO ĐẮT — không nên đánh")
+    await send_telegram_message(session, chat_id,
+        f"📊 *EV với odds {p['odds']} (1xBet):*\n"
+        f"Kèo: {p['market']} — {p['selection']} | Xác suất AI {p['prob']:.0f}%\n"
+        f"→ EV = {ev:+.1%} → *{badge}*")
+    return True
 
 
 async def cmd_kq(session, chat_id, arg=None):
@@ -1478,8 +1620,11 @@ async def handle_update(session, update):
     elif command_base == '/model':
         await handle_model_command(session_http, chat_id)
     else:
-        # Tin nhắn tự do → AI trò chuyện bóng đá
-        await ai_chat(session_http, chat_id, text, msg.get('message_id'))
+        # Tin nhắn odds dán từ app 1xBet → tính EV cho kèo AI đang chờ
+        handled = await handle_odds_reply(session_http, chat_id, text)
+        if not handled:
+            # Tin nhắn tự do → AI trò chuyện bóng đá
+            await ai_chat(session_http, chat_id, text, msg.get('message_id'))
 
 
 async def ai_chat(session, chat_id, question, reply_to=None):
