@@ -2474,11 +2474,12 @@ async def _agent_execute(session, chat_id, name, args):
                         if 'ĐANG ĐÁ' in ln:
                             break  # ưu tiên trận đang đá
             # Bước2: fallback — trận ĐANG ĐÁ hoặc SẮP ĐÁ đầu tiên
-            if not target_ln:
+            # CHỈ dùng fallback generic khi query KHÔNG có "vs" (không phải yêu cầu trận cụ thể)
+            if not target_ln and ' vs ' not in q_teams and ' v ' not in q_teams:
                 for ln in fetched.split('\n'):
                     if 'ĐANG ĐÁ' in ln:
                         target_ln = ln; break
-            if not target_ln:
+            if not target_ln and ' vs ' not in q_teams and ' v ' not in q_teams:
                 for ln in fetched.split('\n'):
                     if 'SẮP ĐÁ' in ln:
                         target_ln = ln; break
