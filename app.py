@@ -1670,7 +1670,15 @@ async def _agent_execute(session, chat_id, name, args):
         now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
         web = await tool_web_search(session, f"{q} football next match schedule {now_str}", 6)
         fetched = ""
-        if web and not web.startswith("Không"):
+        # Luôn thử Sky Sports: URL chuẩn theo tên đội — trang này đọc được, đầy đủ lịch trận thật
+        slug = re.sub(r'[^a-z0-9]+', '-', q.lower()).strip('-')
+        for cand in (f"https://www.skysports.com/{slug}-fixtures",
+                     f"https://www.skysports.com/{slug}-scores-fixtures"):
+            pg = await tool_fetch_url(session, cand)
+            if pg and not pg.startswith(("Không", "LỖI")) and len(pg) > 600:
+                fetched = pg
+                break
+        if not fetched and web and not web.startswith("Không"):
             lines = web.split("\n")
             for ln in lines:
                 m = re.search(r'https?://\S+', ln)
