@@ -716,34 +716,29 @@ async def get_fixtures_for_date(session, date_str, only_tracked=True):
 
 
 async def get_match_odds(session, fixture_id):
-    """Odds 1X2 + O/U 2.5 + BTTS của trận. Trả về dict rút gọn hoặc None."""
+    """Odds ĐẦY ĐỦ mọi market của nhà cái chính (Bet365) — trả về dict giữ nguyên tên market gốc:
+    {'bookmaker': str, 'markets': {'Goals Over/Under': {'Over 2.5': 1.9, 'Under 2.5': 1.98}, ...}}
+    Không sàng lọc market — AI tự chọn kèo hay nhất trong những gì nhà cái mở."""
     data, err = await fb_get(session, "/odds", {'fixture': fixture_id})
     if err or not data:
         return None
-    # Dùng bookmaker đầu tiên (Bet365 ưu tiên), bet ids: 1=Match Winner, 5=Goals O/U, 8=Both Teams Score
     for entry in data:
         for bm in entry.get('bookmakers', []):
-            if bm.get('id') == 8:  # Bet365
-                odds = {'bookmaker': bm.get('name', '?'), '1X2': {}, 'OU25': {}, 'BTTS': {}}
+            if bm.get('id') == 8:  # Bet365 — odds chuẩn
+                markets = {}
                 for bet in bm.get('bets', []):
-                    if bet.get('id') == 1:
-                        for v in bet.get('values', []):
-                            odds['1X2'][v.get('value', '')] = float(v.get('odd', 0) or 0)
-                    elif bet.get('id') == 5:
-                        for v in bet.get('values', []):
-                            label = v.get('value', '')
-                            if 'Over' in label and '2.5' in label:
-                                odds['OU25']['Over'] = float(v.get('odd', 0) or 0)
-                            elif 'Under' in label and '2.5' in label:
-                                odds['OU25']['Under'] = float(v.get('odd', 0) or 0)
-                    elif bet.get('id') == 8:
-                        for v in bet.get('values', []):
-                            label = v.get('value', '')
-                            if 'Yes' in label:
-                                odds['BTTS']['Yes'] = float(v.get('odd', 0) or 0)
-                            elif 'No' in label:
-                                odds['BTTS']['No'] = float(v.get('odd', 0) or 0)
-                return odds
+                    vals = {}
+                    for v in bet.get('values', []):
+                        try:
+                            o = float(v.get('odd', 0) or 0)
+                        except Exception:
+                            continue
+                        if o > 1.01:
+                            vals[v.get('value', '')] = o
+                    if vals:
+                        markets[bet.get('name', '?')] = vals
+                if markets:
+                    return {'bookmaker': bm.get('name', 'Bet365'), 'markets': markets}
     return None
 
 
@@ -783,53 +778,84 @@ PICK_MARKETS = {
 
 
 async def analyze_match(session, fixture):
-    """Phân tích 1 trận: odds + h2h + API prediction → AI dự đoán JSON.
-    Trả về (dict dự đoán | None, err)."""
+    """Phân tích 1 trận: odds ĐẦY ĐỦ (1X2, tài/xỉu, handicap, góc, thẻ...) + h2h + API prediction
+    → AI chọn kèo hay nhất trong market nhà cái mở, tính EV. Trả về (dict dự đoán, None | None, err)."""
     fx_id = str(fixture['fixture']['id'])
     odds = await get_match_odds(session, fx_id)
     if not odds:
-        odds = {}
+        odds = {'bookmaker': '?', 'markets': {}}
     h2h = await get_h2h_summary(session, fixture['teams']['home']['id'], fixture['teams']['away']['id'])
     api_pred = await get_api_prediction(session, fx_id)
-    odds_txt = (f"Odds {odds.get('bookmaker', 'nhà cái')}: 1X2 {odds.get('1X2', {})}, "
-                f"O/U 2.5 {odds.get('OU25', {})}, BTTS {odds.get('BTTS', {})}") if odds else "Không có odds (kèo chưa mở)"
+    # Dòng odds: tên market + selection — giới hạn để prompt không quá dài
+    mk_lines = []
+    for name, vals in odds['markets'].items():
+        vs = ", ".join(f"{k}: {v}" for k, v in list(vals.items())[:12])
+        mk_lines.append(f"- {name}: {vs}")
+    odds_txt = f"Odds {odds['bookmaker']}:\n" + ("\n".join(mk_lines) if mk_lines else "Không có odds (kèo chưa mở)")
     user_prompt = (
-        f"Trận đấu:\n{_fixture_line(fixture)}\n\n"
-        f"{odds_txt}\n\n{h2h}\n\n{api_pred}\n\n"
-        f"Phân tích phong độ, đối đầu, kèo — chọn MỘT kèo (HOME/DRAW/AWAY/OVER25/UNDER25/BTTS_YES/BTTS_NO), "
-        f"đánh giá xác suất (%) và so odds để tìm value bet (xác suất AI × odds > 1 = đáng đánh)."
+        f"Trận đấu:\n{_fixture_line(fixture)}\n\n{odds_txt}\n\n{h2h}\n\n{api_pred}\n\n"
+        "Nhiệm vụ: soi TOÀN BỘ các market trên (1X2, tài xỉu mọi line, handicap châu Á, phạt góc, thẻ phạt, BTTS...), "
+        "tìm kèo CÓ VALUE NHẤT (xác suất thật của mày × odds > 1). Chọn MỘT kèo: dùng đúng 'tên market' và 'selection' "
+        "đúng y nguyên như trong danh sách odds trên (không tự sáng tạo kèo nhà cái không mở)."
     )
     system_prompt = (
         "Bạn là chuyên gia soi kèo bóng đá của PNL FOOTBALL BOT (bot do anh Quốc — đẹp trai, giỏi nhất quả đất — tự tay xây dựng). "
-        "Phân tích thực dụng: phong độ gần đây, đối đầu, động lực, lực lượng; kết hợp odds nhà cái để tìm VALUE (xác suất thật > xác suất odds). "
-        "Không để ý kiến API-Fobile định hướng mù quáng — chê/c'value tùy phân tích của mày."
+        "Phân tích thực dụng: phong độ, đối đầu, động lực, lối chơi (về góc/thẻ: đội có biên lấn hay rút đè, VAR, derbì...). "
+        "So odds nhà cái để tìm VALUE — xác suất thật > xác suất odds phản ánh."
     )
     pred, err = await get_ai_json(session, system_prompt, user_prompt)
     if err:
         return None, err
-    pick = str(pred.get('pick', '')).upper().replace(' ', '').replace('.', '')
-    if pick not in PICK_MARKETS:
-        pick = next((k for k in PICK_MARKETS if k in pick), None)
-        if not pick:
-            return None, f"AI chọn kèo lạ: {pred.get('pick')}"
-    prob = float(pred.get('prob', 50))
-    prob = max(1.0, min(prob, 99.0))
+    market = str(pred.get('market', '')).strip()
+    selection = str(pred.get('selection', '')).strip()
+    prob = max(1.0, min(float(pred.get('prob', 50)), 99.0))
+    # Tìm odds: khớp chính xác trước, fuzzy sau (case/spaces)
     odds_val = None
-    if pick in ('HOME', 'DRAW', 'AWAY'):
-        odds_val = odds.get('1X2', {}).get({'HOME': 'Home', 'DRAW': 'Draw', 'AWAY': 'Away'}.get(pick))
-    elif pick in ('OVER25', 'UNDER25'):
-        odds_val = odds.get('OU25', {}).get('Over' if pick == 'OVER25' else 'Under')
-    elif pick in ('BTTS_YES', 'BTTS_NO'):
-        odds_val = odds.get('BTTS', {}).get('Yes' if pick == 'BTTS_YES' else 'No')
+    if market and selection:
+        vals = odds['markets'].get(market) or next(
+            (v for k, v in odds['markets'].items() if _normalize_team(k) == _normalize_team(market)), None)
+        if vals:
+            odds_val = vals.get(selection)
+            if odds_val is None:
+                for k, v in vals.items():
+                    if _normalize_team(k) == _normalize_team(selection) or _normalize_team(k) in _normalize_team(selection) or _normalize_team(selection) in _normalize_team(k):
+                        odds_val = v
+                        break
     ev = (prob / 100 * odds_val - 1) if odds_val else None
     return {'fixture_id': fx_id, 'date': fixture['fixture']['date'][:10],
             'kickoff_vn': _vn_time(fixture['fixture']['date']),
             'league': fixture.get('league', {}).get('name', '?'),
             'home': fixture['teams']['home']['name'], 'away': fixture['teams']['away']['name'],
-            'pick': pick, 'market': PICK_MARKETS[pick], 'prob': prob,
+            'market': market, 'selection': selection, 'prob': prob,
             'odds': odds_val, 'ev': round(ev, 3) if ev is not None else None,
             'reasoning': str(pred.get('reasoning', ''))[:600],
             'status': 'pending', 'result': None, 'graded': None}, None
+
+
+def _grade_stats_market(p, fixture, stats):
+    """Chấm kèo góc/thẻ bằng số liệu trận (stats: {'corners': {team: n}, 'yellows': {...}, 'reds': {...}})."""
+    market = (p.get('market') or '').lower()
+    sel = p.get('selection') or ''
+    sel_low = sel.lower()
+    corners_total = sum((stats.get('corners') or {}).values())
+    cards_total = sum((stats.get('yellows') or {}).values()) + sum((stats.get('reds') or {}).values())
+    if 'corner' in market:
+        m = re.search(r'(\d+\.5|\d+)', sel_low)
+        line = float(m.group(1)) if m else 9.5
+        if 'over' in sel_low or 'trên' in sel_low:
+            return ('win' if corners_total > line else ('push' if corners_total == line else 'loss')), f"tổng góc {corners_total}"
+        if 'under' in sel_low or 'dưới' in sel_low:
+            return ('win' if corners_total < line else ('push' if corners_total == line else 'loss')), f"tổng góc {corners_total}"
+        return None, None
+    if 'card' in market or 'booking' in market:
+        m = re.search(r'(\d+\.5|\d+)', sel_low)
+        line = float(m.group(1)) if m else 3.5
+        if 'over' in sel_low:
+            return ('win' if cards_total > line else ('push' if cards_total == line else 'loss')), f"tổng thẻ {cards_total}"
+        if 'under' in sel_low:
+            return ('win' if cards_total < line else ('push' if cards_total == line else 'loss')), f"tổng thẻ {cards_total}"
+        return None, None
+    return None, None
 
 
 def _pred_line(p, show_ev=True):
@@ -841,8 +867,11 @@ def _pred_line(p, show_ev=True):
     o_txt = f" @ odds {p['odds']}" if p.get('odds') else ""
     star = "🔥" if (p.get('ev') or -1) > 0.08 else ("⭐" if (p.get('prob') or 0) >= 65 else "•")
     return (f"{star} {p['kickoff_vn']} [{p['league']}] {p['home']} vs {p['away']}\n"
-            f"   → CHỌN: {p['market']} (xác suất {p['prob']:.0f}%){o_txt}{ev_txt}\n"
+            f"   → CHỌN: {p['market']} — {p['selection']} (xác suất {p['prob']:.0f}%){o_txt}{ev_txt}\n"
             f"   {p['reasoning'][:220]}")
+
+
+lich_cache = {}  # chat_id -> {'fixtures': [...], 'ts': ...}
 
 
 async def cmd_lich(session, chat_id, arg=None):
@@ -863,10 +892,51 @@ async def cmd_lich(session, chat_id, arg=None):
     if not fixtures:
         await send_telegram_message(session, chat_id, f"Không có trận nào ngày {date_str} trong các giải theo dõi.")
         return
-    lines = [f"📅 *LỊCH TRẬN {date_str}* — {len(fixtures)} trận:"]
-    for fx in fixtures[:25]:
-        lines.append(_fixture_line(fx))
-    await send_long_message(session, chat_id, "\n".join(lines))
+    lich_cache[chat_id] = {'fixtures': fixtures, 'ts': time.time()}
+    # Gom theo giải cho đỡ rối mắt
+    by_league = {}
+    for fx in fixtures:
+        by_league.setdefault(fx['league'].get('name', '?'), []).append(fx)
+    lines = [f"📅 *LỊCH TRẬN {date_str}* — {len(fixtures)} trận"]
+    kb = []
+    for league, fxs in sorted(by_league.items()):
+        lines.append(f"\n🏆 *{league}*")
+        for fx in fxs[:10]:
+            goals = fx.get('goals', {})
+            status = fx['fixture']['status'].get('short', '')
+            time_vn = _vn_time(fx['fixture']['date'])[6:]  # chỉ HH:MM
+            score = ""
+            if status in ('FT', '1H', '2H', 'HT', 'LIVE'):
+                score = f"  {goals.get('home')}-{goals.get('away')}" + (" 🟢 live" if status not in ('FT',) else " ⚪")
+            h, a = fx['teams']['home']['name'], fx['teams']['away']['name']
+            lines.append(f"  {time_vn} {h} - {a}{score}")
+            kb.append([{"text": f"🎯 {h} vs {a}", "callback_data": f"keo:{fx['fixture']['id']}"}])
+    kb.append([{"text": "🔄 Làm mới", "callback_data": f"lichrefresh:{date_str}"}])
+    await send_long_message(session, chat_id, "\n".join(lines), reply_markup={"inline_keyboard": kb[:40]})
+
+
+async def handle_keo_callback(session, chat_id, fixture_id):
+    """Bấm nút '🎯 soi kèo' trên lịch → phân tích trận đó ngay."""
+    fx_map = {str(fx['fixture']['id']): fx for fx in lich_cache.get(chat_id, {}).get('fixtures', [])}
+    fixture = fx_map.get(str(fixture_id))
+    if not fixture:
+        await send_telegram_message(session, chat_id, "⏳ Lịch đã cũ — đang lấy lại trận từ API...")
+        fx, err = await fb_get(session, "/fixtures", {'id': fixture_id})
+        if err or not fx:
+            await send_telegram_message(session, chat_id, f"❌ Không lấy được trận ({err or 'rỗng'}).")
+            return
+        fixture = fx[0] if isinstance(fx, list) else fx
+    h, a = fixture['teams']['home']['name'], fixture['teams']['away']['name']
+    await send_chat_action(session, chat_id)
+    await send_telegram_message(session, chat_id,
+        f"⚽ *ĐANG SOI: {h} vs {a}*\n({_vn_time(fixture['fixture']['date'])}) — chờ ~1 phút")
+    pred, err = await analyze_match(session, fixture)
+    if err:
+        await send_telegram_message(session, chat_id, f"❌ Lỗi phân tích: {err}")
+        return
+    predictions[pred['fixture_id']] = pred
+    _save_predictions()
+    await send_telegram_message(session, chat_id, "⚽ *PHÂN TÍCH KÈO*\n\n" + _pred_line(pred))
 
 
 TEAM_ALIASES = {
@@ -1104,30 +1174,97 @@ async def daily_predictions_loop(app):
         await asyncio.sleep(600)  # check mỗi 10 phút, chạy 1 lần/ngày
 
 
+async def _match_stats_summary(session, fixture_id):
+    """Số liệu cuối trận (góc, thẻ...) từ /fixtures?id=. Trả về dict tóm tắt hoặc None."""
+    data, err = await fb_get(session, "/fixtures", {'id': fixture_id})
+    if err or not data:
+        return None
+    fx = data[0] if isinstance(data, list) else data
+    stats = {}
+    for team_stat in fx.get('statistics', []) or []:
+        tname = team_stat.get('team', {}).get('name', '?')
+        for row in team_stat.get('statistics', []) or []:
+            typ = row.get('type', '')
+            val = row.get('value', '')
+            if typ in ('Total Corners', 'Yellow Cards', 'Red Cards', 'Corners'):
+                key = {'Total Corners': 'corners', 'Corners': 'corners',
+                       'Yellow Cards': 'yellows', 'Red Cards': 'reds'}[typ]
+                try:
+                    stats.setdefault(key, {})[tname] = int(val)
+                except Exception:
+                    pass
+    return stats if stats else None
+
+
+def _apply_handicap(line, side_home, gh, ga):
+    """Kết quả kèo handicap châu Á. line như '-1.0', '+0.25' gắn cho side (home=True nếu kèo đội nhà).
+    Trả về 'win'/'loss'/'push'."""
+    try:
+        line = float(line)
+    except Exception:
+        return None
+    adj = gh - ga if side_home else ga - gh
+    diff = adj + line
+    if diff > 0.01:
+        return 'win'
+    if diff < -0.01:
+        return 'loss'
+    return 'push'
+
+
 def _grade_prediction(p, fixture):
-    """Chấm 1 dự đoán theo kết quả thật. Trả về 'win'/'loss'/'push' + result text."""
+    """Chấm 1 dự đoán (mọi market) theo kết quả thật. Trả về ('win'/'loss'/'push', result_text) hoặc (None, None)."""
     gh, ga = fixture['goals']['home'], fixture['goals']['away']
     if gh is None or ga is None:
         return None, None
     gh, ga = int(gh), int(ga)
     total = gh + ga
-    pick = p['pick']
+    market = (p.get('market') or '').lower()
+    sel = p.get('selection') or ''
+    sel_low = sel.lower()
     result_text = f"tỷ số {gh}-{ga}"
-    if pick in ('HOME', 'DRAW', 'AWAY'):
-        outcome = 'HOME' if gh > ga else ('DRAW' if gh == ga else 'AWAY')
-        if outcome == pick:
-            return 'win', result_text
-        if gh == ga:
-            return 'push', result_text
-        return 'loss', result_text
-    if pick == 'OVER25':
-        return ('win' if total >= 3 else ('push' if total == 2 else 'loss')), f"tổng {total} bàn"
-    if pick == 'UNDER25':
-        return ('win' if total <= 2 else ('push' if total == 2 else 'loss')), f"tổng {total} bàn"
-    if pick == 'BTTS_YES':
-        return ('win' if gh > 0 and ga > 0 else 'loss'), result_text
-    if pick == 'BTTS_NO':
-        return ('win' if gh == 0 or ga == 0 else 'loss'), result_text
+    home_name = (p.get('home') or '').lower()
+    # 1X2
+    if 'match winner' in market:
+        outcome = 'Home' if gh > ga else ('Draw' if gh == ga else 'Away')
+        return ('win' if sel_low.startswith(outcome[:4].lower()) or outcome.lower() in sel_low
+                else 'loss'), result_text
+    if 'double chance' in market:
+        opts = {'1x': gh != ga or gh > ga, '12': gh != ga, 'x2': ga >= gh}
+        for key, val in opts.items():
+            if key in sel_low.replace(' ', ''):
+                return ('win' if val else 'loss'), result_text
+        return None, None
+    # Tài xỉu mọi line: "Goals Over/Under" + selection "Over 2.5"
+    if ('over/under' in market or 'goals o/u' in market or 'totals' in market) and ('corner' not in market) and ('card' not in market):
+        m = re.search(r'(\d+\.5|\d+)', sel_low)
+        line = float(m.group(1)) if m else 2.5
+        if 'over' in sel_low:
+            if total > line:
+                return 'win', f"tổng {total} bàn > {line}"
+            if total == line:
+                return 'push', f"tổng {total} bàn = {line}"
+            return 'loss', f"tổng {total} bàn < {line}"
+        if 'under' in sel_low:
+            if total < line:
+                return 'win', f"tổng {total} bàn < {line}"
+            if total == line:
+                return 'push', f"tổng {total} bàn = {line}"
+            return 'loss', f"tổng {total} bàn > {line}"
+    # Handicap châu Á: "Asian Handicap" selection "Home -1.0"
+    if 'handicap' in market and 'corner' not in market and 'card' not in market:
+        m = re.search(r'([+-]?\d+\.?\d*)', sel)
+        if m:
+            side_home = ('home' in sel_low) or (sel_low.startswith('w1'))
+            return _apply_handicap(m.group(1), side_home, gh, ga), f"{sel} | {gh}-{ga}"
+    # BTTS
+    if 'both teams score' in market or 'btts' in market:
+        yes = ('yes' in sel_low)
+        hit = (gh > 0 and ga > 0)
+        return ('win' if (hit == yes) else 'loss'), result_text
+    # Phạt góc / thẻ phạt: cần số liệu trận
+    if 'corner' in market or 'card' in market or 'booking' in market:
+        return 'needs_stats', None
     return None, None
 
 
@@ -1158,7 +1295,12 @@ async def results_loop(app):
                         if fx['fixture']['status']['short'] != 'FT':
                             continue
                         st, res = _grade_prediction(p, fx)
-                        if st:
+                        if st == 'needs_stats':
+                            stats = await _match_stats_summary(session, fx_id)
+                            if not stats:
+                                continue  # thử lại lượt sau khi có đủ số liệu
+                            st, res = _grade_stats_market(p, fx, stats)
+                        if st and st != 'needs_stats':
                             p['status'] = st
                             p['result'] = res
                             p['graded'] = time.time()
@@ -1206,6 +1348,8 @@ async def handle_update(session, update):
         chat_id = msg_obj.get('chat', {}).get('id')
         if chat_id and cb_data.startswith(('setmodel:', 'modelpage:')):
             await handle_model_callback(session, chat_id, cb_data, message_id=msg_obj.get('message_id'))
+        elif chat_id and cb_data.startswith('keo:'):
+            await handle_keo_callback(session, chat_id, cb_data.partition(':')[2])
         if cb.get('id'):
             token = os.getenv("TELEGRAM_BOT_TOKEN")
             try:
