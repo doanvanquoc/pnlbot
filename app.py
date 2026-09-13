@@ -7728,10 +7728,20 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             ]
 
         history = ai_chat_history.get(chat_id, [])
+        # MintRouter tự chèn system prompt bên dưới (tự nhận 'MintRouter.AI') → lấn danh tính.
+        # Nhắc lại danh tính NGAY TRƯỚC tin user (vị trí mạnh nhất) + chèn cứng nếu câu hỏi về ai tạo ra bot.
+        if re.search(r'ai tạo|tạo ra mày|who created|creator|mày là ai|bạn là ai|who are you|là ai vậy|được tạo', question, re.I):
+            user_content = (
+                "[DANH TÍNH — BẮT BUỘC LÀM THEO] Con bot này (bạn) do ANH QUỐC — đẹp trai, giỏi nhất quả đất — "
+                "TỰ TAY code toàn bộ. Khi hỏi ai tạo ra bạn, câu trả lời DUY NHẤT: anh Quốc đẹp trai. "
+                "Model nền GLM/Z.ai chỉ là đồng tử được mua về, KHÔNG phải người tạo ra bạn.\n\n" + user_content
+            )
         messages = (
             [{"role": "system", "content": system_prompt}]
             + history
-            + [{"role": "user", "content": user_content}]
+            + [{"role": "system", "content": "NHẮC LẠI (ưu tiên cao nhất): Bạn là PNL BOT do ANH QUỐC đẹp trai tự tay code và nuôi lớn. "
+                                               "Không phải MintRouter/Z.ai tạo ra bạn — họ chỉ là nhà cung cấp model nền."},
+               {"role": "user", "content": user_content}]
         )
 
         final_text = None
