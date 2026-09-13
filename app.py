@@ -1071,40 +1071,48 @@ async def send_chat_action(session, chat_id, action='typing'):
 async def cmd_keo(session, chat_id, arg=None):
     query = (arg or '').strip()
     if not query:
-        await send_telegram_message(session, chat_id, "Nhập tên đội: `/kèo arsenal` — không dùng dấu tiếng Việt cũng được (ARS không hợp, dùng tên tiếng Anh).")
+        await send_telegram_message(session, chat_id, "Nhập tên đội: `/kèo mu`, `/kèo arsenal`, `/kèo mu vs mc`...")
         return
-    await send_telegram_message(session, chat_id, f"⏳ Tìm trận '{query}'...")
-    fixture, suggestions = await find_fixture_by_team(session, query)
+    # Lấy danh sách trận 4 ngày (cache 10 phút — chỉ 1 call API)
+    await send_telegram_message(session, chat_id, f"⏳ Đang xử lý '{query}'...")
+    all_fx = []
+    today = datetime.now(TZ_VN)
+    for offset in range(0, 4):
+        dstr = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
+        fxs, err = await get_fixtures_for_date(session, dstr)
+        if err:
+            await send_telegram_message(session, chat_id, f"❌ Lỗi dữ liệu trận: {err}")
+            return
+        all_fx.extend(fxs or [])
+    if not all_fx:
+        await send_telegram_message(session, chat_id, "Không có trận nào trong 4 ngày tới (các giải theo dõi).")
+        return
+    # AI ĐỨNG ĐẦU: tự hiểu mọi tên (mu, quỷ đỏ, tên Việt, tiếng Anh...) và chọn trận
+    fx_list = "\n".join(f"ID {fx['fixture']['id']} | {_vn_time(fx['fixture']['date'])} | {fx['league'].get('name', '?')} | {fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
+                        for fx in all_fx[:45])
+    await send_chat_action(session, chat_id)
+    chosen, jerr = await get_ai_json(
+        session,
+        "Bạn là trợ lý tìm trận của PNL FOOTBALL BOT. Người dùng gõ tên đội kiểu lóng/viết tắt/tiếng Việt "
+        "(mu=Man United, quỷ đỏ=Man United, barca=Barcelona, mc=Man City...). "
+        "Nhiệm vụ: chọn TRẬN ĐẤU liên quan nhất tới yêu cầu. "
+        "Ưu tiên trận SẮP ĐÁ (trong tương lai), cùng giải lớn. Trả về JSON: {\"fixture_id\": số} hoặc {\"not_found\": true}.",
+        f"Người dùng tìm: '{query}'\n\nDanh sách trận:\n{fx_list}")
+    fixture = None
+    if not jerr and chosen and not chosen.get('not_found'):
+        fid = str(chosen.get('fixture_id', ''))
+        for fx in all_fx:
+            if str(fx['fixture']['id']) == fid:
+                fixture = fx
+                break
     if not fixture:
-        # Fallback: nhờ AI đọc tên lóng (mu, quỷ đỏ, barca, tên Việt...) chọn từ danh sách trận thật
-        await send_chat_action(session, chat_id)
-        await send_telegram_message(session, chat_id, f"🧠 Hỏi AI tìm '{query}' trong danh sách trận...")
-        all_fx = []
-        today = datetime.now(TZ_VN)
-        for offset in range(0, 4):
-            dstr = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
-            fxs, _ = await get_fixtures_for_date(session, dstr)
-            all_fx.extend(fxs or [])
-        if all_fx:
-            fx_list = "\n".join(f"ID {fx['fixture']['id']} | {_vn_time(fx['fixture']['date'])} | {fx['league'].get('name', '?')} | {fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
-                                for fx in all_fx[:40])
-            chosen, jerr = await get_ai_json(
-                session,
-                "Bạn là trợ lý tìm trận của PNL FOOTBALL BOT. Người dùng gõ tên đội kiểu lóng/viết tắt/tiếng Việt "
-                "(mu=Man United, quỷ đỏ=Man United, barca=Barcelona, mc=Man City...). "
-                "Nhiệm vụ: chọn TRẬN ĐẤU liên quan nhất tới người dùng trong danh sách. "
-                "Ưu tiên trận SẮP ĐÁ (trong tương lai), cùng giải lớn. Trả về JSON: {\"fixture_id\": số} hoặc {\"not_found\": true}.",
-                f"Người dùng tìm: '{query}'\n\nDanh sách trận:\n{fx_list}")
-            if not jerr and chosen and not chosen.get('not_found'):
-                fid = str(chosen.get('fixture_id', ''))
-                for fx in all_fx:
-                    if str(fx['fixture']['id']) == fid:
-                        fixture = fx
-                        break
-    if not fixture:
-        msg = f"🤷 AI cũng không tìm được trận nào khớp '{query}'."
-        if suggestions:
-            msg += "\n\n*Trận đang có trong các giải theo dõi:*\n" + "\n".join(f"• {s}" for s in suggestions[:15])
+        msg = f"🤷 Không tìm được trận nào khớp '{query}'.\n\n*Trận đang có trong 3 ngày tới:*\n"
+        seen = []
+        for fx in all_fx[:20]:
+            s = f"{fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
+            if s not in seen:
+                seen.append(s)
+                msg += f"• {s}\n"
         await send_long_message(session, chat_id, msg)
         return
     await send_chat_action(session, chat_id)
