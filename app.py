@@ -2585,11 +2585,24 @@ TEAM_SKY_SLUGS = {
     'monaco': 'monaco', 'as monaco': 'monaco',
     'lyon': 'lyon', 'olympique lyonnais': 'lyon',
     'lille': 'lille', 'losc': 'lille',
-    'lens': 'lens', 'rc lens': 'lens',
+    'lens': 'rc-lens', 'rc lens': 'rc-lens',
     'nice': 'nice', 'ogc nice': 'nice',
     'rennes': 'rennes', 'stade rennais': 'rennes',
-    'strasbourg': 'strasbourg',
+    'reims': 'reims', 'stade reims': 'reims', 'stade de reims': 'reims',
+    'strasbourg': 'strasbourg', 'rc strasbourg': 'strasbourg',
+    'troyes': 'troyes',
     'nantes': 'nantes',
+    'brest': 'brest', 'stade brestois': 'brest', 'brestois': 'brest',
+    'auxerre': 'auxerre',
+    'angers': 'angers',
+    'le havre': 'le-havre', 'havre': 'le-havre',
+    'lorient': 'lorient',
+    'mallorca': 'real-mallorca', 'real mallorca': 'real-mallorca',
+    'oviedo': 'real-oviedo', 'real oviedo': 'real-oviedo',
+    'toulouse': 'toulouse',
+    'le mans': 'le-mans',
+    'paris fc': 'paris-fc',
+    'as monaco': 'monaco',
     'porto': 'porto', 'fc porto': 'porto',
     'benfica': 'benfica', 'sl benfica': 'benfica',
     'ajax': 'ajax',
@@ -2666,6 +2679,35 @@ def _resolve_team_part(part):
     # fallback: slug hóa (đội ít gặp)
     if len(cleaned.split()) <= 3:
         return re.sub(r'[^a-z0-9]+', '-', cleaned).strip('-') or None
+    return None
+
+
+# token chung chung → các club cụ thể (để hỏi lại thay vì search mò)
+_AMBIGUOUS_TOKENS = {
+    # token → [(tên hiển thị, có dữ liệu Sky không)]
+    'stade': [('Stade Rennais', True), ('Stade Brestois', True), ('Stade de Reims', False)],
+}
+
+
+def _check_ambiguous(q):
+    """'psg vs stade' → ('stade', [(tên, slug)...]) nếu có từ mơ hồ không resolve được qua map."""
+    parts = [p.strip() for p in re.split(r'\s+vs\s+|\s+x\s+', (q or '').lower().strip()) if p.strip()]
+    for p in parts:
+        cleaned = _clean_team_part(p)
+        if not cleaned:
+            continue
+        if _canon_team_slug(cleaned):
+            continue
+        hit = False
+        for key in list(TEAM_SKY_SLUGS.keys()) + list(SKY_SHORT_NAMES.keys()):
+            if key and re.search(r'(^|\s)' + re.escape(key) + r'($|\s)', cleaned):
+                hit = True
+                break
+        if hit:
+            continue
+        for t in cleaned.split():
+            if t in _AMBIGUOUS_TOKENS:
+                return t, _AMBIGUOUS_TOKENS[t]
     return None
 
 
@@ -2766,7 +2808,7 @@ def _parse_sky_fixtures(pg):
     lines = []
     results = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
-        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
+        r'([A-Z][A-Za-z0-9 \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
         r'([A-Z][\w\' \.\-]{1,28}?)\s+(\d+)\s+([A-Z][\w\' \.\-]{1,28}?)\s+(\d+)'
         r'(?:\s+(\d+)[\'\u2019&#;x\d ]{0,12})?\s+(FT|In Play|HT|LIVE|AET|PEN)\b',
         pg)
@@ -2783,7 +2825,7 @@ def _parse_sky_fixtures(pg):
         lines.append(f"{tag} [{league}] {date_str}: {h} {gh}-{ga} {a}{min_txt}")
     upcoming = re.findall(
         r'((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+)\s+'
-        r'([A-Z][A-Za-z \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
+        r'([A-Z][A-Za-z0-9 \.]{2,30}?)\s+app\.football\.scores_fixtures\.view_fixture\s+'
         r'([A-Z][\w\' \.\-]{1,28}?)\s+app\.football\.scores_fixtures\.are_scheduled\s+'
         r'([A-Z][\w\' \.\-]{1,28}?)\s+\.\s+([\d\.]+(?:am|pm))\s+Fixture',
         pg)
@@ -2901,8 +2943,9 @@ for _s in ('borussia-dortmund', 'bayern-munich', 'leverkusen', 'stuttgart', 'lei
             'eintracht-frankfurt', 'monchengladbach', 'wolfsburg', 'hoffenheim', 'freiburg',
             'mainz', 'augsburg', 'union-berlin', 'werder-bremen', 'st-pauli'):
     TEAM_LEAGUES[_s] = 'German Bundesliga'
-for _s in ('paris-saint-germain', 'marseille', 'monaco', 'lyon', 'lille', 'lens', 'nice',
-            'rennes', 'strasbourg', 'nantes'):
+for _s in ('paris-saint-germain', 'marseille', 'monaco', 'lyon', 'lille', 'rc-lens', 'nice',
+            'rennes', 'strasbourg', 'nantes', 'brest', 'auxerre', 'angers', 'le-havre',
+            'lorient', 'paris-fc', 'troyes', 'le-mans', 'toulouse'):
     TEAM_LEAGUES[_s] = 'French Ligue 1'
 for _s in ('celtic', 'rangers'):
     TEAM_LEAGUES[_s] = 'Scottish Premiership'
@@ -2960,6 +3003,14 @@ async def _agent_execute(session, chat_id, name, args):
         slug_a = q_slugs[0] if q_slugs else None
         if not slug_a:
             slug_a = _sky_slug_for(q)[0]
+        # tên đội mơ hồ (vd 'stade' = Reims/Rennais/Brestois?) → hỏi lại ngay, không search mò
+        amb = _check_ambiguous(q)
+        if amb:
+            tok, cands = amb
+            blines = [f"Đội '{tok}' chưa rõ là đội nào — anh muốn nói đội nào trong các đội này?"]
+            for disp, has_data in cands:
+                blines.append(f"- {disp}" + (" (bot có dữ liệu ✅)" if has_data else " (bot chưa có dữ liệu ⚠️)"))
+            return "\n".join(blines)
         fetched = await _fetch_team_fixtures(session, q)
         pages = []
         if fetched:
@@ -3038,13 +3089,21 @@ async def _agent_execute(session, chat_id, name, args):
                         break
                     if target_ln:
                         break
-        # query 2 đội mà không thấy trận → web search tên đầy đủ
+        # query 2 đội mà không thấy trận → web search tên đầy đủ (+football+giải để khỏi trôi sang du lịch)
         if not target_ln and len(q_slugs) >= 2:
             fulls = [s.replace('-', ' ') for s in q_slugs[:2]]
-            web_result = await tool_web_search(session, f"{' vs '.join(fulls)} score result today 2026", 5)
+            _lg = ''
+            try:
+                _lg = league_hint or ''
+            except Exception:
+                _lg = ''
+            web_result = await tool_web_search(session, f"{' vs '.join(fulls)} football {_lg} score result".strip(), 5)
             if web_result and not web_result.startswith("Không"):
-                return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
-                        f"Kết quả tìm kiếm:\n{web_result[:1500]}")
+                _low = web_result.lower()
+                # rác (vd trang du lịch Paris) → giấu, chỉ báo không tìm thấy
+                if any(f in _low for f in fulls):
+                    return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
+                            f"Kết quả tìm kiếm:\n{web_result[:1500]}")
             return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports — thử lại sau hoặc hỏi đội khác.")
         if target_ln:
             # Nếu trận đã đá → trả kết quả luôn, không phân tích
@@ -3075,9 +3134,14 @@ async def _agent_execute(session, chat_id, name, args):
             if opp_parsed:
                 data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{opp_parsed}")
             else:
-                # BẮT BUỘC có dữ liệu đối thủ — Sky lỗi thì web_search bù
-                web_opp = await tool_web_search(session, f"{opponent} recent results last 5 matches 2026", 6)
-                data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
+                # BẮT BUỘC có dữ liệu đối thủ — Sky lỗi thì web_search bù (rác thì bỏ, khỏi nhiễu AI)
+                web_opp = await tool_web_search(session, f"{opponent} football results fixtures 2026", 6)
+                _wl = (web_opp or '').lower()
+                _on = opponent.lower()
+                _okey = [_on] + [w for w in re.split(r'[^a-z0-9]+', _on) if len(w) > 4]
+                if web_opp and not web_opp.startswith("Không") and any(k in _wl for k in _okey) and re.search(
+                        r'\d\s*-\s*\d|fixtures?|results?| vs |score', web_opp, re.I):
+                    data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
         if league_data:
             kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
             for _sl in [s for s in (q_slugs or []) if s]:
