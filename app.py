@@ -1855,28 +1855,28 @@ def _keo_logic_check(obj):
             ga_, gb_ = n1, n2
     if ga_ is not None:
         tot = ga_ + gb_
-        # Tài xỉu phải khớp tổng bàn
-        if line is not None and (is_over or is_under):
-            ok_over = tot > line
-            ok_under = tot < line
-            if is_over and not ok_over:
-                errs.append(f"Tài {line} nhưng kịch bản tỉ số {ga_}-{gb_} (tổng {tot}) không vượt line → chọn Xỉu hoặc đổi kịch bản")
-            if is_under and not ok_under:
-                errs.append(f"Xỉu {line} nhưng kịch bản tỉ số {ga_}-{gb_} (tổng {tot}) đã vượt line → chọn Tài hoặc đổi kịch bản")
-        # BTTS phải khớp
+        # Mỗi kèo phải có căn cứ riêng (lịch sử/lực lượng/đối đầu) — không ăn theo tỉ số
+        for _k, _v in (ks or {}).items():
+            w = str((_v or {}).get('why') or '').strip()
+            if len(w) < 10:
+                errs.append(f"kèo '{_k}' thiếu căn cứ riêng (why) — nêu số liệu/thống kê của chính kèo đó")
+        # Mâu thuẫn vật lý với kịch bản (kịch bản là ước tính trung tâm — sai lệch ≤1 bàn chấp nhận)
+        if line is not None and (is_over or is_under) and abs(tot - line) > 1.5:
+            side_s = 'Tài' if is_over else 'Xỉu'
+            errs.append(f"{side_s} {line} quá xa kịch bản {ga_}-{gb_} (tổng {tot}) — chọn cửa gần kịch bản hơn")
         both = ga_ > 0 and gb_ > 0
-        if btts_yes and not both:
-            errs.append(f"BTTS Có nhưng kịch bản {ga_}-{gb_} có đội không ghi bàn → đổi BTTS hoặc đổi kịch bản")
+        if btts_yes and not both and max(ga_, gb_) >= 2:
+            errs.append(f"BTTS Có nhưng kịch bản {ga_}-{gb_} có đội không ghi bàn ≥2 — đổi BTTS hoặc đổi kịch bản")
         if btts_no and both:
-            errs.append(f"BTTS Không nhưng kịch bản {ga_}-{gb_} cả hai đều ghi bàn → mâu thuẫn")
-        # 1X2 phải khớp
+            errs.append(f"BTTS Không nhưng kịch bản {ga_}-{gb_} cả hai đều ghi bàn — mâu thuẫn")
+        # 1X2 vẫn phải cùng phe đội thắng theo kịch bản (mâu thuẫn cứng)
         if ga_ > gb_ and (re.search(r'x2', p12) or re.search(r'h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội nhà thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
         if ga_ < gb_ and (re.search(r'1x', p12) or re.search(r'h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội khách thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
         if ga_ == gb_ and not re.search(r'h[ôo]a|draw|1x|x2', p12):
             errs.append(f"Kịch bản hòa {ga_}-{gb_} nhưng 1X2 chọn '{p12}' → phải chọn hòa/X")
-        # Châu Á phải thắng kèo theo tỉ số (hoặc ít nhất hòa kèo)
+        # Châu Á chỉ chặn khi THUA SÂU theo kịch bản (margin < -1.25 — gần như không bù được)
         mh = re.search(r'([+-])\s*(\d+(?:[.,]\d+)?(?:[/-]\d+)?)', pa)
         if mh and lean_hdc:
             try:
@@ -1891,11 +1891,11 @@ def _keo_logic_check(obj):
                     marg = ga_ + hv - gb_
                 else:
                     marg = gb_ - hv - ga_
-                if marg < -0.25:
-                    errs.append(f"Châu Á '{pa}' THUA kèo theo kịch bản {ga_}-{gb_} (margin {marg:+.2f}) → chọn cửa thắng kèo theo tỉ số, hoặc đổi kịch bản")
+                if marg < -1.25:
+                    errs.append(f"Châu Á '{pa}' thua SÂU theo kịch bản {ga_}-{gb_} (margin {marg:+.2f}) — chọn cửa hợp lý hơn")
             except Exception:
                 pass
-        return errs  # có tỉ số → đã kiểm đủ R0-R4, khỏi check cũ
+        return errs  # có tỉ số → kiểm xong R0 (mâu thuẫn vật lý + căn cứ riêng)
     # R1: 1X2 vs Châu Á — chỉ mâu thuẫn khi kèo CÂN (|handicap| ≤ 0.75) mà lệch phe
     # (MU +1.5 với MC thắng 1-0 vẫn hợp lý — được chấp sâu)
     lean12 = 'A' if re.search(r'1x', p12) else ('B' if re.search(r'x2', p12) else (side(p12) if side(p12) else None))
@@ -1946,9 +1946,19 @@ def _render_keo_from_json(obj):
     if live and live[:50] != out[0][:50]:
         out.append(live[:90])
     for d, key in (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc')):
-        p, pct = pick(key)
+        v = ks.get(key) or {}
+        p = str(v.get('pick') or '').strip()
+        pct = v.get('pct')
+        try:
+            pct = int(pct)
+        except Exception:
+            pct = None
+        why = re.sub(r'\s+', ' ', str(v.get('why') or '').strip())[:70]
         if p:
-            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}")
+            line_txt = f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}"
+            if why:
+                line_txt += f" — {why}"
+            out.append(line_txt)
     if len(out) < 5:
         return None
     b = str(obj.get('best') or '').strip()
@@ -1959,13 +1969,14 @@ def _render_keo_from_json(obj):
 
 KEO_JSON_SCHEMA = (
     '{"header": "[giải] TeamA vs TeamB (giờ VN)", "kickoff": "YYYY-MM-DD", "live": "🔴 LIVE phút X — tỉ số hoặc rỗng", '
-    '"scenario": "TeamNhà X-Y TeamKhách + 1 câu mô tả kịch bản (vd: MU 1-2 MC — MC cầm bóng thắng ngược)", '
-    '"keos": {"1x2": {"pick": "đội/cửa thắng", "pct": 70}, '
-    '"tai_xiu": {"pick": "Tài 2.5 hoặc Xỉu 2.5", "pct": 65}, '
-    '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60}, '
-    '"btts": {"pick": "Có hoặc Không", "pct": 60}, '
-    '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60}, '
-    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55}}, '
+    '"scenario": "TeamNhà X-Y TeamKhách + 1 câu mô tả (vd: MU 1-2 MC — MC cầm bóng thắng ngược)", '
+    '"keos": {'
+    '"1x2": {"pick": "đội/cửa", "pct": 70, "why": "căn cứ riêng: lịch sử + phong độ + lực lượng, vd X/5 trận gần đây…"}, '
+    '"tai_xiu": {"pick": "Tài 2.5 hoặc Xỉu 2.5", "pct": 65, "why": "tỉ lệ nổ tài/xỉu các trận gần đây + hàng công/hàng thủ"}, '
+    '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60, "why": "lịch sử đối đầu + chênh lực lượng"}, '
+    '"btts": {"pick": "Có hoặc Không", "pct": 60, "why": "tỉ lệ BTTS nổ của 2 đội + thủng lưới gần đây"}, '
+    '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60, "why": "quy luật derby/kỳ vọng trọng tài + số thẻ trung bình"}, '
+    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55, "why": "lối chơi biên/kiem soát + số góc trung bình"}}, '
     '"best": "kèo tự tin nhất"}')
 
 def _save_keo_batch(chat_id, obj, rendered):
@@ -2336,10 +2347,9 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                 # ÉP FORMAT TẦNG API: buộc JSON schema — AI không thể tự do đẻ bảng/câu dài
                 json_prompt = (
                     "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này.\n"
-                    "QUAN TRỌNG NHẤT: chốt KỊCH BẢN TRẬN ĐẤU TRƯỚC — scenario PHẢI dạng 'TeamNhà X-Y TeamKhách + mô tả' (vd 'MU 1-2 MC — MC cầm bóng thắng ngược'), "
-                    "rồi 6 kèo PHẢI SUY từ tỉ số đó: kèo nào THUA kèo theo tỉ số là SAI — sửa ngay. "
-                    "Tài/Xỉu phải khớp tổng bàn của tỉ số; BTTS phải khớp việc 2 đội cùng ghi bàn; 1X2 cùng phe đội thắng; "
-                    "Châu Á phải thắng hoặc hòa kèo theo tỉ số (MU +0.5 với tỉ số MU 0-1 MC là THUA kèo — MU +1.5 mới thắng).\n"
+                    "QUAN TRỌNG NHẤT: scenario PHẢI dạng 'TeamNhà X-Y TeamKhách + mô tả' (vd 'MU 1-2 MC — MC cầm bóng thắng ngược') — đây là kịch bản chính để neo. "
+                    "MỖI KÈO PHẢI có 'why': căn cứ RIÊNG từ dữ liệu thật — lịch sử nổ tài/xỉu, tỉ lệ BTTS, đối đầu, chấn thương/lực lượng, số thẻ/góc trung bình (ghi cụ thể kiểu '4/5 trận gần đây nổ tài'). "
+                    "Kèo KHÔNG bắt buộc thắng theo tỉ số kịch bản, NHƯNG không được mâu thuẫn vật lý: BTTS Có mà tỉ số có đội 0 bàn; Xỉu/Tài lệch tổng bàn >1.5; 1X2 khác phe đội thắng; Châu Á thua sâu margin <-1.25.\n"
                     "Schema (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
                     + KEO_JSON_SCHEMA +
                     "\n\nPhân tích gốc:\n" + content[:3000])
