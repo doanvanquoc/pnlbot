@@ -188,13 +188,15 @@ async def send_long_message(session, chat_id, text, reply_markup=None):
 
 # ═══════════════ AI (MintRouter) ═══════════════
 
-async def get_ai_response(session, messages, max_tokens=2500, timeout_s=120):
+async def get_ai_response(session, messages, max_tokens=2500, timeout_s=120, response_format=None):
     """Gọi LLM qua MintRouter chat completions. Trả về (text, None) hoặc (None, err)."""
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
     model = os.getenv("DASH_MODEL", "glm-5.3")
     payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": max_tokens}
+    if response_format:
+        payload["response_format"] = response_format
     for attempt in range(3):
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -1793,6 +1795,50 @@ def _strict_keo_format(text):
 
 
 
+def _render_keo_from_json(obj):
+    """Render output kèo từ JSON schema cứng — không phụ thuộc AI biết format."""
+    if not isinstance(obj, dict):
+        return None
+    ks = obj.get('keos') or {}
+    def pick(k):
+        v = ks.get(k) or {}
+        p = str(v.get('pick') or '').strip()
+        pct = v.get('pct')
+        try:
+            pct = int(pct)
+        except Exception:
+            pct = None
+        return p, pct
+    out = [str(obj.get('header') or '⚽ Trận đấu')[:110]]
+    live = str(obj.get('live') or '').strip()
+    if live and live[:50] != out[0][:50]:
+        out.append(live[:90])
+    def sn(p):
+        return '⭐' * max(1, min(p // 15, 5)) if isinstance(p, int) else ''
+    for d, key in (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc')):
+        p, pct = pick(key)
+        if p:
+            s = sn(pct) if pct else ''
+            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}{' ' + s if s else ''}")
+    if len(out) < 5:
+        return None
+    b = str(obj.get('best') or '').strip()
+    if b:
+        out.append(f"⭐ Tự tin nhất: {b[:70]}")
+    return '\n'.join(out)
+
+
+KEO_JSON_SCHEMA = (
+    '{"header": "[giải] TeamA vs TeamB (giờ VN)", "live": "🔴 LIVE phút X — tỉ số hoặc rỗng", '
+    '"keos": {"1x2": {"pick": "đội/cửa thắng", "pct": 70}, '
+    '"tai_xiu": {"pick": "Tài 2.5 hoặc Xỉu 2.5", "pct": 65}, '
+    '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60}, '
+    '"btts": {"pick": "Có hoặc Không", "pct": 60}, '
+    '"the": {"pick": "Tài 4.5 hoặc Xỉu 4.5", "pct": 60}, '
+    '"goc": {"pick": "Tài 10.5 hoặc Xỉu 10.5", "pct": 55}}, '
+    '"best": "kèo tự tin nhất"}')
+
+
 def _clean_tg(text):
     """Dọn format AI → Telegram đọc đẹp: bỏ **, #, ---, cột |, tiếng Nga/ryc, khoảng trắng thừa."""
     if not text:
@@ -2117,24 +2163,30 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             raw = (msg.get('content') or '')
             logger.info(f"[KEO-RAW]\n{raw[:1500]}")
             content = _clean_tg(raw)
-            # ÉP FORMAT: thiếu kèo nào trong 6 kèo chuẩn → bắt AI chép lại đúng mẫu
-            need = [d for d in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc')
-                    if not re.search(r'^\s*[-|•]?\s*(?:tài xỉu\s*)?' + re.escape(d), content, re.I | re.M)]
             is_keo = bool(re.search(r'analyze_keo', str(messages), re.I)) or any(
                 w in question.lower() for w in ('kèo', 'phân tích', 'dự đoán'))
-            if is_keo and need:
-                fix_prompt = (
-                    f"Câu trả lời trước của mày SAI FORMAT — thiếu: {', '.join(need)}.\n"
-                    "Chép lại ĐÚNG theo mẫu sau, ĐỦ 6 kèo, mỗi kèo MỘT DÒNG '- Tên kèo: chọn (X%)', KHÔNG bảng |, KHÔNG **, KHÔNG giải thích dài, KHÔNG thêm bớt:\n"
-                    "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
-                    "- 1X2: [chọn] (X%)\n- Tài xỉu 2.5: [Tài/Xỉu] (X%)\n- Châu Á: [kèo] (X%)\n"
-                    "- BTTS: [Có/Không] (X%)\n- Thẻ: [Tài/Xỉu] (X%)\n- Góc: [Tài/Xỉu] (X%)\n"
-                    "⭐ [kèo tự tin nhất]\n\nCâu trả lời cũ:\n" + content[:2500])
-                fixed, err = await get_ai_response(session, [{"role": "user", "content": fix_prompt}], max_tokens=700)
-                if fixed:
-                    logger.info(f"[KEO-FIX]\n{fixed[:800]}")
-                    content = fixed
-            content = _strict_keo_format(content)
+            rendered = None
+            if is_keo and content:
+                # ÉP FORMAT TẦNG API: buộc JSON schema — AI không thể tự do đẻ bảng/câu dài
+                json_prompt = (
+                    "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
+                    + KEO_JSON_SCHEMA +
+                    "\n\nPhân tích gốc:\n" + content[:3000])
+                jtxt, jerr = await get_ai_response(
+                    session, [{"role": "user", "content": json_prompt}], max_tokens=700,
+                    response_format={"type": "json_object"})
+                if jtxt:
+                    try:
+                        obj = json.loads(re.sub(r'^```(?:json)?|```$', '', jtxt.strip(), flags=re.M).strip())
+                        rendered = _render_keo_from_json(obj)
+                    except Exception:
+                        rendered = None
+                    if rendered:
+                        logger.info(f"[KEO-JSON-OK] {rendered[:200]}")
+            if rendered:
+                content = rendered
+            else:
+                content = _strict_keo_format(content)
             if content:
                 await send_telegram_message(session, chat_id, content, reply_to=reply_to)
             else:
