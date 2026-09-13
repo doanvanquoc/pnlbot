@@ -5781,14 +5781,20 @@ async def detect_pump_candidates(session, limit=6):
     results = await asyncio.gather(*[analyze_one(s, c) for s, c in cands])
     results = [r for r in results if r]
     results.sort(key=lambda x: x['score'], reverse=True)
-    # NÍT GIÁ LIVE: close từ nến 1h ĐÃ ĐÓNG có thể cũ tới 59 phút → entry MARKET phải là giá hiện tại.
-    # Lấy giá realtime rồi tính lại TP/SL kế hoạch FOMO theo giá live.
-    tickers_map, _ = await get_market_snapshot(session)
+    # GIÁ LIVE THẬT (KHÔNG cache): entry MARKET phải là giá tại thời điểm báo, không chơi
+    # snapshot TTL 30s. 1 call /ticker/price lấy giá tươi cho các coin trong danh sách.
+    live_map = {}
+    try:
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/price") as resp:
+            if resp.status == 200:
+                for t in await resp.json():
+                    live_map[t['symbol']] = float(t['price'])
+    except Exception as e:
+        logger.warning(f"[PUMP-RADAR] Không lấy được giá live: {e}")
     for r in results:
-        live = (tickers_map.get(r['symbol']) or {}).get('price')
-        if not live:
+        entry = live_map.get(r['symbol'])
+        if not entry:
             continue
-        entry = float(live)
         r['close'] = entry
         sup, res15 = r.get('support15m'), r.get('resistance15m')
         fomo_sl = sup if sup and entry * 0.94 < sup < entry * 0.995 else entry * 0.975
