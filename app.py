@@ -2351,6 +2351,8 @@ def _strict_keo_format(text):
         for ln in lines:
             if re.match(r'^\d+[.)\s]', ln) or ln.startswith('#'):
                 continue
+            if re.match(r'(?i)^odds\b', ln):
+                continue  # dòng thông tin odds ('Odds 1X2: ...') — không phải pick
             m = re.search(pat + r'[^:—\-]{0,14}[:—\-]\s*(.+)', ln, re.I)
             if m and m.start() < 25:
                 val = m.group(1)
@@ -2428,9 +2430,9 @@ def _strict_keo_format(text):
             out.append(f"- {disp}: {val}")
     if best:
         out.append(best[:90])
-    # Không moi được kèo nào/best nào → đây là câu trả lời hội thoại (vd kèo live):
-    # trả NGUYÊN VĂN đã dọn, cấm cắt cụt thành 1 dòng header
-    if not out_k and not best:
+    # Moi được < 3 kèo → đây là câu trả lời hội thoại (vd kèo live), KHÔNG phải template:
+    # trả NGUYÊN VĂN đã dọn thay vì ép khung rồi cắt cụt (tránh nhặt nhầm dòng odds/info làm pick)
+    if len(out_k) < 3:
         return text[:3500]
     return '\n'.join(out)
 
