@@ -1991,6 +1991,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "Khi người dùng hỏi, TỰ QUYẾT ĐỊNH cần tool gì: "
         "- Muốn phân tích/dự đoán kèo một đội/trận → PHẢI gọi analyze_keo NGAY (tool có dữ liệu lịch trận thật), "
         "TUYỆT ĐỐI KHÔNG tự web_search rồi tự kết luận kèo — kết quả web_search thường rác (trùng tên, thiếu dữ liệu). "
+        "- Người dùng CHỈ nhắc tên một đội bóng (vd 'celta', 'mu', 'arsenal', 'real madrid') → đó là yêu cầu PHÂN TÍCH KÈO "
+        "→ gọi analyze_keo NGAY với tên đó, đừng web_search chữ trần (sẽ dính kết quả rác kiểu chứng chỉ CELTA Cambridge). "
         "- Cần thông tin mới (phong độ, chấn thương, kết quả, lịch sử đối đầu, tin tức) → web_search rồi fetch_url nếu cần chi tiết. "
         "- Hỏi thành tích dự đoán của bot → my_stats. "
         "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
