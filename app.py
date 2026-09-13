@@ -1685,50 +1685,79 @@ async def _clear_status_msgs(session, chat_id):
 
 
 def _strict_keo_format(text):
-    """Chỉ giữ 8 dòng chuẩn: ⚽ header (+LIVE) + 6 dòng '- X:' + ⭐. Cắt mọi thứ khác.
-    Lấy kèo từ dòng dạng '- 1X2: ...' — dòng kèo phân tán/ô bảng sẽ bị ghép lại."""
+    """Chuẩn hóa output: header + LIVE + 6 dòng '- Kèo: chọn ⭐' + ⭐ best.
+    Sao = tin cậy (≥75:5⭐, ≥65:4, ≥58:3, ≥52:2, còn lại 1). Bỏ ngoặc %, bỏ bảng/rác."""
     if not text:
         return text
-    # chuẩn hóa: ghép cột dọc (Kèo\nLựa chọn\n...) thành '- market: selection (sao)'
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    kèo = {}
-    order = []
-    MARKETS = ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc')
-    header = None
-    live = None
+    t = _clean_tg(text)
+    lines = [l.strip() for l in t.split('\n') if l.strip()]
+    header = live = None
+    out_k = []
+    specs = [('1X2', r'1\s*[xX]\s*2'), ('Tài xỉu', r't[aàảá]i\s*x[ỉiu]u'), ('Châu Á', r'ch[âaàáả]u\s*[áaàả]'),
+             ('BTTS', r'(?:btts|cả\s*2\s*đ[ôo]i\s*ghi)'), ('Thẻ', r'th[ẻe]'), ('Góc', r'g[óo]c')]
+    for disp, pat in specs:
+        val = None
+        stars = 0
+        for ln in lines:
+            m = re.match(r'^[-•]?\s*' + pat + r'[^:—\-]*[:—\-]\s*(.+)', ln, re.I)
+            if not m:
+                # dạng cột dọc: dòng chỉ toàn tên kèo → lấy dòng sau có nội dung
+                if re.match(r'^[-•]?\s*' + pat + r'[\s:—\-]*$|^[\d\.]+\)?$', ln, re.I) and not val:
+                    continue
+            if m and m.group(1):
+                val = m.group(1).strip()
+                mm = re.search(r'\((\d{2})\s*%\)', val)
+                if not mm:
+                    mm = re.search(r'(\d{2})\s*%', val)
+                if mm:
+                    p = int(mm.group(1))
+                    stars = 5 if p >= 75 else 4 if p >= 65 else 3 if p >= 58 else 2 if p >= 52 else 1
+                    val = re.sub(r'[\(\[]?[\d]{2}\s*%[\)\]]?', '', val)
+                val = re.sub(r'[⭐✅🔥💡⭐]+', '', val).strip(' :—-|')
+                if val:
+                    out_k.append((disp, val, stars))
+                break
+        if not val:
+            # tìm dạng dọc: dòng tên kèo riêng → dòng kế là lựa chọn
+            for k, ln in enumerate(lines):
+                if re.match(r'^[-•]?\s*' + pat + r'.{0,14}$', ln, re.I) and len(ln) < 25:
+                    nxt = lines[k + 1] if k + 1 < len(lines) else ''
+                    if nxt and not any(re.match(r'^[-•]?\s*' + p2, nxt, re.I) for _d2, p2 in specs):
+                        stars_l = len(re.findall(r'⭐', nxt))
+                        val2 = re.sub(r'⭐+', '', nxt).strip(' :—-|')
+                        if val2 and len(val2) > 1:
+                            out_k.append((disp, val2, stars_l))
+                        break
     best = None
-    i = 0
-    while i < len(lines):
-        ln = lines[i]
-        low = ln.lower()
-        # header: dòng chứa 'vs' + tên giải hoặc ⚽
-        if header is None and ('vs' in low or '⚽' in ln) and any(g in ln for g in ('League', 'Liga', 'Serie', 'Bundes', 'Ligue', 'derby', 'Derby', 'Premier', 'Championship')):
-            header = ln[:120]
-        elif 'LIVE' in ln or ('phút' in ln and 'ĐANG' in ln):
-            live = ln
-        elif ln.startswith('⭐') and len(ln) < 40:
-            if not best:
-                best = ln
-        for mk in MARKETS:
-            if low.startswith(mk.lower()) and mk not in kèo:
-                # kèo line: '1X2  City thắng... ⭐⭐⭐' hoặc '1X2: ...'
-                content = ln[len(mk):].lstrip(' :—-')
-                stars = ''.join(re.findall(r'⭐', ln))
-                content = re.sub(r'⭐+', '', content).strip()
-                kèo[mk] = f"{content}{' (' + str(len(stars)) + '/5)' if stars else ''}"
-                order.append(mk)
-        i += 1
-    if not kèo:
-        # fallback: giữ nguyên text nếu không parse được kèo nào
-        return text
-    out = [header or '⚽ Trận đấu']
+    for ln in lines:
+        if ln.startswith('⭐') and len(ln) > 3 and 'Tự tin' in ln:
+            best = ln
+            break
+    if not best and out_k:
+        bp = max(out_k, key=lambda x: x[2])
+        best = f"⭐ Tự tin nhất: {bp[1]}"
+    header = next((ln for ln in lines if (' vs ' in ln.lower() or '⚽' in ln) and any(
+        g in ln for g in ('League', 'Liga', 'Serie', 'Bundes', 'Ligue', 'erby', 'Premier', 'Championship', 'Copa'))), None)
+    if not header:
+        header = next((ln for ln in lines if ' vs ' in ln.lower()), '⚽ Trận đấu')
+    live = next((ln for ln in lines if 'LIVE' in ln.upper() or '🔴' in ln), None)
+    out = [header[:110]]
     if live:
-        out.append(live)
-    for mk in ('1X2', 'Tài xỉu', 'Châu Á', 'BTTS', 'Thẻ', 'Góc'):
-        if mk in kèo:
-            out.append(f"- {mk}: {kèo[mk]}")
-    out.append(best or ('⭐ ' + max(kèo.items(), key=lambda kv: kv[1].count('/5'))[0] if False else ('⭐ ' + (order[-1] if order else ''))))
+        out.append(live[:90])
+    for disp, val, stars in out_k[:6]:
+        s = '⭐' * max(1, min(stars, 5)) if stars else ''
+        out.append(f"- {disp}: {val}{' ' + s if s else ''}")
+    if best:
+        out.append(best[:80])
     return '\n'.join(out)
+
+
+
+
+
+
+
+
 
 
 def _clean_tg(text):
