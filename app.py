@@ -1793,6 +1793,71 @@ def _strict_keo_format(text):
 
 
 
+def _keo_logic_check(obj):
+    """Kiểm tra 6 kèo nhất quán về kịch bản. Trả list lỗi (rỗng = hợp lý)."""
+    errs = []
+    ks = obj.get('keos') or {}
+    header = str(obj.get('header') or '')
+    m = re.search(r'([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)\s+vs\s+([A-Za-zÀ-ỹ][\w\'\- ]{1,28}?)(?:\s*[\(\-—:,]|$)', header)
+    ta, tb = (m.group(1).strip().lower(), m.group(2).strip().lower()) if m else ('', '')
+    def side(txt):
+        t = txt.lower()
+        for s, grp in ((ta, 'A'), (tb, 'B')):
+            if s and s.split()[0] in t:
+                return grp
+        return None
+    p12 = str((ks.get('1x2') or {}).get('pick') or '').lower()
+    pa = str((ks.get('chau_a') or {}).get('pick') or '').lower()
+    ptx = str((ks.get('tai_xiu') or {}).get('pick') or '').lower()
+    pb = str((ks.get('btts') or {}).get('pick') or '').lower()
+    # line tài xỉu
+    ml = re.search(r'(\d+(?:[.,]\d+)?[-/]\d+|\d+(?:[.,]\d+)?)', ptx)
+    line = None
+    if ml:
+        raw = ml.group(1)
+        if re.match(r'\d+[/-]\d+$', raw := raw if False else raw):
+            pass
+        try:
+            parts = re.split(r'[/-]', raw)
+            line = float(parts[0]) + (float(parts[1]) if len(parts) == 2 else 0) / 1 if False else (
+                (float(parts[0]) + float(parts[1])) / 2 if len(parts) == 2 else float(parts[0]))
+        except Exception:
+            line = None
+    is_over = bool(re.search(r't[àaả]i|over|l[êe]n', ptx))
+    is_under = bool(re.search(r'x[ỉi]u|under|xu[ốo]ng', ptx))
+    btts_yes = bool(re.search(r'c[ôo]|yes|ghi b[àa]n', pb)) and not bool(re.search(r'kh[ôo]ng|no', pb))
+    btts_no = bool(re.search(r'kh[ôo]ng|no', pb))
+    # R1: 1X2 vs Châu Á — chỉ mâu thuẫn khi kèo CÂN (|handicap| ≤ 0.75) mà lệch phe
+    # (MU +1.5 với MC thắng 1-0 vẫn hợp lý — được chấp sâu)
+    lean12 = 'A' if re.search(r'1x', p12) else ('B' if re.search(r'x2', p12) else (side(p12) if side(p12) else None))
+    lean_hdc = side(pa)
+    mh = re.search(r'([+-])\s*(\d+(?:[.,]\d+)?(?:[/-]\d+)?)', pa)
+    hand = None
+    if mh:
+        try:
+            v = float(mh.group(2).replace(',', '.').replace('/', '/').split('/')[0]) if '/' in mh.group(2) else float(mh.group(2).replace(',', '.'))
+            if re.match(r'\d+[/-]\d+$', mh.group(2).replace(',', '.')):
+                parts = re.split(r'[/-]', mh.group(2))
+                v = (float(parts[0]) + float(parts[1])) / 2
+            hand = v
+        except Exception:
+            hand = None
+    if (lean12 and lean_hdc and lean12 != lean_hdc and (ta in pa or tb in pa)
+            and (hand is None or abs(hand) <= 0.75)):
+        errs.append(f"Châu Á ('{pa}') lệch phe với 1X2 ('{p12}') ở kèo cân — "
+                    "nếu tin đội này thắng thì chọn chấp theo đội đó, hoặc chọn được chấp sâu (≥1.0) mới lệch phe được")
+    # R2: BTTS Có + Xỉu line thấp
+    if btts_yes and is_under and line is not None and line <= 2.5:
+        errs.append(f"BTTS Có nhưng Xỉu {line} — BTTS Có tối thiểu 2 bàn, Xỉu {line} cần ≤2 bàn toàn thắng → mâu thuẫn")
+    # R3: BTTS Không + Tài line cao
+    if btts_no and is_over and line is not None and line >= 3.5:
+        errs.append(f"BTTS Không nhưng Tài {line} — hai đội không cùng ghi bàn mà tổng bàn ≥3.5 là ngược")
+    # R4: 1X2 nghiêng hòa + Tài cao
+    if re.search(r'h[ôo]a|draw', p12) and is_over and line is not None and line >= 3.5:
+        errs.append(f"1X2 nghiêng hòa nhưng Tài {line} — hòa thường ít bàn")
+    return errs
+
+
 def _render_keo_from_json(obj):
     """Render output kèo từ JSON schema cứng — không phụ thuộc AI biết format."""
     if not isinstance(obj, dict):
@@ -1825,6 +1890,7 @@ def _render_keo_from_json(obj):
 
 KEO_JSON_SCHEMA = (
     '{"header": "[giải] TeamA vs TeamB (giờ VN)", "kickoff": "YYYY-MM-DD", "live": "🔴 LIVE phút X — tỉ số hoặc rỗng", '
+    '"scenario": "kịch bản trận đấu + tỉ số dự đoán (vd: MC cầm bóng thắng 2-1)", '
     '"keos": {"1x2": {"pick": "đội/cửa thắng", "pct": 70}, '
     '"tai_xiu": {"pick": "Tài 2.5 hoặc Xỉu 2.5", "pct": 65}, '
     '"chau_a": {"pick": "vd MC -0.5 hoặc MU +0.5", "pct": 60}, '
@@ -2200,15 +2266,38 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             if is_keo and content:
                 # ÉP FORMAT TẦNG API: buộc JSON schema — AI không thể tự do đẻ bảng/câu dài
                 json_prompt = (
-                    "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
+                    "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này.\n"
+                    "QUAN TRỌNG NHẤT: chốt KỊCH BẢN TRẬN ĐẤU TRƯỚC (scenario: tỉ số dự đoán + cách diễn ra), "
+                    "rồi 6 kèo PHẢI SUY từ kịch bản đó — KHÔNG chốt từng kèo rời rạc theo % cao nhất. "
+                    "Quy tắc logic: Châu Á phải cùng phe với 1X2; BTTS Có ⇒ tổng bàn ít nhất 2 (không chọn Xỉu ≤2.5); "
+                    "BTTS Không ⇒ không Tài ≥3.5; 1X2 nghiêng hòa ⇒ không Tài cao.\n"
+                    "Schema (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
                     + KEO_JSON_SCHEMA +
                     "\n\nPhân tích gốc:\n" + content[:3000])
                 jtxt, jerr = await get_ai_response(
-                    session, [{"role": "user", "content": json_prompt}], max_tokens=700,
+                    session, [{"role": "user", "content": json_prompt}], max_tokens=900,
                     response_format={"type": "json_object"})
                 if jtxt:
                     try:
                         obj = json.loads(re.sub(r'^```(?:json)?|```$', '', jtxt.strip(), flags=re.M).strip())
+                        errs = _keo_logic_check(obj)
+                        if errs:
+                            # bắt AI sửa cho nhất quán với kịch bản (1 vòng)
+                            fixp = (
+                                "JSON trước của mày có lỗi logic:\n- " + "\n- ".join(errs) +
+                                "\nSửa lại: giữ KỊCH BẢN TRẬN ĐẤU làm mốc, mọi kèo suy từ kịch bản đó "
+                                "(kèo % cao nhất KHÔNG có quyền kéo các kèo khác lệch kịch bản). "
+                                "Trả lại ĐẦY ĐỦ object JSON đúng schema:\n" + KEO_JSON_SCHEMA)
+                            ftxt, _ = await get_ai_response(
+                                session, [{"role": "user", "content": fixp}], max_tokens=900,
+                                response_format={"type": "json_object"})
+                            if ftxt:
+                                try:
+                                    obj2 = json.loads(re.sub(r'^```(?:json)?|```$', '', ftxt.strip(), flags=re.M).strip())
+                                    if not _keo_logic_check(obj2):
+                                        obj = obj2
+                                except Exception:
+                                    pass
                         rendered = _render_keo_from_json(obj)
                     except Exception:
                         rendered = None
