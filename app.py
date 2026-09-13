@@ -2907,19 +2907,21 @@ for _s in set(TEAM_SKY_SLUGS.values()):
 
 
 def _canon_team_slug(name):
-    """Chuẩn hóa mọi biến thể tên đội → slug ('mu', 'Man Utd', 'Manchester United' → 'manchester-united')."""
+    """Chuẩn hóa mọi biến thể tên đội → slug ('mu', 'Man Utd', 'Manchester United',
+    'Paris Saint-Germain' → 'paris-saint-germain'). Không phân biệt gạch nối/cách."""
     if not name:
         return None
     import unicodedata
     n = unicodedata.normalize('NFKD', str(name).lower().replace('.', ''))
     n = ''.join(c for c in n if not unicodedata.combining(c))
     n = re.sub(r'\s+', ' ', n.strip())
-    if n in TEAM_SKY_SLUGS:
-        return TEAM_SKY_SLUGS[n]
-    if n in SKY_SHORT_NAMES:
-        return SKY_SHORT_NAMES[n]
-    if n in _SLUG_NAMES:
-        return _SLUG_NAMES[n]
+    for variant in (n, n.replace('-', ' '), n.replace('-', '')):
+        if variant in TEAM_SKY_SLUGS:
+            return TEAM_SKY_SLUGS[variant]
+        if variant in SKY_SHORT_NAMES:
+            return SKY_SHORT_NAMES[variant]
+        if variant in _SLUG_NAMES:
+            return _SLUG_NAMES[variant]
     return None
 
 
@@ -3786,8 +3788,10 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     + KEO_JSON_SCHEMA +
                     "\nNếu phân tích gốc có ODDS THẬT (1xBet/Pinnacle): tính EV = pct/100 × odds − 1 cho từng kèo, "
                     "ưu tiên kèo EV>0.05 khi chốt best; ghi odds đã dùng vào why (vd '1xBet 2.10').\n"
-                    "Mọi kèo 1X2/Tài xỉu chốt ra PHẢI có odds 1xBet > 1.5 — kèo nào chỉ có cửa ≤1.5 thì đổi line/cửa khác, "
-                    "không đổi được thì ghi 'Thiếu dữ liệu' pct=0.\n"
+                    "CHỈ khi có ODDS THẬT trong dữ liệu: mọi kèo 1X2/Tài xỉu chốt ra PHẢI có odds 1xBet > 1.5 — "
+                    "kèo nào chỉ có cửa ≤1.5 thì đổi line/cửa khác, không đổi được thì ghi 'Thiếu dữ liệu' pct=0. "
+                    "Nếu KHÔNG có odds thật thì phân tích bình thường theo framework, "
+                    "TUYỆT ĐỐI không được ghi 'Thiếu dữ liệu' chỉ vì thiếu odds.\n"
                     "\n\nPhân tích gốc:\n" + content[:3000])
                 jtxt, jerr = await get_ai_response(
                     session, [{"role": "user", "content": json_prompt}], max_tokens=900,
