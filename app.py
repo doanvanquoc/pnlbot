@@ -3282,6 +3282,31 @@ async def _fetch_league_fixtures(session, fetched, league_hint=None):
     return parsed
 
 
+def _calibration_lines():
+    """Lịch sử hit-rate theo bucket % AI đã ghi — để bắt AI hạ % nổ cho đúng thực tế."""
+    out = []
+    try:
+        graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss')]
+        if len(graded) >= 5:
+            w = sum(1 for p in graded if p['status'] == 'win')
+            out.append(f"TỔNG: mày thắng {w}/{len(graded)} ({w/len(graded)*100:.0f}%) — liệu mà ghi % cho khớp!")
+        buckets = {}
+        for p in graded:
+            try:
+                b = f"{int(float(p.get('prob') or 0)) // 10 * 10}-{int(float(p.get('prob') or 0)) // 10 * 10 + 9}"
+            except Exception:
+                continue
+            buckets.setdefault(b, [0, 0])
+            buckets[b][0 if p['status'] == 'win' else 1] += 1
+        for b in sorted(buckets):
+            w, l = buckets[b]
+            if w + l >= 3:
+                out.append(f"Kèo mày ghi {b}% thực tế chỉ thắng {w}/{w+l} ({w/(w+l)*100:.0f}%) — cấm ghi % cao hơn thực tế")
+    except Exception:
+        pass
+    return out
+
+
 async def _agent_execute(session, chat_id, name, args):
     """Thực thi 1 tool agent. Trả về text kết quả."""
     if name == 'web_search':
@@ -3611,6 +3636,7 @@ async def _agent_execute(session, chat_id, name, args):
         for mk, (w, l) in sorted(by_market.items()):
             if w + l >= 3:
                 hist_lines.append(f"Bot {mk}: {w}/{w+l} ({w/(w+l)*100:.0f}%)")
+        hist_lines += _calibration_lines()
         hist_block = ""
         if hist_lines:
             hist_block = "\n\nLỊCH SỬ DỰ ĐOÁN CỦA BOT (dùng để calibrate % — đừng lặp lại sai lầm cũ):\n" + "\n".join(hist_lines[:8])
@@ -3808,6 +3834,11 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     "Kèo KHÔNG bắt buộc thắng theo tỉ số kịch bản, NHƯNG không được mâu thuẫn vật lý: BTTS Có mà tỉ số có đội 0 bàn; Xỉu/Tài lệch tổng bàn >1.5; 1X2 khác phe đội thắng; Châu Á thua sâu margin <-1.25.\n"
                     "Schema (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
                     + KEO_JSON_SCHEMA +
+                    "\nBASE RATE THỰC TẾ (không được ảo tưởng): chủ nhà thắng ~44%, hòa ~26%, khách ~30%. "
+                    "1X2: CẤM chọn 1 cửa quá 65% trừ khi chênh lệch hạng/đội hình rõ rệt và có số liệu. "
+                    "Châu Á đội cửa trên chấp -0.5 trở lên: phải thắng cách biệt mới ăn — kiểm tra hiệu số + khả năng ghi bàn, "
+                    "nếu không chắc thắng cách biệt thì chọn cửa dưới/kèo + hoặc pct thấp. "
+                    "Hòa xảy ra 1/4 trận — kèo nào cũng phải tính cửa hòa, đừng mặc định đội mạnh thắng.\n"
                     "\nNếu phân tích gốc có ODDS THẬT (1xBet/Pinnacle): tính EV = pct/100 × odds − 1 cho từng kèo, "
                     "ưu tiên kèo EV>0.05 khi chốt best; ghi odds đã dùng vào why (vd '1xBet 2.10').\n"
                     "CHỈ khi có ODDS THẬT trong dữ liệu: mọi kèo 1X2/Tài xỉu chốt ra PHẢI có odds 1xBet > 1.5 — "
