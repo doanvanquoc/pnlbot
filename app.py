@@ -1864,79 +1864,37 @@ async def _agent_execute(session, chat_id, name, args):
         if _an and _an.get('result'):
             _mark_status_msg(chat_id, _an['result'].get('message_id'))
         now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
-        web = await tool_web_search(session, f"{q} football club match schedule {now_str}", 6)
-        fetched = ""
-        # Luôn thử Sky Sports: URL chuẩn theo tên đội — trang này đọc được, đầy đủ lịch trận thật
-        fetched = await _fetch_team_fixtures(session, q)
-        if not fetched and web and not web.startswith("Không"):
-            lines = web.split("\n")
-            for ln in lines:
-                m = re.search(r'https?://\S+', ln)
-                if m and any(d in ln for d in ('manutd.com', 'bbc.com/sport', 'skysports.com', 'espn.com',
-                                               'theguardian.com', 'goal.com', 'flashscore', 'sofascore', 'livescore',
-                                               'aiscore', 'fotmob', 'sport')):
-                    fetched = await tool_fetch_url(session, m.group(0).rstrip('.,)'))
-                    break
-        system = (
-            "Bạn là chuyên gia soi kèo bóng đá. Phân tích SÂU trong đầu (phong độ, đối đầu, động lực, lực lượng, "
-            "lối chơi, bối cảnh — dùng dữ liệu user + kiến thức bóng đá, thiếu thì ước lượng) "
-            "NHƯNG XUẤT RA CHỈ KẾT QUẢ GỌN NHẤT theo đúng mẫu sau (không viết bài phân tích dài):\n\n"
-            "⚽ [Tên giải] TeamA vs TeamB (giờ VN)\n"
-            "(nếu đang đá thêm: 🔴 LIVE phút XX — tỉ số X-Y)\n"
-            "- 1X2: [lựa chọn] (tin cậy X%)\n"
-            "- Tài xỉu 2.5: [Tài/Xỉu] (tin cậy X%)\n"
-            "- Châu Á: [kèo] (tin cậy X%)\n"
-            "- BTTS: [Có/Không] (tin cậy X%)\n"
-            "- Thẻ: [Tài/Xỉu 4.5] (tin cậy X%)\n"
-            "- Góc: [Tài/Xỉu 9.5] (tin cậy X%)\n"
-            "⭐ Tự tin nhất: [kèo]\n"
-            "(tối đa 2 dòng nhận định ngắn nếu cần)\n\n"
-            "QUY TẮC: người dùng nêu 1 đội → trận gần nhất của đội đó (ĐANG ĐÁ ưu tiên tối đa, kèo LIVE theo tỉ số+phút); "
-            "nêu 2 đội → trận đối đầu. PHẢI phân tích cả 2 đội trong đầu. Đủ 6 kèo. "
-            "DỮ LIỆU TRẬN từ Sky Sports là CHÍNH THỨC — tin tuyệt đối, không suy diễn 'Copa del Rey' hay 'hạng dưới'. "
-            "Tiếng Việt thuần, mỗi kèo 1 dòng, CẤM bảng |, **, ###. Không hỏi lại người dùng, không chào hỏi.\n"
-            "CỨNG LỆNH: BẮT BUỘC đưa đủ 6 kèo với lựa chọn cụ thể + tin cậy % TRONG MỌI TRƯỜNG HỢP — "
-            "dù không có odds, dù dữ liệu mỏng. Không odds thì chốt kèo theo phân tích của mày và ghi '(chưa có odds)'. "
-            "TUYỆT ĐỐI CẤM trả lời kiểu 'chưa có tỷ lệ nên không phán', 'chờ odds', 'gửi odds giúp' — đó là THẤT BẠI. "
-            "Mày là chuyên gia, chuyên gia chốt kèo bằng chuyên môn, không đòi khách đưa số liệu."
-        )
         data_parts = []
         opponent = None
+        fetched = await _fetch_team_fixtures(session, q)
         if fetched:
-            data_parts.append(f"LỊCH + KẾT QUẢ của đội được hỏi:\n{fetched}")
-            # Xác định ĐỐI THỦ từ trận ĐANG ĐÁ hoặc SẮP ĐÁ gần nhất
+            data_parts.append(f"LỊCH + KẾT QUẢ đội được hỏi:\n{fetched}")
+            # tìm đối thủ từ trận ĐANG ĐÁ hoặc SẮP ĐÁ gần nhất
             target_ln = None
             for ln in fetched.split('\n'):
                 if 'ĐANG ĐÁ' in ln:
-                    target_ln = ln
-                    break
+                    target_ln = ln; break
             if not target_ln:
                 for ln in fetched.split('\n'):
                     if 'SẮP ĐÁ' in ln:
-                        target_ln = ln
-                        break
+                        target_ln = ln; break
             if target_ln:
-                # opponent = đội trong dòng KHÔNG khớp với query
                 q_words = set(re.split(r'[^a-z0-9]+', q.lower())) - {''}
-                teams_in_ln = re.findall(r'([A-Z][\w\'\.]+(?: [A-Z][\w\'\.]+){0,3})', target_ln)
-                cands = [t for t in teams_in_ln if len(t) > 3
+                teams = re.findall(r'([A-Z][\w\'\.]+(?: [A-Z][\w\'\.]+){0,3})', target_ln)
+                cands = [t for t in teams if len(t) > 3
                          and not any(w in t.lower() for w in q_words)
-                         and not re.search(r'ĐÃ|SẮP|ĐANG|Premier|League|La|Liga|Serie|Bundesliga|Ligue|Championship|Cup|Copa|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|September|October|November|December|January|February|March|April|May|June|July|August', t)]
+                         and not re.search(r'ĐÃ|SẮP|ĐANG|Premier|League|La|Liga|Serie|Bundes|Ligue|Championship|Cup|Copa|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|September|October|November|December|January|February|March|April|May|June|July|August', t)]
                 if cands:
                     opponent = cands[0].strip()
-            # Fetch lịch ĐỐI THỦ (slug từ tên đối thủ)
             if opponent:
                 opp_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
-                opp_data = ""
                 for cand in (f"https://www.skysports.com/{opp_slug}-fixtures",
                              f"https://www.skysports.com/{opp_slug}-scores-fixtures"):
                     pg = await tool_fetch_url(session, cand, max_chars=20000)
                     parsed = _parse_sky_fixtures(pg) if pg else ""
                     if parsed:
-                        opp_data = parsed
+                        data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{parsed}")
                         break
-                if opp_data:
-                    data_parts.append(f"LỊCH + KẾT QUẢ của ĐỐI THỦ ({opponent}):\n{opp_data}")
             league_data = await _fetch_league_fixtures(session, fetched)
             if league_data:
                 kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
@@ -1946,33 +1904,10 @@ async def _agent_execute(session, chat_id, name, args):
                        if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
                 if rel:
                     data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
-        if data_parts:
-            data_block = "\n\n".join(data_parts) + "\n\n(Lưu ý: các trận trên là LỊCH THI ĐẤU CHÍNH THỨC mùa 2026-27 — tin tuyệt đối, không suy diễn đội nào 'hạng dưới' hay 'Copa del Rey'.)"
-        else:
-            data_block = f"Kết quả web:\n{web}"
-        text, err = await get_ai_response(session, [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}"},
-        ], max_tokens=4000, timeout_s=180)
-        if err:
-            return f"Lỗi phân tích: {err}"
-        if 'not_found' in text or 'không tìm được trận' in text.lower() or 'không tìm thấy trận' in text.lower():
-            return f"AI không tìm được trận nào khớp '{q}'. Thử tên khác: mu, arsenal, sheffield united, real madrid..."
-        # Cắt bỏ preamble "Mình sẽ kiểm tra cấu trúc workspace..." của persona MintRouter
-        idx = text.find('\n## ')
-        if idx == -1:
-            idx = text.find('\n- **')
-        if idx != -1:
-            text = text[idx + 1:].strip()
-        # Lưu 1 bản ghi pending để /kq chấm (nếu người dùng tự xác nhận thắng/thua)
-        predictions[f"web_{int(time.time())}_{chat_id}"] = {
-            'match': q, 'datetime': '?', 'league': '?', 'scores': '', 'score_total': 0,
-            'market': 'AI phân tích', 'selection': 'xem nội dung', 'prob': 50, 'odds': None, 'ev': None,
-            'reasoning': text[:400], 'status': 'pending', 'result': None, 'graded': None,
-            'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'), 'kickoff_vn': '?', 'home': '', 'away': '',
-        }
-        _save_predictions()
-        return _clean_tg(text)[:4000]
+        data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
+                      + "\n\n".join(data_parts)) if data_parts else (
+                      f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(session, f"{q} football next match {now_str}", 5))
+        return ("Dữ liệu trận đấu (dùng làm nền tảng chốt 6 kèo):\n\n" + data_block)
     if name == 'my_stats':
         graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
         wins = [p for p in graded if p['status'] == 'win']
@@ -2002,7 +1937,21 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
         "Gọi tool cho tới khi có đủ dữ liệu trả lời đầy đủ. "
         "CỨNG LỆNH TỔNG HỢP: kết quả cuối PHẢI chứa đủ 6 kèo (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc) "
-        "với lựa chọn cụ thể + tin cậy %, kèm giờ đá + 2 đội — BẤKỂ KỂ tool trả về gì. "
+        "với lựa chọn cụ thể + tin cậy %, kèm giờ đá + 2 đội — BẤKỂ KỂ tool trả về gì.\n"
+        "FORMAT KẾT QUẢ CUỐI (đúng mẫu):\n"
+        "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
+        "(🔴 LIVE phút X — tỉ số nếu đang đá)\n"
+        "- 1X2: [lựa chọn] (tin cậy X%)\n"
+        "- Tài xỉu 2.5: [Tài/Xỉu] (tin cậy X%)\n"
+        "- Châu Á: [kèo] (tin cậy X%)\n"
+        "- BTTS: [Có/Không] (tin cậy X%)\n"
+        "- Thẻ: [Tài/Xỉu] (tin cậy X%)\n"
+        "- Góc: [Tài/Xỉu] (tin cậy X%)\n"
+        "⭐ Tự tin nhất: [kèo]\n"
+        "(1-2 dòng nhận định ngắn nếu cần)\n"
+        "KÈO KHÔNG CÓ SỐ → vẫn chốt bằng chuyên môn, ghi '(ước lượng)'. "
+        "CẤM: 'chưa có tỷ lệ', 'chưa đủ dữ liệu', 'chờ odds', 'hỏi lại người dùng', các mục ngoài lề (nguồn, khuyến cáo, quản lý vốn, 18+...). "
+        "Chỉ trả đúng format trên, không thêm mục khác."
         "KHÔNG BAO GIỜ: nói 'chưa có tỷ lệ', 'chưa đủ dữ liệu', 'chờ odds', 'hỏi lại người dùng cần cửa nào' — "
         "nếu tool thiếu số thì TỰ chốt theo chuyên môn của mày và ghi '(ước lượng)'. "
         "Trả lời ngắn gọn tiếng Việt. KHÔNG dùng bảng markdown (| | |) — dùng dòng đạn '- '. "
