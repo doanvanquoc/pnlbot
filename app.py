@@ -2432,23 +2432,8 @@ async def _agent_execute(session, chat_id, name, args):
         q_raw = (args.get('query') or '').strip()
         if not q_raw:
             return "LỖI: cần tên đội."
-        # Làm sạch query: bỏ từ ngữ chung, giữ tên đội + "vs" + tham số kèo
-        _strip_words = ('kèo', 'keo', 'phân tích', 'check', 'soi', 'vào', 'được không',
-                        'không', 'duoc', 'khong', 'nhé', 'nha', 'help', 'giúp', 'tao',
-                        'mày', 'bot', 'ơi', 'đi', 'hôm nay', 'tối nay', 'xem', 'cho')
-        q = q_raw.lower()
-        for sw in _strip_words:
-            q = q.replace(sw, ' ')
-        q = re.sub(r'\s+', ' ', q).strip()
-        # Giữ lại phần có tên đội (bỏ "tài 3.5" khỏi query tìm trận)
-        q_teams = re.split(r'(tài|xỉu|over|under|btts|1x2|châu á|handicap)', q)[0].strip()
-        if not q_teams:
-            q_teams = q
-        # Nếu query có "vs" → cả 2 đội; nếu không → chỉ 1 đội
-        if ' vs ' not in q_teams and ' v ' not in q_teams:
-            q = q_teams
-        else:
-            q = q_teams
+        q = q_raw
+        q_teams = q_raw
         await send_chat_action(session, chat_id)
         _an = await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
         if _an and _an.get('result'):
@@ -2732,7 +2717,9 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
     system_prompt = (
         "Bạn là PNL FOOTBALL BOT — trợ lý bóng đá toàn diện của anh Quốc (đẹp trai, giỏi nhất quả đất). "
         "Khi người dùng hỏi, TỰ QUYẾT ĐỊNH cần tool gì: "
-        "- Muốn phân tích/dự đoán kèo một đội/trận → PHẢI gọi analyze_keo NGAY (tool có dữ liệu lịch trận thật), "
+        "- Muốn phân tích/dự đoán kèo một đội/trận → PHẢI gọi analyze_keo NGAY (tool có dữ liệu lịch trận thật). "
+        "Khi gọi analyze_keo, query CHỈ chứa tên đội (vd 'mu', 'arsenal', 'mu vs mc') — KHÔNG kèm câu hỏi phân tích. "
+        "Câu hỏi phân tích (tài 3.5, btts, handicap...) để trong câu trả lời cuối, không đưa vào tool. "
         "TUYỆT ĐỐI KHÔNG tự web_search rồi tự kết luận kèo — kết quả web_search thường rác (trùng tên, thiếu dữ liệu). "
         "- Người dùng CHỈ nhắc tên một đội bóng (vd 'celta', 'mu', 'arsenal', 'real madrid') → đó là yêu cầu PHÂN TÍCH KÈO "
         "→ gọi analyze_keo NGAY với tên đó, đừng web_search chữ trần (sẽ dính kết quả rác kiểu chứng chỉ CELTA Cambridge). "
