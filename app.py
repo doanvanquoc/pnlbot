@@ -84,6 +84,14 @@ def _load_predictions():
         if os.path.exists(PREDICTIONS_FILE):
             with open(PREDICTIONS_FILE, "r", encoding="utf-8") as f:
                 predictions = json.load(f) or {}
+                # chuẩn hóa match_key cũ (tên thô) → slug chuẩn sắp xếp, để gộp bản trùng
+                for _p in predictions.values():
+                    try:
+                        _h, _a, _d = _p.get('home') or '', _p.get('away') or '', _p.get('date') or ''
+                        if _h and _a and _h != '?' and _a != '?' and _d:
+                            _p['match_key'] = _make_match_key(_h, _a, _d)
+                    except Exception:
+                        pass
     except Exception as e:
         logger.error(f"Lỗi nạp predictions: {e}")
 
@@ -1008,6 +1016,16 @@ def _odds_match_key(home, away):
     return f"{ha}|{ab}"
 
 
+def _make_match_key(home, away, kickoff):
+    """Key gộp trận ổn định: slug chuẩn + SẮP XẾP A-Z (MU vs MC == Man Utd vs Man City)."""
+    ha = _canon_team_slug(home or '') or (home or '').lower().strip()
+    ab = _canon_team_slug(away or '') or (away or '').lower().strip()
+    if not ha or not ab:
+        return f"{(home or '').lower()}|{(away or '').lower()}|{kickoff}"
+    a, b = sorted([ha, ab])
+    return f"{a}|{b}|{kickoff}"
+
+
 _standings_cache = {}  # league_id -> (data, timestamp)
 _team_stats_cache = {}  # (team_id, league_id) -> (data, timestamp)
 STATS_CACHE_TTL = 3600  # 1 giờ
@@ -1672,7 +1690,7 @@ async def cmd_keo(session, chat_id, arg=None):
     ts_now = int(time.time() * 1000)
     _mh = re.search(r'(.+?)\s+vs\s+(.+)', match_info, re.I)
     _home, _away = (_mh.group(1).strip(), _mh.group(2).strip()) if _mh else ('', '')
-    _mk = f"{_home.lower()}|{_away.lower()}|{datetime.now(TZ_VN).strftime('%Y-%m-%d')}" if _home and _away else ''
+    _mk = _make_match_key(_home, _away, datetime.now(TZ_VN).strftime('%Y-%m-%d')) if _home and _away else ''
     for i, pk in enumerate(picks):
         try:
             prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
@@ -2053,7 +2071,11 @@ async def results_loop(app):
                                 away = mm.group(2).strip()
                     if not home or not away or home == '?' or away == '?':
                         continue
-                    key = p.get('match_key') or f"{home.lower()}|{away.lower()}|{d}"
+                    # gộp theo CẶP ĐỘI (bỏ ngày) — AI hay ghi kickoff lệch nhau cho cùng 1 trận;
+                    # trong cửa sổ today/yest, 1 cặp đội chỉ đá 1 trận nên không sợ lẫn
+                    _ph = _canon_team_slug(home) or home.lower()
+                    _pa = _canon_team_slug(away) or away.lower()
+                    key = "|".join(sorted([_ph, _pa]))
                     web_groups.setdefault(key, {'home': home, 'away': away, 'preds': []})['preds'].append(p)
                 for key, g in web_groups.items():
                     try:
@@ -2692,7 +2714,7 @@ def _save_keo_batch(chat_id, obj, rendered):
     kickoff = str(obj.get('kickoff') or '')[:10]
     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', kickoff):
         kickoff = datetime.now(TZ_VN).strftime('%Y-%m-%d')
-    match_key = f"{home.lower()}|{away.lower()}|{kickoff}"
+    match_key = _make_match_key(home, away, kickoff)
     # tránh lưu trùng: trận này đã pending thì bỏ qua (bỏ qua khi chưa rõ đội)
     if home != '?' and away != '?':
         for p in predictions.values():
