@@ -1329,13 +1329,13 @@ def _grade_prediction(p, fixture):
         is_over = any(w in sel for w in ('tài', 'over', 'trên'))
         is_under = any(w in sel for w in ('xỉu', 'under', 'dưới'))
         if total > line:
-            result_txt = f"tổng {total} (Tài {line})"
+            result_txt = f"tổng {total} (Tài {line:g})"
             return ('win' if is_over else ('loss' if is_under else None)), result_txt
         if total < line:
-            result_txt = f"tổng {total} (Xỉu {line})"
+            result_txt = f"tổng {total} (Xỉu {line:g})"
             return ('win' if is_under else ('loss' if is_over else None)), result_txt
         # half-line: no push
-        result_txt = f"tổng {total} (hòa {line})"
+        result_txt = f"tổng {total} (hòa {line:g})"
         return 'push', result_txt
     # ── BTTS ──
     if 'btts' in market or 'both' in market or 'ghi bàn' in market or 'cả 2' in market:
@@ -1363,7 +1363,7 @@ def _grade_prediction(p, fixture):
         if is_home_side:
             effective = gh + h_val - ga
         else:
-            effective = ga - h_val - gh
+            effective = ga + h_val - gh
         if effective > 0:
             return 'win', f"margin {effective:+.1f}"
         if effective < 0:
@@ -2594,7 +2594,7 @@ def _keo_logic_check(obj):
                 if lean_hdc == 'A':
                     marg = ga_ + hv - gb_
                 else:
-                    marg = gb_ - hv - ga_
+                    marg = gb_ + hv - ga_
                 if marg < -1.25:
                     errs.append(f"Châu Á '{pa}' thua SÂU theo kịch bản {ga_}-{gb_} (margin {marg:+.2f}) — chọn cửa hợp lý hơn")
             except Exception:
