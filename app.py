@@ -812,6 +812,7 @@ ODDS_QUOTA_FILE = "odds_quota.json"
 ODDS_BOARD_TTL = 21600  # cache board 6h — pre-match odds đủ dùng, tiết kiệm quota
 ODDS_MONTHLY_BUDGET = 500
 ODDS_RESERVE = 50  # giữ lại, không xài cạn
+ODDS_MIN = 1.5  # kèo 1X2/Tài xỉu chốt ra PHẢI có odds 1xBet trên mức này
 # league (tên Sky bracket hoặc slug TEAM_LEAGUES) → sport key
 ODDS_SPORT_KEYS = {
     'Premier League': 'soccer_epl', 'premier-league': 'soccer_epl',
@@ -951,12 +952,13 @@ def format_odds_block(ev):
     return "ODDS THẬT (decimal):\n" + "\n".join(lines)
 
 
-def odds_price_for(market_key, pick, ev):
-    """Giá 1xBet cho đúng lựa chọn AI (để lưu odds + tính EV). None nếu không khớp."""
+def _odds_price_book(market_key, pick, ev):
+    """(price, book_key) 1xBet cho đúng lựa chọn AI; fallback Pinnacle. (None, None) nếu không khớp."""
     try:
         b = _book_markets(ev, 'onexbet') or _book_markets(ev, 'pinnacle')
         if not b:
-            return None
+            return None, None
+        bk = b.get('key')
         sel = (pick or '').lower()
         if market_key == '1x2':
             for m in b.get('markets', []) or []:
@@ -965,29 +967,35 @@ def odds_price_for(market_key, pick, ev):
                 for x in m.get('outcomes', []) or []:
                     nm = (x.get('name') or '')
                     if nm.lower() == 'draw' and re.search(r'hòa|draw|x2\s*$|^\s*x\b|1x', sel):
-                        return float(x.get('price'))
+                        return float(x.get('price')), bk
                     if nm == ev.get('home_team') and _side_eq(sel, nm):
-                        return float(x.get('price'))
+                        return float(x.get('price')), bk
                     if nm == ev.get('away_team') and _side_eq(sel, nm):
-                        return float(x.get('price'))
+                        return float(x.get('price')), bk
         elif market_key == 'tai_xiu':
             mline = re.search(r'(\d+(?:[.,]\d+)?)', sel)
             line = float(mline.group(1).replace(',', '.')) if mline else None
             side = 'Over' if re.search(r'tài|over', sel) else ('Under' if re.search(r'xỉu|under', sel) else None)
             if line is None or not side:
-                return None
+                return None, None
             for m in b.get('markets', []) or []:
                 if m.get('key') != 'totals':
                     continue
                 for x in m.get('outcomes', []) or []:
                     try:
                         if x.get('name') == side and abs(float(x.get('point')) - line) < 0.01:
-                            return float(x.get('price'))
+                            return float(x.get('price')), bk
                     except Exception:
                         continue
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
+
+
+def odds_price_for(market_key, pick, ev):
+    """Giá 1xBet cho đúng lựa chọn AI (để lưu odds + tính EV). None nếu không khớp."""
+    price, _bk = _odds_price_book(market_key, pick, ev)
+    return price
 
 
 # key match_key (slug chuẩn) -> odds event, để _save_keo_batch gắn odds+EV thật
@@ -1888,18 +1896,20 @@ def _fold(s):
 
 
 def _side_eq(stored, lineside):
-    """So khớp tên đội 2 phía (chuẩn hóa alias trước, fallback chuỗi)."""
+    """So khớp tên đội 2 phía (chuẩn hóa alias trước, fallback chuỗi không phân biệt gạch nối/cách)."""
     if not stored or not lineside:
         return False
     cs, cl = _canon_team_slug(stored), _canon_team_slug(lineside)
     if cs and cl:
         return cs == cl
     fs, fl = _fold(stored), _fold(lineside)
+    ns = re.sub(r'[^a-z0-9]', '', fs)
+    nl = re.sub(r'[^a-z0-9]', '', fl)
     if cs and not cl:
-        return cs.replace('-', ' ') in fl
+        return cs.replace('-', ' ') in fl or (len(ns) >= 6 and ns in nl)
     if cl and not cs:
-        return len(fs) >= 3 and fs in fl
-    return len(fs) >= 4 and fs in fl
+        return (len(fs) >= 3 and fs in fl) or (len(ns) >= 6 and ns in nl)
+    return (len(fs) >= 4 and fs in fl) or (len(ns) >= 4 and ns in nl)
 
 
 def _sky_extract_score(page_text, home, away):
@@ -2451,6 +2461,29 @@ def _keo_logic_check(obj):
             errs.append(f"kèo '{_k}' pct={_pc} — xác suất thật không bao giờ 100%, hạ xuống dưới 90")
         elif _pc > 0 and re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', _pp, re.I):
             errs.append(f"kèo '{_k}' là placeholder ('{_pp}') với pct={_pp} — phải ra kèo thật có số liệu, hoặc pct=0")
+    # R-0: kèo 1X2/Tài xỉu PHẢI có odds 1xBet > ODDS_MIN (khi có odds thật để đối chiếu)
+    try:
+        _lh, _la = _split_vs(header)
+        _lev = _ODDS_BY_MATCH.get(_odds_match_key(_lh, _la)) if _lh and _la else None
+    except Exception:
+        _lev = None
+    if _lev:
+        for _k in ('1x2', 'tai_xiu'):
+            _v = (ks or {}).get(_k) or {}
+            if not isinstance(_v, dict):
+                continue
+            _pp = str(_v.get('pick') or '')
+            try:
+                _pc = int(_v.get('pct', 0))
+            except Exception:
+                _pc = 0
+            if _pc <= 0:
+                continue
+            if re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', _pp, re.I):
+                continue
+            _pr, _bk = _odds_price_book(_k, _pp, _lev)
+            if _pr is not None and _pr <= ODDS_MIN:
+                errs.append(f"kèo '{_k}' ({_pp}) odds chỉ {_pr:g} ≤ {ODDS_MIN} — đổi cửa/line khác có odds > {ODDS_MIN}, không được thì ghi 'Thiếu dữ liệu' pct=0")
     # R0: kịch bản phải có tỉ số cụ thể — mọi kèo phải khớp tỉ số này
     # format bắt buộc: 'TeamNhà X-Y TeamKhách' (hoặc có tên đội kèm tỉ số) → map đúng phe
     ps = str(obj.get('scenario') or '')
@@ -2595,6 +2628,14 @@ def _render_keo_from_json(obj, single_key=None):
     live = str(obj.get('live') or '').strip()
     if live and live[:50] != out[0][:50]:
         out.append(live[:90])
+    # odds thật cho 2 kèo có giá (1X2/tài xỉu) — tra từ event đã stash lúc phân tích
+    _rev = None
+    try:
+        _rh, _ra = _split_vs(obj.get('header') or '')
+        if _rh and _ra:
+            _rev = _ODDS_BY_MATCH.get(_odds_match_key(_rh, _ra))
+    except Exception:
+        _rev = None
     pairs = (('1X2', '1x2'), ('Tài xỉu', 'tai_xiu'), ('Châu Á', 'chau_a'), ('BTTS', 'btts'), ('Thẻ', 'the'), ('Góc', 'goc'))
     if single_key:
         pairs = [(d, k) for d, k in pairs if k == single_key]
@@ -2607,7 +2648,15 @@ def _render_keo_from_json(obj, single_key=None):
         except Exception:
             pct = None
         if p and not (pct and re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', p, re.I)):
-            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}")
+            _tag = ''
+            if _rev is not None and key in ('1x2', 'tai_xiu'):
+                try:
+                    _pr, _bk = _odds_price_book(key, p, _rev)
+                    if _pr:
+                        _tag = f" @{_pr:g}" + ("" if _bk == 'onexbet' else " (Pin)")
+                except Exception:
+                    _tag = ''
+            out.append(f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}{_tag}")
     if single_key:
         return '\n'.join(out) if len(out) >= 2 else None
     if len(out) < 5:
@@ -2748,7 +2797,7 @@ TEAM_SKY_SLUGS = {
     'atm': 'atletico-madrid', 'atleti': 'atletico-madrid',
     'bvb': 'borussia-dortmund', 'dortmund': 'borussia-dortmund',
     'bayern': 'bayern-munich', 'munich': 'bayern-munich',
-    'psg': 'paris-saint-germain',
+    'psg': 'paris-saint-germain', 'paris saint germain': 'paris-saint-germain',
     'inter': 'inter-milan', 'milan': 'ac-milan', 'juve': 'juventus', 'napoli': 'napoli',
     'sheffield united': 'sheffield-united', 'sheff utd': 'sheffield-united', 'sheffield utd': 'sheffield-united',
     'sheffield': 'sheffield-united', 'blades': 'sheffield-united',
@@ -3737,6 +3786,8 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     + KEO_JSON_SCHEMA +
                     "\nNếu phân tích gốc có ODDS THẬT (1xBet/Pinnacle): tính EV = pct/100 × odds − 1 cho từng kèo, "
                     "ưu tiên kèo EV>0.05 khi chốt best; ghi odds đã dùng vào why (vd '1xBet 2.10').\n"
+                    "Mọi kèo 1X2/Tài xỉu chốt ra PHẢI có odds 1xBet > 1.5 — kèo nào chỉ có cửa ≤1.5 thì đổi line/cửa khác, "
+                    "không đổi được thì ghi 'Thiếu dữ liệu' pct=0.\n"
                     "\n\nPhân tích gốc:\n" + content[:3000])
                 jtxt, jerr = await get_ai_response(
                     session, [{"role": "user", "content": json_prompt}], max_tokens=900,
