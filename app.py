@@ -1212,7 +1212,10 @@ async def cmd_keo(session, chat_id, arg=None):
         f"{KEO_FRAMEWORK}\n"
         "Trả về JSON: {\"match\": \"A vs B\", \"datetime\": \"ngày giờ giờ VN\", \"league\": \"...\", "
         "\"scores\": {\"phong_do\": 4, \"doi_dau\": 3, \"dong_luc\": 5, \"luc_luong\": 4, \"loi_choi\": 3, \"boi_canh\": 4}, "
-        "\"market\": \"1X2 hoặc Tài xỉu 2.5 hoặc Asian Handicap...\", \"selection\": \"chi tiết kèo\", \"prob\": 55, "
+        "\"picks\": [ {\"market\": \"1X2\", \"selection\": \"Home\", \"prob\": 58}, "
+        "{\"market\": \"Tài xỉu 2.5\", \"selection\": \"Under\", \"prob\": 55}, "
+        "{\"market\": \"Asian Handicap\", \"selection\": \"Home -0.5\", \"prob\": 54}, "
+        "{\"market\": \"BTTS\", \"selection\": \"No\", \"prob\": 52} ] (TỐI THIỂU 3 KÈO: 1X2, tài xỉu, handicap; thêm BTTS/góc/thẻ nếu đủ dữ liệu), "
         "\"reasoning\": \"...\"}. Nếu không xác định được trận nào: {\"not_found\": true, \"note\": \"...\"}"
     )
     pred, err = await get_ai_json(session, system,
@@ -1236,32 +1239,49 @@ async def cmd_keo(session, chat_id, arg=None):
         total += max(0, min(s, 5))
         score_lines.append(f"• {vn}: {max(0, min(s, 5))}/5")
     score_txt = "\n".join(score_lines)
-    record = {
-        'match': str(pred.get('match') or query),
-        'datetime': str(pred.get('datetime') or '?'),
-        'league': str(pred.get('league') or '?'),
-        'scores': score_txt,
-        'score_total': total,
-        'market': str(pred.get('market') or '?'),
-        'selection': str(pred.get('selection') or '?'),
-        'prob': max(1.0, min(float(pred.get('prob', 50)), 99.0)),
-        'odds': None, 'ev': None,
-        'reasoning': str(pred.get('reasoning') or '')[:500],
-        'status': 'pending', 'result': None, 'graded': None,
-        'fixture_id': f"web_{int(time.time())}_{chat_id}",
-        'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
-        'kickoff_vn': str(pred.get('datetime') or '?'),
-        'home': '', 'away': '',
-    }
-    predictions[record['fixture_id']] = record
+    match_info = str(pred.get('match') or query)
+    dt = str(pred.get('datetime') or '?')
+    league = str(pred.get('league') or '?')
+    picks = pred.get('picks') or []
+    ts_now = int(time.time())
+    for i, pk in enumerate(picks):
+        try:
+            prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
+        except Exception:
+            prob = 50.0
+        rec = {
+            'match': match_info, 'datetime': dt, 'league': league,
+            'scores': score_txt, 'score_total': total,
+            'market': str(pk.get('market') or '?'),
+            'selection': str(pk.get('selection') or '?'),
+            'prob': prob, 'odds': None, 'ev': None,
+            'reasoning': str(pred.get('reasoning') or '')[:500],
+            'status': 'pending', 'result': None, 'graded': None,
+            'fixture_id': f"web_{ts_now}_{chat_id}_{i}",
+            'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
+            'kickoff_vn': dt, 'home': '', 'away': '',
+        }
+        predictions[rec['fixture_id']] = rec
     _save_predictions()
-    await send_telegram_message(session, chat_id,
-        "⚽ *KÈO AI CHỌN:*\n"
-        f"Trận: {record['match']} ({record['datetime']}) [{record['league']}]\n"
-        f"→ *{record['market']} — {record['selection']}* (xác suất {record['prob']:.0f}%)\n"
-        f"Lý do: {record['reasoning']}\n\n"
-        "💰 *Dán odds 1xBet của trận này vào* để bot tính EV chính xác (mày đang mở app mà).\n"
-        "Vd: `tx2.5 1.90 1.95`, `1x2 2.40 3.60 2.80`, `hdc 1.85 2.00`")
+    lines = ["⚽ *AI PHÂN TÍCH TRẬN:*", f"Trận: {match_info} ({dt}) [{league}]", ""]
+    if score_txt:
+        lines.append(f"📊 *Bảng điểm:* {total}/30")
+        lines.append(score_txt)
+        lines.append("")
+    if picks:
+        lines.append("*Dự đoán từng loại kèo:*")
+        best = max(picks, key=lambda p: float(p.get('prob') or 0))
+        for pk in picks:
+            prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
+            mark = "🔥" if pk is best else "•"
+            lines.append(f"{mark} {pk.get('market')} → *{pk.get('selection')}* ({prob:.0f}%)")
+        lines.append("")
+        lines.append(f"💡 Chắc ăn nhất: *{best.get('market')} — {best.get('selection')}* "
+                     f"({float(best.get('prob', 50)):.0f}%)")
+    lines.append(f"Lý do: {str(pred.get('reasoning') or '')[:400]}")
+    lines.append("")
+    lines.append("💰 Có odds 1xBet thì dán vào (vd `tx2.5 1.90 1.95`, `1x2 2.40 3.60 2.80`) — t tính EV cho từng kèo.")
+    await send_telegram_message(session, chat_id, "\n".join(lines))
 
 
 def _parse_odds_msg(text):
