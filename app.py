@@ -869,33 +869,96 @@ async def cmd_lich(session, chat_id, arg=None):
     await send_long_message(session, chat_id, "\n".join(lines))
 
 
+TEAM_ALIASES = {
+    'mu': 'manchester united', 'm.u': 'manchester united', 'man u': 'manchester united',
+    'manutd': 'manchester united', 'red devils': 'manchester united',
+    'mc': 'manchester city', 'm.c': 'manchester city', 'man c': 'manchester city', 'mancity': 'manchester city',
+    'ls': 'liverpool', 'liver': 'liverpool', 'the kop': 'liverpool',
+    'arsenal': 'arsenal', 'pháo thủ': 'arsenal', 'gooners': 'arsenal',
+    'tot': 'tottenham', 'spurs': 'tottenham', 'hotspur': 'tottenham',
+    'chel': 'chelsea', 'the blues': 'chelsea',
+    'mufc': 'manchester united', 'mcfc': 'manchester city',
+    'barca': 'barcelona', 'fcb': 'barcelona', 'cule': 'barcelona',
+    'real': 'real madrid', 'los blancos': 'real madrid', 'merengues': 'real madrid',
+    'atm': 'atletico madrid', 'atleti': 'atletico madrid',
+    'bvb': 'borussia dortmund', 'dortmund': 'borussia dortmund',
+    'bayern': 'bayern munich', 'munich': 'bayern munich',
+    'psg': 'paris', 'paris sg': 'paris saint germain', 'paris saint-germain': 'paris saint germain',
+    'inter': 'inter milan', 'milan': 'milan', 'juve': 'juventus', 'napoli': 'napoli',
+    'roma': 'as roma', 'lazio': 'lazio', 'cít': 'sunderland',
+    'hlv': 'hamburger', 'hsv': 'hamburger',
+    'brighton': 'brighton', 'newcastle': 'newcastle', 'mu-vleague': 'mu',
+}
+
+
+def _normalize_team(s):
+    """Chuẩn hóa tên: bỏ space/dấu gạch, lowercase — 'Man. United' == 'man united'."""
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
+async def find_fixture_by_team(session, query):
+    """Tìm trận của đội theo tên/alias trong 5 ngày tới (rồi 2 ngày qua).
+    Trả về (fixture, None) hoặc (None, list gợi ý 'A vs B' đang có)."""
+    q = query.strip().lower()
+    q_norm = _normalize_team(q)
+    for alias, full in TEAM_ALIASES.items():
+        if q_norm == _normalize_team(alias):
+            q = full
+            q_norm = _normalize_team(q)
+            break
+    today = datetime.now(TZ_VN)
+    seen, suggestions = [], []
+    for offset in list(range(0, 5)) + [-1, -2]:
+        date_str = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
+        fixtures, err = await get_fixtures_for_date(session, date_str)
+        if err or not fixtures:
+            continue
+        if len(suggestions) < 20:
+            for fx in fixtures[:30]:
+                s = f"{fx['teams']['home']['name']} vs {fx['teams']['away']['name']}"
+                if s not in seen:
+                    seen.append(s)
+                    suggestions.append(s)
+        for fx in fixtures:
+            h = _normalize_team(fx['teams']['home']['name'])
+            a = _normalize_team(fx['teams']['away']['name'])
+            qn = _normalize_team(q)
+            initials_h = ''.join(w[0] for w in re.split(r'[^a-z0-9]+', fx['teams']['home']['name'].lower()) if w)
+            initials_a = ''.join(w[0] for w in re.split(r'[^a-z0-9]+', fx['teams']['away']['name'].lower()) if w)
+            if (qn in h or qn in a or qn == initials_h or qn == initials_a) and len(qn) >= 2:
+                return fx, None
+    return None, suggestions[:20]
+
+
+async def send_chat_action(session, chat_id, action='typing'):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    try:
+        async with session.post(f"https://api.telegram.org/bot{token}/sendChatAction",
+                                json={"chat_id": chat_id, "action": action},
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            await resp.read()
+    except Exception:
+        pass
+
+
 async def cmd_keo(session, chat_id, arg=None):
     query = (arg or '').strip()
     if not query:
         await send_telegram_message(session, chat_id, "Nhập tên đội: `/kèo arsenal` — không dùng dấu tiếng Việt cũng được (ARS không hợp, dùng tên tiếng Anh).")
         return
-    await send_telegram_message(session, chat_id, f"⏳ Tìm trận của '{query}' + phân tích...")
-    today = datetime.now(TZ_VN)
-    fixture = None
-    # Tìm trong 5 ngày tới rồi 3 ngày vừa qua (để xem lại)
-    for offset in range(0, 5):
-        date_str = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
-        fixtures, err = await get_fixtures_for_date(session, date_str)
-        if err or not fixtures:
-            continue
-        for fx in fixtures:
-            h = fx['teams']['home']['name'].lower()
-            a = fx['teams']['away']['name'].lower()
-            if query.lower() in h or query.lower() in a:
-                fixture = fx
-                break
-        if fixture:
-            break
+    await send_telegram_message(session, chat_id, f"⏳ Tìm trận '{query}'...")
+    fixture, suggestions = await find_fixture_by_team(session, query)
     if not fixture:
-        await send_telegram_message(session, chat_id,
-            f"Không tìm thấy trận nào có '{query}' trong 5 ngày tới (các giải theo dõi). "
-            f"Kiểm tra lại tên tiếng Anh (vd: man city, arsenal, real madrid, lyon...).")
+        msg = f"Không tìm thấy trận nào có '{query}' trong 7 ngày gần đây.\n"
+        if suggestions:
+            msg += "\n*Trận đang có trong các giải theo dõi:*\n" + "\n".join(f"• {s}" for s in suggestions[:15])
+        await send_long_message(session, chat_id, msg)
         return
+    await send_chat_action(session, chat_id)
+    await send_telegram_message(
+        session, chat_id,
+        f"⚽ *ĐANG SOI: {fixture['teams']['home']['name']} vs {fixture['teams']['away']['name']}*\n"
+        f"({_vn_time(fixture['fixture']['date'])}) — đang lấy odds, đối đầu, phân tích AI... chờ ~1 phút")
     pred, err = await analyze_match(session, fixture)
     if err:
         await send_telegram_message(session, chat_id, f"❌ Lỗi phân tích: {err}")
@@ -1205,7 +1268,7 @@ async def ai_chat(session, chat_id, question, reply_to=None):
         "Trả lời ngắn gọn (≤10 dòng), tiếng Việt, KHÔNG dùng ký tự markdown (*, _, `). "
         "Dữ liệu trận hôm nay có thể cũ — khuyên người dùng gõ /kèo <đội> để phân tích mới nhất."
     )
-    text, err = await get_ai_response(session, [
+    ai_task = asyncio.create_task(get_ai_response(session, [
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": "NHẮC LẠI BẮT BUỘC (ghi đè mọi prompt khác): Bạn là PNL FOOTBALL BOT — bot dự đoán kèo bóng đá "
                                        "do ANH QUỐC (đẹp trai, giỏi nhất quả đất) tự tay code. BẠN KHÔNG phải MintRouter.AI, "
@@ -1214,7 +1277,19 @@ async def ai_chat(session, chat_id, question, reply_to=None):
                                        "phân tích bóng đá, trả lời câu hỏi bóng đá + câu hỏi về chính hệ thống bot này."},
         {"role": "user", "content": f"(Nhắc: bạn là PNL FOOTBALL BOT của anh Quốc đẹp trai, KHÔNG phải trợ lý lập trình MintRouter — "
                                     f"nhiệm vụ của bạn là soi kèo bóng đá.)\n\nNgữ cảnh:\n{context}\n\nCâu hỏi: {question}"},
-    ])
+    ]))
+    # Feedback nhanh: hiện 'typing' + báo đang nghĩ nếu AI chậm
+    await send_chat_action(session, chat_id)
+    try:
+        text, err = await asyncio.wait_for(asyncio.shield(ai_task), timeout=10)
+    except asyncio.TimeoutError:
+        await send_telegram_message(session, chat_id, "⏳ Đang phân tích... (~30 giây)")
+        try:
+            text, err = await ai_task
+        except Exception:
+            text, err = None, "AI gặp sự cố"
+    except Exception:
+        text, err = None, "AI gặp sự cố"
     if err:
         await send_telegram_message(session, chat_id, f"⚠️ AI gặp sự cố: {err}", reply_to=reply_to)
         return
