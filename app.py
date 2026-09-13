@@ -5626,6 +5626,206 @@ def _save_ai_alert_state():
         logger.error(f"Lỗi lưu ai_alert_state: {e}")
 
 
+# ─── Pump radar: phát hiện coin "bất ngờ bay vút" CÒN nhiên liệu để pump tiếp ───
+PUMP_RADAR_INTERVAL = int(float(os.getenv('PUMP_RADAR_INTERVAL', '600')))  # 10 phút
+PUMP_SCORE_MIN = float(os.getenv('PUMP_SCORE_MIN', '6.5'))                 # ngưỡng điểm báo
+PUMP_CHANGE_MIN = 15.0            # % tăng 24h tối thiểu để coi là "đang bay"
+PUMP_COOLDOWN_SEC = 2 * 3600      # không báo lại cùng coin trong 2h
+PUMP_MAX_ITEMS = 3
+PUMP_STATE_FILE = "pump_radar_state.json"
+pump_last_alerted = {}            # symbol -> ts lần báo gần nhất
+
+
+def _load_pump_state():
+    try:
+        if os.path.exists(PUMP_STATE_FILE):
+            with open(PUMP_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                global pump_last_alerted
+                pump_last_alerted = {k: float(v) for k, v in raw.items()}
+    except Exception as e:
+        logger.error(f"Lỗi nạp pump_radar_state: {e}")
+
+
+def _save_pump_state():
+    try:
+        with open(PUMP_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(pump_last_alerted, f)
+    except Exception as e:
+        logger.error(f"Lỗi lưu pump_radar_state: {e}")
+
+
+def _pump_score(res_15m, res_1h, change24, funding, oi_change, taker_ratio):
+    """Điểm 0-10 đo 'đà tăng còn nguyên hay đã cháy đuồi' cho coin đang bay."""
+    score = 0.0
+    reasons = []
+    if res_15m.get('close') and res_15m.get('ema9') and res_15m.get('ema21'):
+        if res_15m['close'] > res_15m['ema9'] > res_15m['ema21']:
+            score += 2
+            reasons.append("15m EMA stack chuẩn 🟢")
+        if res_15m['close'] > (res_15m.get('vwap') or 0):
+            score += 1
+            reasons.append("giá trên VWAP 15m")
+    if res_1h.get('close') and res_1h.get('ema9') and res_1h.get('ema21'):
+        if res_1h['close'] > res_1h['ema9'] > res_1h['ema21']:
+            score += 2
+            reasons.append("1h uptrend còn nguyên")
+    vr = res_15m.get('vol_ratio') or 0
+    if vr >= 2.0:
+        score += 2
+        reasons.append(f"volume x{vr:.1f} so với MA20 (tiền đổ vào thật)")
+    elif vr >= 1.3:
+        score += 1
+    f = funding if funding is not None else 0.0
+    if f <= 0:
+        score += 2
+        reasons.append(f"funding {f * 100:+.3f}% — short bị vắt le, nhiên liệu squeeze")
+    elif 0 < f <= 0.0005:
+        score += 1
+    elif f > 0.0015:
+        score -= 2
+        reasons.append(f"funding {f * 100:+.3f}% — long đang đông, dễ cháy đuồi ⚠️")
+    oi = oi_change if oi_change is not None else 0.0
+    if oi > 2:
+        score += 2
+        reasons.append(f"OI +{oi:.1f}% — tiền mới vẫn vào vị thế")
+    elif oi < -2:
+        score -= 1
+        reasons.append(f"OI {oi:+.1f}% — tiền đang rút ❌")
+    if taker_ratio and taker_ratio > 1.02:
+        score += 1
+        reasons.append("taker mua > bán")
+    # Quá muộn: đã bay quá xa thì rủi ro đón đầu cao
+    if change24 > 120:
+        score -= 2
+        reasons.append(f"đã bay +{change24:.0f}%/24h — VERY late ⚠️")
+    elif change24 > 60:
+        score -= 1
+        reasons.append(f"đã bay +{change24:.0f}%/24h")
+    return max(0.0, min(score, 10.0)), reasons
+
+
+async def detect_pump_candidates(session, limit=6):
+    """Tìm coin đang 'bay vút' còn nhiên liệu pump tiếp.
+    Trả về list dict: symbol, change24, score, reasons, signal15m, funding, oi_change, tp/sl/close (1h)."""
+    try:
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr") as resp:
+            if resp.status != 200:
+                return []
+            tickers = await resp.json()
+    except Exception as e:
+        logger.warning(f"[PUMP-RADAR] Lỗi ticker 24h: {e}")
+        return []
+    SCAN_BLACKLIST = {'AAPLUSDT', 'NVDAUSDT', 'MSTRUSDT', 'TSLAUSDT', 'GOOGLUSDT', 'AMZNUSDT', 'METAUSDT',
+                      'MSFTUSDT', 'COINUSDT', 'NFLXUSDT', 'AVGOUSDT', 'ORCLUSDT', 'PLTRUSDT', 'HOODUSDT',
+                      'SPXUSDT', 'SPYUSDT', 'QQQUSDT', 'IWMUSDT', 'SOXLUSDT', 'SOXSUSDT', 'TSLLUSDT',
+                      'XAUUSDT', 'XAGUSDT', 'XPTUSDT', 'XBIUSDT', 'DDOGUSDT', 'CRMUSDT', 'PLTRUSDT',
+                      'PUMPBTCUSDT', 'BTCUSDT_260925', 'ETHUSDT_260925', 'BTCUSDT_261225', 'ETHUSDT_261225'}
+    cands = []
+    for t in tickers:
+        sym = t['symbol']
+        if not sym.endswith('USDT') or sym in SCAN_BLACKLIST:
+            continue
+        change = float(t.get('priceChangePercent', 0))
+        if change < PUMP_CHANGE_MIN:
+            continue
+        if float(t.get('quoteVolume', 0)) < 2_000_000:  # thanh khoản tối thiểu
+            continue
+        cands.append((sym, change))
+    cands.sort(key=lambda x: x[1], reverse=True)
+    cands = cands[:limit]
+    if not cands:
+        return []
+    sem = asyncio.Semaphore(4)
+
+    async def analyze_one(sym, change):
+        async with sem:
+            try:
+                res_15m, res_1h = await asyncio.gather(
+                    analyze_market(session, sym, interval='15m', fetch_extras=False),
+                    analyze_market(session, sym, interval='1h'))
+                if not res_15m or not res_1h:
+                    return None
+                funding = res_1h.get('funding_rate')
+                if funding is None:
+                    funding = await get_single_funding_rate(session, sym)
+                oi = res_1h.get('oi_change')
+                if oi is None:
+                    oi = 0.0
+                score, reasons = _pump_score(res_15m, res_1h, change, funding, oi, res_1h.get('taker_ratio'))
+                return {'symbol': sym, 'change24': change, 'score': score, 'reasons': reasons,
+                        'signal15m': res_15m.get('signal'), 'signal1h': res_1h.get('signal'),
+                        'confidence': res_1h.get('confidence'), 'funding': funding, 'oi_change': oi,
+                        'close': res_1h.get('close'), 'tp': res_1h.get('tp'), 'sl': res_1h.get('sl'),
+                        'vwap15m': res_15m.get('vwap')}
+            except Exception as e:
+                logger.warning(f"[PUMP-RADAR] Lỗi phân tích {sym}: {e}")
+                return None
+    results = await asyncio.gather(*[analyze_one(s, c) for s, c in cands])
+    results = [r for r in results if r]
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results
+
+
+def _fmt_pump_message(cands, mode="auto"):
+    """Format tin báo pump radar."""
+    if not cands:
+        return None
+    lines = ["🚀 *PUMP RADAR — coin đang bay vút, còn nhiên liệu pump tiếp*"]
+    for c in cands[:PUMP_MAX_ITEMS]:
+        r_txt = " · ".join(c['reasons'][:3])
+        sym_disp = display_symbol(c['symbol'])
+        lines.append(
+            f"\n• *{sym_disp}* — điểm sức khỏe {c['score']:.1f}/10 🔥\n"
+            f"  Giá {format_price(c['close'])} (+{c['change24']:.1f}%/24h) | 15m {c['signal15m']} / 1h {c['signal1h']} ({c['confidence']})\n"
+            f"  {r_txt}\n"
+            f"  TP gợi ý {format_price(c['tp'])} | SL {format_price(c['sl'])}"
+        )
+    lines.append(
+        "\n⚠️ *Quy tắc FOMO an toàn:* KHÔNG đuổi nến đang chạy — chờ pullback về VWAP 15m/EMA9 rồi vào, "
+        "size ≤ 5-10% vốn, SL ngay dưới đáy nến bùng nổ. Coin đã bay >60%/24h là nhảy dù, lợi nhuận kèm rủi ro cao."
+        + ("" if mode == "auto" else " (bạn vừa yêu cầu quét)")
+    )
+    return "\n".join(lines)
+
+
+async def pump_radar_loop(app):
+    """Mỗi 10 phút: quét coin đang bay vút còn nhiên liệu pump tiếp → báo Telegram.
+    Chỉ BÁO, không tự vào lệnh. /stopauto all sẽ tắt cả radar này."""
+    await asyncio.sleep(120)  # chờ khởi động
+    while True:
+        try:
+            if _ai_features_paused():
+                await asyncio.sleep(PUMP_RADAR_INTERVAL)
+                continue
+            session = app['session']
+            cands = await detect_pump_candidates(session)
+            now = time.time()
+            alertable = []
+            for c in cands:
+                if c['score'] < PUMP_SCORE_MIN:
+                    continue
+                if now - pump_last_alerted.get(c['symbol'], 0) < PUMP_COOLDOWN_SEC:
+                    continue
+                alertable.append(c)
+            if alertable:
+                for c in alertable:
+                    pump_last_alerted[c['symbol']] = now
+                _save_pump_state()
+                msg = _fmt_pump_message(alertable)
+                if msg:
+                    await _notify_all_chats(session, msg)
+                    logger.info(f"[PUMP-RADAR] Báo {len(alertable)} coin bay vút: {[c['symbol'] for c in alertable]}")
+            else:
+                logger.info("[PUMP-RADAR] Không có coin bay vút nào đạt ngưỡng báo.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi trong pump_radar_loop: {e}")
+        await asyncio.sleep(PUMP_RADAR_INTERVAL)
+
+
 async def ai_signal_alert_loop(app):
     """Mỗi 30 phút: quét thị trường, BÁO qua Telegram mọi tín hiệu 4-5 sao tìm được.
     Khác ai_auto_trader_loop ở chỗ KHÔNG tự vào lệnh, không đặt TP/SL —
@@ -6769,6 +6969,25 @@ def _urlencode_q(q):
     return quote(q, safe='')
 
 
+async def tool_find_pumpers(session, chat_id, args):
+    """Quét coin đang 'bay vút' CÒN nhiên liệu pump tiếp (funding, OI, momentum 15m/1h, volume).
+    Trả về top coins xếp theo điểm sức khỏe 0-10 + TP/SL gợi ý + cảnh báo FOMO."""
+    cands = await detect_pump_candidates(session, limit=8)
+    if not cands:
+        return "Hiện không có coin nào tăng ≥15%/24h đủ thanh khoản để phân tích pump-continuation."
+    lines = ["🚀 *Coin đang bay vút — xếp theo điểm 'còn nhiên liệu pump tiếp'* (0-10):"]
+    for c in cands[:6]:
+        sym_disp = display_symbol(c['symbol'])
+        lines.append(
+            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {'🔥' if c['score'] >= 6.5 else ''}\n"
+            f"  Giá {format_price(c['close'])} (+{c['change24']:.1f}%/24h) | 15m {c['signal15m']} / 1h {c['signal1h']} ({c['confidence']})\n"
+            f"  {' · '.join(c['reasons'][:3])}\n"
+            f"  TP {format_price(c['tp'])} | SL {format_price(c['sl'])} | VWAP 15m {format_price(c['vwap15m'])}"
+        )
+    lines.append("\n⚠️ Khuyên người dùng: KHÔNG đuổi nến — chờ pullback về VWAP 15m/EMA9, size ≤ 5-10% vốn, SL dưới đáy nến bùng nổ. Điểm < 5 = đã cháy đuồi, bỏ qua.")
+    return "\n".join(lines)
+
+
 async def tool_get_p2p_rate(session, chat_id, args):
     """Giá P2P hiện tại trên Binance P2P (mua/bán USDT, USDC...) bằng fiat VND/USD...
     Lấy trực tiếp API Binance P2P — KHÔNG dùng web_search cho câu hỏi này."""
@@ -6892,6 +7111,7 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "search_news", "description": "Tìm tin tức/sự kiện mới nhất về một coin từ Google News (miễn phí). Dùng khi người dùng hỏi tin tức, lý do coin tăng/giảm, sự kiện, tin cộng đồng. Kết quả chỉ THAM KHẢO, không phải tín hiệu mua bán.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Tên coin hoặc chủ đề, ví dụ 'Bitcoin ETF' hoặc 'SOL'"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web tổng quát (DuckDuckGo) — dùng khi cần thông tin ngoài tin tức coin: benchmark model AI, sản phẩm, chính sách, so sánh, sự kiện ngoài thị trường crypto... Trả về tiêu đề + link. Kết hợp fetch_url để đọc chi tiết.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Cụm từ tìm kiếm, có thể tiếng Việt hoặc tiếng Anh"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "fetch_url", "description": "Đọc nội dung một trang web cụ thể (text thô đã bỏ HTML, tối đa ~4000 ký tự). Dùng sau web_search khi cần đọc chi tiết bài viết/trang.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL đầy đủ https://..."}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "find_pumpers", "description": "Quét coin đang 'bay vút' (momo pump) CÒN nhiên liệu để pump tiếp — chấm điểm sức khỏe 0-10 dựa trên momentum 15m/1h, funding, OI, volume spike. Dùng khi người dùng muốn FOMO long coin đang bay/bất ngờ tăng mạnh. KHÔNG tự vào lệnh — chỉ phân tích + khuyên vào sau pullback.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_p2p_rate", "description": "Giá P2P hiện tại trên Binance P2P (mua/bán USDT/USDC/BTC... bằng VND, USD...). KHÔNG dùng web_search cho câu hỏi giá P2P — dùng tool này, nhanh và chính xác. trade_type: BUY (người dùng mua) hoặc SELL (bán).", "parameters": {"type": "object", "properties": {"asset": {"type": "string", "description": "USDT/USDC/BTC..., mặc định USDT"}, "fiat": {"type": "string", "description": "VND/USD..., mặc định VND"}, "trade_type": {"type": "string", "enum": ["BUY", "SELL"], "description": "Mặc định BUY"}}}}},
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
@@ -6912,6 +7132,7 @@ TOOL_EXECUTORS = {
     'web_search': tool_web_search,
     'fetch_url': tool_fetch_url,
     'get_p2p_rate': tool_get_p2p_rate,
+    'find_pumpers': tool_find_pumpers,
     'scan_market': tool_scan_market,
     'get_account_summary': tool_get_account_summary,
     'get_positions': tool_get_positions,
@@ -9265,6 +9486,10 @@ async def on_startup(app):
     # AI báo tín hiệu ngon mỗi 30 phút (chỉ báo qua Telegram, không tự vào lệnh)
     app['ai_signal_alert_task'] = asyncio.create_task(
         ai_signal_alert_loop(app)
+    )
+    # Pump radar: mỗi 10 phút quét coin đang bay vút còn nhiên liệu pump tiếp (chỉ báo)
+    app['pump_radar_task'] = asyncio.create_task(
+        pump_radar_loop(app)
     )
     # AI rà soát vị thế đang mở mỗi 30 phút (cảnh báo rủi ro, không tự đóng lệnh)
     app['ai_pos_guard_task'] = asyncio.create_task(
