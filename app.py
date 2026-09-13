@@ -251,7 +251,7 @@ async def get_ai_json(session, system_prompt, user_prompt, timeout_s=150):
         # Lần 2: quát vào mặt nó
         retry_messages = base_messages + [
             {"role": "assistant", "content": (text or '')[:500]},
-            {"role": "user", "content": "ĐỪNG viết bài phân tích. Chỉ trả về JSON: {\"pick\": \"HOME|DRAW|AWAY|OVER25|UNDER25|BTTS_YES|BTTS_NO\", \"prob\": số 1-99, \"reasoning\": \"...\"}"},
+            {"role": "user", "content": "ĐỪNG viết bài phân tích dài dòng. Trả về DUY NHẤT JSON ĐÚNG schema đã yêu cầu trong system prompt (match, datetime, league, scores đủ 6 mục, picks, reasoning). Không thêm ngoài."},
         ]
         text, err = await get_ai_response(session, retry_messages, max_tokens=800, timeout_s=60)
         if err:
@@ -1768,25 +1768,28 @@ async def _agent_execute(session, chat_id, name, args):
                     fetched = await tool_fetch_url(session, m.group(0).rstrip('.,)'))
                     break
         system = (
-            "Bạn là PNL FOOTBALL BOT — chuyên gia soi kèo bóng đá (bot do anh Quốc đẹp trai tự tay code).\n"
-            f"{KEO_FRAMEWORK}\n"
-            "Trả về JSON: {\"match\": \"A vs B\", \"datetime\": \"ngày giờ giờ VN\", \"league\": \"...\", "
-            "\"scores\": {\"phong_do\": 4, \"doi_dau\": 3, \"dong_luc\": 5, \"luc_luong\": 4, \"loi_choi\": 3, \"boi_canh\": 4}, "
-            "\"picks\": [{\"market\": \"1X2\", \"selection\": \"Home\", \"prob\": 58}, "
-            "{\"market\": \"Tài xỉu bàn 2.5\", \"selection\": \"Under\", \"prob\": 55}, "
-            "{\"market\": \"Asian Handicap\", \"selection\": \"Home -0.5\", \"prob\": 54}, "
-            "{\"market\": \"BTTS\", \"selection\": \"No\", \"prob\": 52}, "
-            "{\"market\": \"Tài xỉu thẻ phạt\", \"selection\": \"Over 4.5\", \"prob\": 53}, "
-            "{\"market\": \"Tài xỉu phạt góc\", \"selection\": \"Under 9.5\", \"prob\": 55}], "
-            "\"reasoning\": \"...\"}. Nếu không xác định được trận: {\"not_found\": true}"
+            "Bạn là chuyên gia soi kèo bóng đá. Lịch trận + kết quả đã có ở tin nhắn user — dùng nó làm dữ liệu chính. "
+            "Chấm 6 yếu tố MỖI YẾU TỐ 1-5 ĐIỂM: phong_do (form 5 trận, sân nhà/khách), doi_dau (gặp gần nhất, derby), "
+            "dong_luc (đua vô địch/trụ hạng/cúp/derby), luc_luong (chấn thương/đội hình mạnh), loi_choi (tấn công/phòng ngự, "
+            "góc/thẻ khi soi kèo đó), boi_canh (sân nhà/khách, lịch dày). Dữ liệu thiếu thì dùng kiến thức bóng đá của mày "
+            "và ghi chú '(ước lượng)'. KHÔNG BAO GIỜ để điểm 0/30 — luôn cho điểm thực tế. "
+            "Sau đó chọn 4-6 kèo tự tin nhất: 1X2, tài xỉu bàn, Asian Handicap, BTTS, tài xỉu thẻ, tài xỉu góc "
+            "(kèo nào thiếu cơ sở thì bỏ, không cần đủ 6). Xác suất prob (%) phản ánh đúng mức chắc chắn. "
+            "Chỉ trả JSON DUY NHẤT: {\"match\":\"A vs B\",\"datetime\":\"13/09 22:30 VN\",\"league\":\"PL\","
+            "\"diem\":{\"phong_do\":4,\"doi_dau\":3,\"dong_luc\":5,\"luc_luong\":4,\"loi_choi\":3,\"boi_canh\":4},"
+            "\"picks\":[{\"market\":\"1X2\",\"selection\":\"Home\",\"prob\":58}],\"reasoning\":\"2-3 câu\"}. "
+            "Không tìm được trận hợp lệ: {\"not_found\": true}"
         )
+        data_block = fetched[:2500] if fetched else f"Kết quả web (không có dữ liệu Sky):\n{web}"
         pred, err = await get_ai_json(session, system,
-                                      f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nKết quả web:\n{web}\n\nTrang đã đọc:\n{fetched[:2500]}")
+                                      f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nDỮ LIỆU TRẬN THẬT (ưu tiên dùng cái này):\n{data_block}")
         if err:
             return f"Lỗi phân tích: {err}"
         if pred.get('not_found'):
             return f"AI không tìm được trận nào khớp '{q}' — không bịa. Thử tên khác: mu, arsenal, sheffield united, real madrid..."
-        scores = pred.get('scores') or {}
+        scores = pred.get('diem') or pred.get('scores') or {}
+        if scores and not isinstance(scores, dict):
+            scores = {}
         total = 0
         sc = []
         for k, vn in (('phong_do', 'Phong độ'), ('doi_dau', 'Đối đầu'), ('dong_luc', 'Động lực'),
@@ -1803,8 +1806,19 @@ async def _agent_execute(session, chat_id, name, args):
             f"📊 *Bảng điểm: {total}/30* — " + " | ".join(sc), "",
         ]
         picks = pred.get('picks') or []
+        if isinstance(picks, dict):
+            picks = [picks]
+        if picks and isinstance(picks, list):
+            # chuẩn hóa: nếu là list string ("Cả hai đội ghi bàn") → đổi thành dict
+            picks_norm = []
+            for pk in picks:
+                if isinstance(pk, dict):
+                    picks_norm.append(pk)
+                else:
+                    picks_norm.append({'market': 'Kèo', 'selection': str(pk), 'prob': 50})
+            picks = picks_norm
         if picks:
-            lines.append("*Dự đoán 6 kèo:*")
+            lines.append("*Dự đoán kèo:*")
             best = max(picks, key=lambda p: float(p.get('prob') or 0))
             for pk in picks:
                 prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
