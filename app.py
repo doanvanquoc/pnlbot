@@ -219,21 +219,37 @@ async def get_ai_response(session, messages, max_tokens=2500, timeout_s=120):
 
 
 async def get_ai_json(session, system_prompt, user_prompt, timeout_s=150):
-    """Gọi AI yêu cầu trả về JSON. Trả về (dict, None) hoặc (None, err)."""
-    messages = [
+    """Gọi AI yêu cầu trả về JSON. Trả về (dict, None) hoặc (None, err). Thử lại 1 lần nếu AI lấp văn xuôi."""
+    base_messages = [
         {"role": "system", "content": system_prompt + "\nQUAN TRỌNG: trả về DUY NHẤT một khối JSON hợp lệ, không giải thích, không markdown code fence."},
         {"role": "user", "content": user_prompt},
     ]
-    text, err = await get_ai_response(session, messages, max_tokens=1800, timeout_s=timeout_s)
+    text, err = await get_ai_response(session, base_messages, max_tokens=1800, timeout_s=timeout_s)
+    if not err and text:
+        m = re.search(r'\{.*\}', text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0)), None
+            except Exception:
+                pass
+        # Lần 2: quát vào mặt nó
+        retry_messages = base_messages + [
+            {"role": "assistant", "content": (text or '')[:500]},
+            {"role": "user", "content": "ĐỪNG viết bài phân tích. Chỉ trả về JSON: {\"pick\": \"HOME|DRAW|AWAY|OVER25|UNDER25|BTTS_YES|BTTS_NO\", \"prob\": số 1-99, \"reasoning\": \"...\"}"},
+        ]
+        text, err = await get_ai_response(session, retry_messages, max_tokens=800, timeout_s=60)
+        if err:
+            return None, err
+        m = re.search(r'\{.*\}', text, re.S)
+        if not m:
+            return None, f"AI không trả JSON: {text[:150]}"
+        try:
+            return json.loads(m.group(0)), None
+        except Exception as e:
+            return None, f"JSON lỗi: {e} — {m.group(0)[:150]}"
     if err:
         return None, err
-    m = re.search(r'\{.*\}', text, re.S)
-    if not m:
-        return None, f"AI không trả JSON: {text[:150]}"
-    try:
-        return json.loads(m.group(0)), None
-    except Exception as e:
-        return None, f"JSON lỗi: {e} — {m.group(0)[:150]}"
+    return None, "AI trả rỗng"
 
 
 # ═══════════════ MINTROUTER QUOTA (/usage) ═══════════════
