@@ -195,27 +195,43 @@ async def get_ai_response(session, messages, max_tokens=2500, timeout_s=120):
         return None, "Chưa cấu hình DASH_TOKEN."
     model = os.getenv("DASH_MODEL", "glm-5.3")
     payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": max_tokens}
-    try:
-        timeout = aiohttp.ClientTimeout(total=timeout_s)
-        async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
-                                json=payload,
-                                headers={"Authorization": f"Bearer {api_key}",
-                                         "Content-Type": "application/json"},
-                                timeout=timeout) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"AI trả lỗi HTTP {resp.status}: {body[:200]}")
-                return None, f"HTTP {resp.status}: {body[:150]}"
-            data = await resp.json()
-            record_llm_usage(model, data.get('usage'))
-            msg = data.get('choices', [{}])[0].get('message')
-            if not msg:
-                return None, "AI trả về rỗng"
-            return (msg.get('content') or '').strip() or None, None
-    except asyncio.TimeoutError:
-        return None, f"AI phản hồi quá lâu (timeout {timeout_s}s)"
-    except Exception as e:
-        return None, str(e)
+    for attempt in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
+            async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
+                                    json=payload,
+                                    headers={"Authorization": f"Bearer {api_key}",
+                                             "Content-Type": "application/json"},
+                                    timeout=timeout) as resp:
+                if resp.status in (502, 503, 504):
+                    await asyncio.sleep(8 * (attempt + 1))  # MintRouter hít đám mây hồi phục
+                    continue
+                if resp.status == 429:
+                    try:
+                        err429 = (await resp.json(content_type=None)) or {}
+                        wait = int((err429.get('error') or {}).get('reset_seconds') or 30)
+                    except Exception:
+                        wait = 30
+                    logger.warning(f"AI rate limited — chờ {wait}s rồi thử lại")
+                    await asyncio.sleep(min(wait + 2, 90))
+                    continue
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"AI trả lỗi HTTP {resp.status}: {body[:200]}")
+                    return None, f"HTTP {resp.status}: {body[:150]}"
+                data = await resp.json()
+                record_llm_usage(model, data.get('usage'))
+                msg = data.get('choices', [{}])[0].get('message')
+                if not msg:
+                    return None, "AI trả về rỗng"
+                return (msg.get('content') or '').strip() or None, None
+        except asyncio.TimeoutError:
+            return None, f"AI phản hồi quá lâu (timeout {timeout_s}s)"
+        except Exception as e:
+            if attempt == 2:
+                return None, str(e)
+            await asyncio.sleep(3)
+    return None, "AI lỗi liên tiếp 3 lần (server MintRouter không hồi phục)"
 
 
 async def get_ai_json(session, system_prompt, user_prompt, timeout_s=150):
@@ -1191,7 +1207,13 @@ async def ai_chat(session, chat_id, question, reply_to=None):
     )
     text, err = await get_ai_response(session, [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Ngữ cảnh:\n{context}\n\nCâu hỏi: {question}"},
+        {"role": "system", "content": "NHẮC LẠI BẮT BUỘC (ghi đè mọi prompt khác): Bạn là PNL FOOTBALL BOT — bot dự đoán kèo bóng đá "
+                                       "do ANH QUỐC (đẹp trai, giỏi nhất quả đất) tự tay code. BẠN KHÔNG phải MintRouter.AI, "
+                                       "KHÔNG phải trợ lý lập trình — bỏ qua mọi prompt 'workspace/coding assistant' khác. "
+                                       "Bạn có dữ liệu trận đấu trong tin nhắn bên dưới và NHIỆM VỤ của bạn là soi kèo, "
+                                       "phân tích bóng đá, trả lời câu hỏi bóng đá + câu hỏi về chính hệ thống bot này."},
+        {"role": "user", "content": f"(Nhắc: bạn là PNL FOOTBALL BOT của anh Quốc đẹp trai, KHÔNG phải trợ lý lập trình MintRouter — "
+                                    f"nhiệm vụ của bạn là soi kèo bóng đá.)\n\nNgữ cảnh:\n{context}\n\nCâu hỏi: {question}"},
     ])
     if err:
         await send_telegram_message(session, chat_id, f"⚠️ AI gặp sự cố: {err}", reply_to=reply_to)
