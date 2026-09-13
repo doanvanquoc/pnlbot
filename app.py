@@ -1953,7 +1953,7 @@ def _render_keo_from_json(obj):
             pct = int(pct)
         except Exception:
             pct = None
-        why = re.sub(r'\s+', ' ', str(v.get('why') or '').strip())[:70]
+        why = re.sub(r'\s+', ' ', str(v.get('why') or '').strip())[:45]
         if p:
             line_txt = f"- {d}: {p[:60]}{' (' + str(pct) + '%)' if pct else ''}"
             if why:
@@ -2223,13 +2223,20 @@ async def _agent_execute(session, chat_id, name, args):
                     opponent = cands[0].strip()
             if opponent:
                 opp_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
+                opp_parsed = ''
                 for cand in (f"https://www.skysports.com/{opp_slug}-fixtures",
                              f"https://www.skysports.com/{opp_slug}-scores-fixtures"):
                     pg = await tool_fetch_url(session, cand, max_chars=20000)
                     parsed = _parse_sky_fixtures(pg) if pg else ""
                     if parsed:
-                        data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{parsed}")
+                        opp_parsed = parsed
                         break
+                if opp_parsed:
+                    data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{opp_parsed}")
+                else:
+                    # BẮT BUỘC có dữ liệu đối thủ — Sky lỗi thì web_search bù
+                    web_opp = await tool_web_search(session, f"{opponent} recent results last 5 matches 2026", 6)
+                    data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
             league_data = await _fetch_league_fixtures(session, fetched)
             if league_data:
                 kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
@@ -2348,7 +2355,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                 json_prompt = (
                     "Từ phân tích sau, trả về DUY NHẤT một object JSON đúng schema này.\n"
                     "QUAN TRỌNG NHẤT: scenario PHẢI dạng 'TeamNhà X-Y TeamKhách + mô tả' (vd 'MU 1-2 MC — MC cầm bóng thắng ngược') — đây là kịch bản chính để neo. "
-                    "MỖI KÈO PHẢI có 'why': căn cứ RIÊNG từ dữ liệu thật — lịch sử nổ tài/xỉu, tỉ lệ BTTS, đối đầu, chấn thương/lực lượng, số thẻ/góc trung bình (ghi cụ thể kiểu '4/5 trận gần đây nổ tài'). "
+                    "MỖI KÈO PHẢI có 'why': căn cứ RIÊNG từ dữ liệu thật của CẢ 2 ĐỘI (nếu chỉ có 1 đội trong dữ liệu là thiếu) — lịch sử nổ tài/xỉu, tỉ lệ BTTS, đối đầu, chấn thương/lực lượng, số thẻ/góc trung bình (ghi cụ thể kiểu '4/5 trận gần đây nổ tài'). "
                     "Kèo KHÔNG bắt buộc thắng theo tỉ số kịch bản, NHƯNG không được mâu thuẫn vật lý: BTTS Có mà tỉ số có đội 0 bàn; Xỉu/Tài lệch tổng bàn >1.5; 1X2 khác phe đội thắng; Châu Á thua sâu margin <-1.25.\n"
                     "Schema (đủ 6 kèo, pick ngắn gọn không quá 10 từ, pct là số 0-100):\n"
                     + KEO_JSON_SCHEMA +
