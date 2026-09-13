@@ -2429,9 +2429,26 @@ async def _agent_execute(session, chat_id, name, args):
     if name == 'fetch_url':
         return await tool_fetch_url(session, (args.get('url') or '').strip())
     if name == 'analyze_keo':
-        q = (args.get('query') or '').strip()
-        if not q:
+        q_raw = (args.get('query') or '').strip()
+        if not q_raw:
             return "LỖI: cần tên đội."
+        # Làm sạch query: bỏ từ ngữ chung, giữ tên đội + "vs" + tham số kèo
+        _strip_words = ('kèo', 'keo', 'phân tích', 'check', 'soi', 'vào', 'được không',
+                        'không', 'duoc', 'khong', 'nhé', 'nha', 'help', 'giúp', 'tao',
+                        'mày', 'bot', 'ơi', 'đi', 'hôm nay', 'tối nay', 'xem', 'cho')
+        q = q_raw.lower()
+        for sw in _strip_words:
+            q = q.replace(sw, ' ')
+        q = re.sub(r'\s+', ' ', q).strip()
+        # Giữ lại phần có tên đội (bỏ "tài 3.5" khỏi query tìm trận)
+        q_teams = re.split(r'(tài|xỉu|over|under|btts|1x2|châu á|handicap)', q)[0].strip()
+        if not q_teams:
+            q_teams = q
+        # Nếu query có "vs" → cả 2 đội; nếu không → chỉ 1 đội
+        if ' vs ' not in q_teams and ' v ' not in q_teams:
+            q = q_teams
+        else:
+            q = q_teams
         await send_chat_action(session, chat_id)
         _an = await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
         if _an and _an.get('result'):
@@ -2466,6 +2483,14 @@ async def _agent_execute(session, chat_id, name, args):
                     if 'SẮP ĐÁ' in ln:
                         target_ln = ln; break
             if target_ln:
+                # Nếu trận đã đá → trả kết quả luôn, không phân tích
+                if 'ĐÃ ĐÁ' in target_ln:
+                    m_result = re.search(r'ĐÃ ĐÁ \[([^\]]+)\] (.+?): (\S.*?) (\d+)-(\d+) (\S.*?)$', target_ln)
+                    if m_result:
+                        league, date_str, home, gh, ga, away = m_result.groups()
+                        return (f"Trận đã đá rồi ({date_str}):\n"
+                                f"⚽ {home} {gh}-{ga} {away} [{league}]\n"
+                                f"Không cần phân tích nữa — kết quả đã có.")
                 vm = re.search(r':\s*(.+?)\s+vs\s+(.+?)(?:\s+lúc|$)', target_ln)
                 if vm:
                     home_t, away_t = vm.group(1).strip(), vm.group(2).strip()
