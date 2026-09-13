@@ -1651,7 +1651,11 @@ async def ai_chat(session, chat_id, question, reply_to=None):
     (thắng được persona MintRouter). Câu khác → chat thường."""
     if re.search(r'kèo|keo|soi|tài xỉu|châu á|handicap|btts|thẻ|góc|1x2|trận|đấu|thắng|thua|dự đoán|odds|nên đánh|nên vào|đội|vô địch|cúp|derby',
                  question.lower()):
-        await cmd_keo(session, chat_id, question[:120])
+        # Làm sạch câu chat → chỉ giữ tên đội/kèo (bỏ "phân tích kèo... nha nhé giúp t đi")
+        clean_q = re.sub(r'phân tích|phân tích kèo|soi kèo|soi|kèo|keo|nhé|nha|nhỉ|đi|giúp t|giúp tao|giúp|với|tối nay|hôm nay|đánh|được không|đc k|mày|bạn|bot|ồ|ơ',
+                         ' ', question.lower(), flags=re.I)
+        clean_q = re.sub(r'\s+', ' ', clean_q).strip() or question[:120]
+        await cmd_keo(session, chat_id, clean_q[:120])
         return
     today = datetime.now(TZ_VN).strftime('%Y-%m-%d')
     fixtures_cache = getattr(ai_chat, '_fixtures', None)
