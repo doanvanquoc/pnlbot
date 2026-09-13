@@ -5781,6 +5781,19 @@ async def detect_pump_candidates(session, limit=6):
     results = await asyncio.gather(*[analyze_one(s, c) for s, c in cands])
     results = [r for r in results if r]
     results.sort(key=lambda x: x['score'], reverse=True)
+    # NÍT GIÁ LIVE: close từ nến 1h ĐÃ ĐÓNG có thể cũ tới 59 phút → entry MARKET phải là giá hiện tại.
+    # Lấy giá realtime rồi tính lại TP/SL kế hoạch FOMO theo giá live.
+    tickers_map, _ = await get_market_snapshot(session)
+    for r in results:
+        live = (tickers_map.get(r['symbol']) or {}).get('price')
+        if not live:
+            continue
+        entry = float(live)
+        r['close'] = entry
+        sup, res15 = r.get('support15m'), r.get('resistance15m')
+        fomo_sl = sup if sup and entry * 0.94 < sup < entry * 0.995 else entry * 0.975
+        fomo_tp = res15 if res15 and entry * 1.005 < res15 < entry * 1.06 else entry * 1.03
+        r['fomo_sl'], r['fomo_tp'] = fomo_sl, fomo_tp
     return results
 
 
