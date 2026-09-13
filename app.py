@@ -2320,6 +2320,78 @@ TEAM_SKY_SLUGS = {
     'leeds': 'leeds-united', 'west ham': 'west-ham-united', 'newcastle': 'newcastle-united',
     'brighton': 'brighton', 'aston villa': 'aston-villa', 'southampton': 'southampton',
     'nottingham': 'nottingham-forest', 'forest': 'nottingham-forest',
+    'getafe': 'getafe',
+    'celta': 'celta-vigo', 'celta vigo': 'celta-vigo',
+    'sevilla': 'sevilla',
+    'real betis': 'real-betis', 'betis': 'real-betis',
+    'villarreal': 'villarreal', 'villa real': 'villarreal',
+    'real sociedad': 'real-sociedad', 'sociedad': 'real-sociedad',
+    'athletic club': 'athletic-club', 'athletic': 'athletic-club',
+    'athletic bilbao': 'athletic-club', 'bilbao': 'athletic-club',
+    'valencia': 'valencia',
+    'espanyol': 'espanyol',
+    'mallorca': 'real-mallorca', 'real mallorca': 'real-mallorca',
+    'osasuna': 'osasuna',
+    'rayo vallecano': 'rayo-vallecano', 'rayo': 'rayo-vallecano', 'vallecano': 'rayo-vallecano',
+    'girona': 'girona',
+    'alaves': 'alaves', 'deportivo alaves': 'alaves',
+    'levante': 'levante', 'levante ud': 'levante',
+    'elche': 'elche', 'elche cf': 'elche',
+    'oviedo': 'real-oviedo', 'real oviedo': 'real-oviedo',
+    'deportivo la coruna': 'deportivo-la-coruna', 'deportivo': 'deportivo-la-coruna',
+    'la coruna': 'deportivo-la-coruna', 'coruna': 'deportivo-la-coruna',
+    'malaga': 'malaga',
+    'everton': 'everton',
+    'fulham': 'fulham',
+    'crystal palace': 'crystal-palace', 'palace': 'crystal-palace',
+    'bournemouth': 'bournemouth',
+    'brentford': 'brentford',
+    'sunderland': 'sunderland',
+    'burnley': 'burnley',
+    'ac milan': 'ac-milan',
+    'atalanta': 'atalanta',
+    'roma': 'roma', 'as roma': 'roma',
+    'lazio': 'lazio',
+    'fiorentina': 'fiorentina',
+    'torino': 'torino',
+    'bologna': 'bologna',
+    'udinese': 'udinese',
+    'leverkusen': 'leverkusen', 'bayer leverkusen': 'leverkusen',
+    'stuttgart': 'stuttgart', 'vfb stuttgart': 'stuttgart',
+    'leipzig': 'leipzig', 'rb leipzig': 'leipzig',
+    'frankfurt': 'eintracht-frankfurt', 'eintracht frankfurt': 'eintracht-frankfurt',
+    'gladbach': 'monchengladbach', 'monchengladbach': 'monchengladbach',
+    'borussia monchengladbach': 'monchengladbach',
+    'wolfsburg': 'wolfsburg', 'vfl wolfsburg': 'wolfsburg',
+    'hoffenheim': 'hoffenheim', 'tsg hoffenheim': 'hoffenheim',
+    'freiburg': 'freiburg', 'sc freiburg': 'freiburg',
+    'mainz': 'mainz', 'mainz 05': 'mainz',
+    'augsburg': 'augsburg', 'fc augsburg': 'augsburg',
+    'union berlin': 'union-berlin',
+    'werder': 'werder-bremen', 'werder bremen': 'werder-bremen',
+    'st pauli': 'st-pauli',
+    'marseille': 'marseille', 'olympique marseille': 'marseille',
+    'monaco': 'monaco', 'as monaco': 'monaco',
+    'lyon': 'lyon', 'olympique lyonnais': 'lyon',
+    'lille': 'lille', 'losc': 'lille',
+    'lens': 'lens', 'rc lens': 'lens',
+    'nice': 'nice', 'ogc nice': 'nice',
+    'rennes': 'rennes', 'stade rennais': 'rennes',
+    'strasbourg': 'strasbourg',
+    'nantes': 'nantes',
+    'porto': 'porto', 'fc porto': 'porto',
+    'benfica': 'benfica', 'sl benfica': 'benfica',
+    'ajax': 'ajax',
+    'psv': 'psv', 'psv eindhoven': 'psv',
+    'feyenoord': 'feyenoord',
+    'celtic': 'celtic',
+    'rangers': 'rangers',
+    'club brugge': 'club-brugge', 'brugge': 'club-brugge',
+    'salzburg': 'salzburg', 'rb salzburg': 'salzburg',
+    'sporting cp': 'sporting-cp', 'sporting lisbon': 'sporting-cp',
+    'galatasaray': 'galatasaray', 'gala': 'galatasaray',
+    'fenerbahce': 'fenerbahce', 'fener': 'fenerbahce',
+    'olympiacos': 'olympiacos',
 }
 
 # Tên rút gọn Sky Sports hay dùng → slug chuẩn
@@ -2350,12 +2422,49 @@ def _canon_team_slug(name):
     return None
 
 
+# Từ câu hỏi tự nhiên → slug đội (bỏ từ thừa kiểu 'trận', 'đang đá', 'check'...)
+_QUERY_NOISE = ('phân', 'tích', 'kèo', 'keo', 'soi', 'nhé', 'nha', 'nhỉ', 'đi',
+                'giúp', 'với', 'hôm', 'nay', 'tối', 'trận', 'tran', 'đang',
+                'dang', 'đá', 'da', 'check', 'xem', 'trực', 'truc', 'tiếp',
+                'tiep', 'nào', 'nao', 'ơi', 'oi', 'mày', 'may', 'tao', 'bot',
+                'cho', 'xin', 'dự', 'du', 'đoán', 'doan', 'khi', 'giờ', 'gio',
+                'ngày', 'ngay', 'tháng', 'thang', 'sắp', 'sap', 'đêm', 'dem')
+
+
+def _clean_team_part(part):
+    toks = [t for t in re.split(r'[^a-z0-9à-ỹđ]+', (part or '').lower()) if t and t not in _QUERY_NOISE]
+    return ' '.join(toks)
+
+
+def _resolve_team_part(part):
+    """'trận getafe đang đá' → 'getafe' (slug)."""
+    cleaned = _clean_team_part(part)
+    if not cleaned:
+        return None
+    s = _canon_team_slug(cleaned)
+    if s:
+        return s
+    # quét alias dài nhất khớp theo ranh giới từ
+    best = None
+    for key in sorted(list(TEAM_SKY_SLUGS.keys()) + list(SKY_SHORT_NAMES.keys()), key=len, reverse=True):
+        if key and re.search(r'(^|\s)' + re.escape(key) + r'($|\s)', cleaned):
+            best = TEAM_SKY_SLUGS.get(key) or SKY_SHORT_NAMES.get(key)
+            break
+    if best:
+        return best
+    # fallback: slug hóa (đội ít gặp)
+    if len(cleaned.split()) <= 3:
+        return re.sub(r'[^a-z0-9]+', '-', cleaned).strip('-') or None
+    return None
+
+
 def _parse_query_teams(q):
-    """'mu vs mc' → ['manchester-united', 'manchester-city']; 'mu' → ['manchester-united']."""
+    """'mu vs mc' → ['manchester-united', 'manchester-city'];
+    'Check kèo trận getafe đang đá đi' → ['getafe']."""
     parts = [p.strip() for p in re.split(r'\s+vs\s+|\s+x\s+', (q or '').lower().strip()) if p.strip()]
     slugs = []
     for p in parts:
-        s = _canon_team_slug(p)
+        s = _resolve_team_part(p)
         if s and s not in slugs:
             slugs.append(s)
     return slugs
@@ -2375,20 +2484,9 @@ def _sky_line_teams(line):
 def _sky_slug_for(query):
     """Trích slug Sky cho câu hỏi: 'mu vs mc' → ưu tiên đội nhà trước (manchester-united).
     Trả về (slug, matched_name) hoặc (None, None)."""
-    q = query.lower().strip()
-    q = re.sub(r'phân tích|kèo|keo|soi|nhé|nha|nhỉ|đi|giúp|với|hôm nay|tối nay', ' ', q)
-    q = re.sub(r'\s+', ' ', q).strip()
-    # Tách vs — lấy phần đầu làm đội chính
-    parts = [p.strip() for p in re.split(r'\s+vs\s+|\s+x\s+', q) if p.strip()]
-    if not parts:
-        return None, None
-    for part in parts:
-        if part in TEAM_SKY_SLUGS:
-            return TEAM_SKY_SLUGS[part], part
-    # fallback: tên đội dạng vài từ → slug
-    first = parts[0]
-    if len(first.split()) <= 3:
-        return re.sub(r'[^a-z0-9]+', '-', first).strip('-'), first
+    slugs = _parse_query_teams(query)
+    if slugs:
+        return slugs[0], slugs[0].replace('-', ' ')
     return None, None
 
 
@@ -2423,6 +2521,54 @@ def _parse_sky_fixtures(pg):
         lines.append(f"SẮP ĐÁ [{league}] {date_str}: {h} vs {a} lúc {kick}")
     if not lines:
         return ""
+    return "\n".join(lines)
+
+
+_DATE_RE = r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) \d+(?:st|nd|rd|th) \w+'
+_LEAGUE_MASTER_RE = re.compile(
+    r'(?P<date>' + _DATE_RE + r')'
+    r'|app\.football\.scores_fixtures\.view_fixture\s+(?P<sh>[A-Z][\w\' \.\-]{1,28}?)\s+(?P<sgh>\d+)\s+'
+    r'(?P<sa>[A-Z][\w\' \.\-]{1,28}?)\s+(?P<sga>\d+)(?:\s+(?P<smin>\d+)[\'\u2019&#;x\d ]{0,12})?\s+'
+    r'(?P<sst>FT|In Play|HT|LIVE|AET|PEN)\b'
+    r'|app\.football\.scores_fixtures\.view_fixture\s+(?P<uh>[A-Z][\w\' \.\-]{1,28}?)\s+'
+    r'app\.football\.scores_fixtures\.are_scheduled\s+(?P<ua>[A-Z][\w\' \.\-]{1,28}?)\s+\.\s+'
+    r'(?P<ukick>[\d\.]+(?:am|pm))\s+Fixture'
+)
+
+
+def _parse_sky_league(pg, default_league=""):
+    """Parse trang fixtures CẢ GIẢI của Sky (markup khác trang đội: date/league hay vắng mặt).
+    Trả về cùng format dòng như _parse_sky_fixtures."""
+    if not pg:
+        return ""
+    lines = []
+    cur_date = ""
+    for m in _LEAGUE_MASTER_RE.finditer(pg):
+        if m.group('date'):
+            cur_date = m.group('date')
+            continue
+        if m.group('sh') is not None:
+            st = m.group('sst')
+            minute = m.group('smin') or ''
+            if 'In Play' in st or 'LIVE' in st:
+                tag = "🔴 ĐANG ĐÁ"
+                min_txt = f" (phút {minute})" if minute else ''
+            elif st == 'HT':
+                tag = "⏸ NGHỈ GIỮA HIỆP"
+                min_txt = ''
+            else:
+                tag = "ĐÃ ĐÁ"
+                min_txt = ''
+            d = cur_date or "?"
+            lines.append(f"{tag} [{default_league or '?'}] {d}: {m.group('sh')} {m.group('sgh')}-{m.group('sga')} {m.group('sa')}{min_txt}")
+        elif m.group('uh') is not None:
+            d = cur_date
+            if not d:
+                dm = re.search(_DATE_RE, pg[m.end():m.end() + 160])
+                if dm:
+                    d = dm.group(0)
+            d = d or "?"
+            lines.append(f"SẮP ĐÁ [{default_league or '?'}] {d}: {m.group('uh')} vs {m.group('ua')} lúc {m.group('ukick')}")
     return "\n".join(lines)
 
 
@@ -2466,16 +2612,46 @@ LEAGUE_SKY_SLUGS = {
     'DFB Pokal': 'dfb-pokal', 'Coupe de France': 'coupe-de-france',
 }
 
+# slug đội → tên giải (để fetch lịch cả giải ngay cả khi trang đội lỗi)
+TEAM_LEAGUES = {}
+for _s in ('manchester-united', 'manchester-city', 'arsenal', 'liverpool', 'chelsea',
+            'tottenham', 'everton', 'fulham', 'crystal-palace', 'bournemouth', 'brentford',
+            'sunderland', 'burnley', 'wolverhampton-wanderers', 'leeds-united', 'west-ham-united',
+            'newcastle-united', 'brighton', 'aston-villa', 'southampton', 'nottingham-forest'):
+    TEAM_LEAGUES[_s] = 'Premier League'
+for _s in ('getafe', 'celta-vigo', 'sevilla', 'real-betis', 'villarreal', 'real-sociedad',
+            'athletic-club', 'valencia', 'espanyol', 'real-mallorca', 'osasuna', 'rayo-vallecano',
+            'girona', 'alaves', 'levante', 'elche', 'real-oviedo', 'deportivo-la-coruna', 'malaga',
+            'barcelona', 'real-madrid', 'atletico-madrid'):
+    TEAM_LEAGUES[_s] = 'Spanish La Liga'
+for _s in ('inter-milan', 'ac-milan', 'juventus', 'napoli', 'atalanta', 'roma', 'lazio',
+            'fiorentina', 'torino', 'bologna', 'udinese'):
+    TEAM_LEAGUES[_s] = 'Italian Serie A'
+for _s in ('borussia-dortmund', 'bayern-munich', 'leverkusen', 'stuttgart', 'leipzig',
+            'eintracht-frankfurt', 'monchengladbach', 'wolfsburg', 'hoffenheim', 'freiburg',
+            'mainz', 'augsburg', 'union-berlin', 'werder-bremen', 'st-pauli'):
+    TEAM_LEAGUES[_s] = 'German Bundesliga'
+for _s in ('paris-saint-germain', 'marseille', 'monaco', 'lyon', 'lille', 'lens', 'nice',
+            'rennes', 'strasbourg', 'nantes'):
+    TEAM_LEAGUES[_s] = 'French Ligue 1'
+for _s in ('celtic', 'rangers'):
+    TEAM_LEAGUES[_s] = 'Scottish Premiership'
+del _s
+
 _sky_cache = {}  # url -> (text, timestamp)
 SKY_CACHE_TTL = 1800  # 30 phút
 
 
-async def _fetch_league_fixtures(session, fetched):
+async def _fetch_league_fixtures(session, fetched, league_hint=None):
     """Từ dữ liệu lịch đội (có tên giải) → fetch lịch CẢ GIẢI từ Sky (có kết quả mọi đội, kể cả đối thủ)."""
+    league = None
     m = re.search(r'\[([^\]]+)\]', fetched or '')
-    if not m:
+    if m:
+        league = m.group(1)
+    if not league:
+        league = league_hint
+    if not league:
         return ""
-    league = m.group(1)
     slug = LEAGUE_SKY_SLUGS.get(league)
     if not slug:
         # Dynamic fallback: thử slug guessed
@@ -2485,7 +2661,7 @@ async def _fetch_league_fixtures(session, fetched):
     if cache_key in _sky_cache and now - _sky_cache[cache_key][1] < SKY_CACHE_TTL:
         return _sky_cache[cache_key][0]
     pg = await tool_fetch_url(session, f"https://www.skysports.com/{slug}-fixtures", max_chars=30000)
-    parsed = _parse_sky_fixtures(pg) if pg else ""
+    parsed = _parse_sky_league(pg, league) if pg else ""
     if parsed:
         _sky_cache[cache_key] = (parsed, now)
     return parsed
@@ -2522,100 +2698,121 @@ async def _agent_execute(session, chat_id, name, args):
             pages.append(fetched)
         # query nêu 2 đội → fetch luôn trang đội B rồi mới tìm trận
         slug_b = next((s for s in q_slugs if s != slug_a), None)
+        fetched_b = ""
         if len(q_slugs) >= 2 and slug_b and slug_b != slug_a:
             fetched_b = await _fetch_sky_by_slug(session, slug_b)
             if fetched_b:
                 pages.append(fetched_b)
-            # tìm trận mục tiêu: khớp CHUẨN cả 2 đội qua slug (ăn cả tên rút gọn kiểu Man Utd/Man City)
-            target_ln = None
-            if len(q_slugs) >= 2:
-                want = set(q_slugs[:2])
-                cands = []
-                for pg in pages:
-                    for ln in pg.split('\n'):
-                        if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
-                            continue
+        # fetch lịch cả giải trước để tìm trận (phòng khi trang đội thiếu trận)
+        league_hint = TEAM_LEAGUES.get(slug_a or '') or TEAM_LEAGUES.get(slug_b or '')
+        league_data = await _fetch_league_fixtures(session, fetched or fetched_b, league_hint)
+        if league_data and league_data not in pages:
+            pages.append(league_data)
+        # tìm trận mục tiêu: khớp CHUẨN cả 2 đội qua slug (ăn cả tên rút gọn kiểu Man Utd/Man City)
+        target_ln = None
+        if len(q_slugs) >= 2:
+            want = set(q_slugs[:2])
+            cands = []
+            for pg in pages:
+                for ln in pg.split('\n'):
+                    if 'ĐANG ĐÁ' not in ln and 'SẮP ĐÁ' not in ln and 'ĐÃ ĐÁ' not in ln:
+                        continue
+                    ha, hb = _sky_line_teams(ln)
+                    if not ha or not hb:
+                        continue
+                    pair = set()
+                    for nm in (ha, hb):
+                        cs = _canon_team_slug(nm)
+                        if cs:
+                            pair.add(cs)
+                        else:
+                            lnl = nm.lower()
+                            for s in want:
+                                if s.replace('-', ' ') in lnl:
+                                    pair.add(s)
+                    if pair == want:
+                        prio = 0 if 'ĐANG ĐÁ' in ln else (1 if 'SẮP ĐÁ' in ln else 2)
+                        cands.append((prio, ln))
+            if cands:
+                cands.sort(key=lambda x: x[0])
+                target_ln = cands[0][1]
+        else:
+            # 1 đội: trận đang đá → sắp đá gần nhất.
+            # Trang giải có nhiều trận nên chỉ nhận dòng có đúng đội đó
+            # (trang đội thì nhận thẳng — kể cả đội không có trong alias map).
+            for pg in pages:
+                is_league_pg = bool(league_data) and pg is league_data
+                for ln in pg.split('\n'):
+                    if 'ĐANG ĐÁ' not in ln:
+                        continue
+                    if is_league_pg and slug_a:
                         ha, hb = _sky_line_teams(ln)
-                        if not ha or not hb:
+                        ca, cb = _canon_team_slug(ha or ''), _canon_team_slug(hb or '')
+                        if slug_a not in (ca, cb) and slug_a.replace('-', ' ') not in ln.lower():
                             continue
-                        pair = set()
-                        for nm in (ha, hb):
-                            cs = _canon_team_slug(nm)
-                            if cs:
-                                pair.add(cs)
-                            else:
-                                lnl = nm.lower()
-                                for s in want:
-                                    if s.replace('-', ' ') in lnl:
-                                        pair.add(s)
-                        if pair == want:
-                            prio = 0 if 'ĐANG ĐÁ' in ln else (1 if 'SẮP ĐÁ' in ln else 2)
-                            cands.append((prio, ln))
-                if cands:
-                    cands.sort(key=lambda x: x[0])
-                    target_ln = cands[0][1]
-            else:
-                # 1 đội: trận đang đá → sắp đá gần nhất (giữ hành vi cũ)
+                    target_ln = ln
+                    break
+                if target_ln:
+                    break
+            if not target_ln:
                 for pg in pages:
+                    is_league_pg = bool(league_data) and pg is league_data
                     for ln in pg.split('\n'):
-                        if 'ĐANG ĐÁ' in ln:
-                            target_ln = ln
-                            break
+                        if 'SẮP ĐÁ' not in ln:
+                            continue
+                        if is_league_pg and slug_a:
+                            ha, hb = _sky_line_teams(ln)
+                            ca, cb = _canon_team_slug(ha or ''), _canon_team_slug(hb or '')
+                            if slug_a not in (ca, cb) and slug_a.replace('-', ' ') not in ln.lower():
+                                continue
+                        target_ln = ln
+                        break
                     if target_ln:
                         break
-                if not target_ln:
-                    for pg in pages:
-                        for ln in pg.split('\n'):
-                            if 'SẮP ĐÁ' in ln:
-                                target_ln = ln
-                                break
-                        if target_ln:
-                            break
-            # query 2 đội mà không thấy trận → web search tên đầy đủ
-            if not target_ln and len(q_slugs) >= 2:
-                fulls = [s.replace('-', ' ') for s in q_slugs[:2]]
-                web_result = await tool_web_search(session, f"{' vs '.join(fulls)} score result today 2026", 5)
-                if web_result and not web_result.startswith("Không"):
-                    return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
-                            f"Kết quả tìm kiếm:\n{web_result[:1500]}")
-            if target_ln:
-                # Nếu trận đã đá → trả kết quả luôn, không phân tích
-                if 'ĐÃ ĐÁ' in target_ln:
-                    m_result = re.search(r'ĐÃ ĐÁ \[([^\]]+)\] (.+?): (\S.*?) (\d+)-(\d+) (\S.*?)$', target_ln)
-                    if m_result:
-                        league, date_str, home, gh, ga, away = m_result.groups()
-                        return (f"Trận đã đá rồi ({date_str}):\n"
-                                f"⚽ {home} {gh}-{ga} {away} [{league}]\n"
-                                f"Không cần phân tích nữa — kết quả đã có.")
-                home_t, away_t = _sky_line_teams(target_ln)
-                if home_t and away_t:
-                    ca = _canon_team_slug(home_t)
-                    cb = _canon_team_slug(away_t)
-                    if ca == slug_a and cb and cb != slug_a:
-                        opponent, opponent_slug = away_t, cb
-                    elif cb == slug_a and ca and ca != slug_a:
-                        opponent, opponent_slug = home_t, ca
-                    else:
-                        opponent, opponent_slug = away_t, cb  # mặc định: đối thủ là đội khách
-            if opponent and not opponent_slug:
-                opponent_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
-            if opponent and opponent_slug:
-                opp_parsed = await _fetch_sky_by_slug(session, opponent_slug)
-                if opp_parsed:
-                    data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{opp_parsed}")
+        # query 2 đội mà không thấy trận → web search tên đầy đủ
+        if not target_ln and len(q_slugs) >= 2:
+            fulls = [s.replace('-', ' ') for s in q_slugs[:2]]
+            web_result = await tool_web_search(session, f"{' vs '.join(fulls)} score result today 2026", 5)
+            if web_result and not web_result.startswith("Không"):
+                return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
+                        f"Kết quả tìm kiếm:\n{web_result[:1500]}")
+        if target_ln:
+            # Nếu trận đã đá → trả kết quả luôn, không phân tích
+            if 'ĐÃ ĐÁ' in target_ln:
+                m_result = re.search(r'ĐÃ ĐÁ \[([^\]]+)\] (.+?): (\S.*?) (\d+)-(\d+) (\S.*?)$', target_ln)
+                if m_result:
+                    league, date_str, home, gh, ga, away = m_result.groups()
+                    return (f"Trận đã đá rồi ({date_str}):\n"
+                            f"⚽ {home} {gh}-{ga} {away} [{league}]\n"
+                            f"Không cần phân tích nữa — kết quả đã có.")
+            home_t, away_t = _sky_line_teams(target_ln)
+            if home_t and away_t:
+                ca = _canon_team_slug(home_t)
+                cb = _canon_team_slug(away_t)
+                if ca == slug_a and cb and cb != slug_a:
+                    opponent, opponent_slug = away_t, cb
+                elif cb == slug_a and ca and ca != slug_a:
+                    opponent, opponent_slug = home_t, ca
                 else:
-                    # BẮT BUỘC có dữ liệu đối thủ — Sky lỗi thì web_search bù
-                    web_opp = await tool_web_search(session, f"{opponent} recent results last 5 matches 2026", 6)
-                    data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
-            league_data = await _fetch_league_fixtures(session, fetched)
-            if league_data:
-                kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
-                if opponent:
-                    kw += [w.lower() for w in re.split(r'[^a-z0-9]+', opponent.lower()) if len(w) > 3]
-                rel = [ln for ln in league_data.split('\n')
-                       if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
-                if rel:
-                    data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
+                    opponent, opponent_slug = away_t, cb  # mặc định: đối thủ là đội khách
+        if opponent and not opponent_slug:
+            opponent_slug = re.sub(r'[^a-z0-9]+', '-', opponent.lower()).strip('-')
+        if opponent and opponent_slug:
+            opp_parsed = await _fetch_sky_by_slug(session, opponent_slug)
+            if opp_parsed:
+                data_parts.append(f"LỊCH + KẾT QUẢ ĐỐI THỦ ({opponent}):\n{opp_parsed}")
+            else:
+                # BẮT BUỘC có dữ liệu đối thủ — Sky lỗi thì web_search bù
+                web_opp = await tool_web_search(session, f"{opponent} recent results last 5 matches 2026", 6)
+                data_parts.append(f"DỮ LIỆU ĐỐI THỦ ({opponent}) TỪ WEB:\n{web_opp[:1500]}")
+        if league_data:
+            kw = [w for w in re.split(r'[^a-z0-9]+', q.lower()) if len(w) > 3]
+            if opponent:
+                kw += [w.lower() for w in re.split(r'[^a-z0-9]+', opponent.lower()) if len(w) > 3]
+            rel = [ln for ln in league_data.split('\n')
+                   if any(w in ln.lower() for w in kw)][:15]
+            if rel:
+                data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
         # ── API-Football: standings + team stats (dữ liệu thật cho Tài/Xỉu, BTTS) ──
         api_data_parts = []
         try:
@@ -2757,7 +2954,11 @@ async def _agent_execute(session, chat_id, name, args):
             api_block = "\n\nDỮ LIỆU THẬT TỪ API-FOOTBALL (thống kê mùa giải + BXH — dùng cho Tài/Xỉu, BTTS):\n" + "\n".join(api_data_parts)
         data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
                       + "\n\n".join(data_parts) + api_block + hist_block) if data_parts else (
-                      f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(session, f"{q} football next match {now_str}", 5))
+                      f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(
+                          session,
+                          f"{(' vs '.join(s.replace('-', ' ') for s in q_slugs[:2]) if q_slugs else q)} "
+                          f"{(TEAM_LEAGUES.get(slug_a or '') or TEAM_LEAGUES.get(slug_b or '') or '')} "
+                          f"fixtures results", 5))
         return ("Dữ liệu trận đấu (dùng làm nền tảng chốt 6 kèo):\n\n" + data_block)
     if name == 'my_stats':
         graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
