@@ -2004,10 +2004,10 @@ def _keo_logic_check(obj):
         if est_total is not None and line is not None and (is_over or is_under):
             try:
                 est = float(est_total)
-                if is_over and est < line - 0.3:
-                    errs.append(f"Tài {line} nhưng ước tính tổng bàn chỉ {est} — PHẢI chọn Xỉu hoặc đổi kịch bản")
-                if is_under and est > line + 0.3:
-                    errs.append(f"Xỉu {line} nhưng ước tính tổng bàn là {est} — PHẢI chọn Tài hoặc đổi kịch bản")
+                if is_over and est <= 2.8:
+                    errs.append(f"Tài {line} nhưng ước tính tổng bàn chỉ {est} (≤2.8) — PHẢI chọn Xỉu hoặc đổi kịch bản")
+                if is_under and est > 3.0:
+                    errs.append(f"Xỉu {line} nhưng ước tính tổng bàn là {est} (>3.0) — PHẢI chọn Tài hoặc đổi kịch bản")
             except Exception:
                 pass
         both = ga_ > 0 and gb_ > 0
@@ -2512,10 +2512,10 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "Nếu dữ liệu THIẾU cho kèo nào (thiếu 2+ yếu tố framework) → ghi 'Thiếu dữ liệu' với pct=0, KHÔNG đoán mò. "
         "Nếu đủ dữ liệu → chấm điểm framework rồi mới chốt %, % phải phản ánh tổng điểm (≥21/30 → >60%; 18-20 → 55-60%; <18 → <55%). "
         "QUY TẮC TÀI/XỈU: PHẢI ước lượng tổng bàn dự kiến TRƯỚC khi chọn (tổng bàn TB hai đội + bàn thua TB). "
-        "Nếu tổng bàn dự kiến < 2.5 → CHỌN XỈU, KHÔNG chọn Tài. "
-        "Nếu tổng bàn dự kiến > 2.8 → chọn Tài. "
-        "Nếu 2.5-2.8 → xem lịch sử đối đầu (nhiều bàn → Tài, ít bàn → Xỉu). "
-        "KHÔNG BAO GIỜ chọn Tài khi tổng bàn dự kiến < 2.2 — đó là kèo THUA. "
+        "Nếu tổng bàn dự kiến ≤ 2.5 → CHỌN XỈU, KHÔNG chọn Tài. "
+        "Nếu tổng bàn dự kiến > 3.0 → chọn Tài. "
+        "Nếu 2.5-3.0 → xem lịch sử đối đầu (nhiều bàn → Tài, ít bàn → Xỉu). "
+        "KHÔNG BAO GIỜ chọn Tài khi tổng bàn dự kiến ≤ 2.8 — đó là kèo THUA. "
         "BẮT BUỘC: JSON phải có field 'estimated_total_goals' (số thập phân, vd 2.3) — đây là ước tính tổng bàn cả trận. "
         "FORMAT KẾT QUẢ CUỐI (CHÍNH XÁC mẫu — không thêm/bớt):\n"
         "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
