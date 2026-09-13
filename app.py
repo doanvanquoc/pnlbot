@@ -6752,6 +6752,41 @@ def _urlencode_q(q):
     return quote(q, safe='')
 
 
+async def tool_get_p2p_rate(session, chat_id, args):
+    """Giá P2P hiện tại trên Binance P2P (mua/bán USDT, USDC...) bằng fiat VND/USD...
+    Lấy trực tiếp API Binance P2P — KHÔNG dùng web_search cho câu hỏi này."""
+    asset = (args.get('asset') or 'USDT').upper()
+    fiat = (args.get('fiat') or 'VND').upper()
+    trade_type = (args.get('trade_type') or 'BUY').upper()  # BUY = người dùng mua USDT
+    payload = {'asset': asset, 'fiat': fiat, 'tradeType': trade_type,
+               'payTypes': [], 'page': 1, 'rows': 5, 'transAmount': ''}
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with session.post("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+                                json=payload, timeout=timeout) as resp:
+            if resp.status != 200:
+                return f"Không lấy được giá P2P (HTTP {resp.status})."
+            data = await resp.json()
+    except Exception as e:
+        return f"Lỗi gọi Binance P2P: {e}"
+    items = data.get('data') or []
+    if not items:
+        return f"Không có quảng cáo P2P nào cho {asset}/{fiat} ({trade_type})."
+    lines = [f"💰 *Giá P2P {asset}/{fiat}* — {'MUA' if trade_type == 'BUY' else 'BÁN'} {asset} (5 quảng cáo tốt nhất):"]
+    for i, it in enumerate(items, 1):
+        adv = it.get('adv') or {}
+        advn = ((it.get('advertiser') or {}).get('nickName') or '?')
+        price = adv.get('price')
+        avail = adv.get('tradableQuantity') or adv.get('surplusAmount') or '?'
+        lines.append(f"{i}. {price} {fiat} — người bán {advn}, còn {avail} {asset}")
+    try:
+        best = float(items[0]['adv']['price'])
+        lines.append(f"\n→ Giá tốt nhất: **{best:,.0f} {fiat}/{asset}**")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 async def tool_get_price(session, chat_id, args):
     """Tra giá realtime của một hoặc nhiều coin bất kỳ trên Binance Futures."""
     symbols = args.get('symbols') or []
@@ -6840,6 +6875,7 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "search_news", "description": "Tìm tin tức/sự kiện mới nhất về một coin từ Google News (miễn phí). Dùng khi người dùng hỏi tin tức, lý do coin tăng/giảm, sự kiện, tin cộng đồng. Kết quả chỉ THAM KHẢO, không phải tín hiệu mua bán.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Tên coin hoặc chủ đề, ví dụ 'Bitcoin ETF' hoặc 'SOL'"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web tổng quát (DuckDuckGo) — dùng khi cần thông tin ngoài tin tức coin: benchmark model AI, sản phẩm, chính sách, so sánh, sự kiện ngoài thị trường crypto... Trả về tiêu đề + link. Kết hợp fetch_url để đọc chi tiết.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Cụm từ tìm kiếm, có thể tiếng Việt hoặc tiếng Anh"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "fetch_url", "description": "Đọc nội dung một trang web cụ thể (text thô đã bỏ HTML, tối đa ~4000 ký tự). Dùng sau web_search khi cần đọc chi tiết bài viết/trang.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "URL đầy đủ https://..."}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "get_p2p_rate", "description": "Giá P2P hiện tại trên Binance P2P (mua/bán USDT/USDC/BTC... bằng VND, USD...). KHÔNG dùng web_search cho câu hỏi giá P2P — dùng tool này, nhanh và chính xác. trade_type: BUY (người dùng mua) hoặc SELL (bán).", "parameters": {"type": "object", "properties": {"asset": {"type": "string", "description": "USDT/USDC/BTC..., mặc định USDT"}, "fiat": {"type": "string", "description": "VND/USD..., mặc định VND"}, "trade_type": {"type": "string", "enum": ["BUY", "SELL"], "description": "Mặc định BUY"}}}}},
     {"type": "function", "function": {"name": "scan_market", "description": "Quét toàn thị trường futures, trả về các tín hiệu LONG/SHORT mạnh nhất (4-5 sao) đã lọc MTF + xu hướng BTC + win-rate, kèm entry/TP/SL. Dùng khi người dùng muốn tìm coin có cơ hội tốt nhất.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_account_summary", "description": "Số dư ví futures, PnL chưa thực hiện, margin balance, số dư khả dụng.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "get_positions", "description": "Danh sách vị thế futures đang mở: entry, mark, PnL, đòn bẩy, giá thanh lý.", "parameters": {"type": "object", "properties": {}}}},
@@ -6858,6 +6894,7 @@ TOOL_EXECUTORS = {
     'search_news': tool_search_news,
     'web_search': tool_web_search,
     'fetch_url': tool_fetch_url,
+    'get_p2p_rate': tool_get_p2p_rate,
     'scan_market': tool_scan_market,
     'get_account_summary': tool_get_account_summary,
     'get_positions': tool_get_positions,
@@ -7279,6 +7316,8 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
             "hỏi về TIN TỨC/sự kiện/lý do coin tăng giảm/tin cộng đồng -> search_news (kết quả chỉ tham khảo, không phải tín hiệu); "
             "câu hỏi ngoài thị trường (benchmark AI, sản phẩm, chính sách, so sánh...) -> web_search rồi fetch_url đọc chi tiết trang. "
+            "hỏi GIÁ P2P (USDT/USDC... ra VND) -> get_p2p_rate ngay lập tức, TUYỆT ĐỐI không web_search hay fetch_url cho câu này. "
+            "QUYẾT ĐỊNH NHANH: tối đa 2 lượt tool cho câu hỏi thường — có đủ dữ liệu là kết luận ngay, đừng tra quá nhiều bước. "
             "câu hỏi về tài khoản -> các tool get_account/get_positions/get_open_orders/get_order_history/get_income_history. "
             "QUAN TRỌNG về TP/SL: TP/SL của vị thế thường là lệnh ĐIỀU KIỆN riêng (STOP_MARKET/TAKE_PROFIT_MARKET qua Algo Service), "
             "KHÔNG gắn trên vị thế. Khi đánh giá vị thế có TP/SL hay chưa, PHẢI xem kết quả get_open_orders hoặc phần 'TP/SL điều kiện' "
