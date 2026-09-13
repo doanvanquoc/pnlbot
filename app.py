@@ -1618,22 +1618,32 @@ def _help_text():
     )
 
 
-async def cmd_analyze_odds_image(session, chat_id, photo, caption=''):
+async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=False):
     """Screenshot 1xBet → tải ảnh → AI vision đọc odds + phân tích kèo + EV."""
     await send_telegram_message(session, chat_id, "📸 Đang đọc odds từ ảnh + phân tích... (chờ ~30 giây)")
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     try:
-        file_id = photo[-1]['file_id']  # ảnh lớn nhất
+        file_id = (photo[0].get('file_id') if is_doc else photo[-1]['file_id'])
         async with session.get(f"https://api.telegram.org/bot{token}/getFile",
                                params={'file_id': file_id}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             fd = await resp.json()
+        if not fd.get('ok'):
+            await send_telegram_message(session, chat_id, f"❌ Telegram lỗi tải ảnh: {fd.get('description', '?')} — gửi lại ảnh nhé.")
+            return
         file_path = fd.get('result', {}).get('file_path')
         if not file_path:
-            await send_telegram_message(session, chat_id, "❌ Không tải được ảnh.")
+            await send_telegram_message(session, chat_id, "❌ Không lấy được đường dẫn ảnh.")
             return
         async with session.get(f"https://api.telegram.org/bot{token}/file/{file_path}",
                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                await send_telegram_message(session, chat_id, f"❌ Tải ảnh thất bại HTTP {resp.status} — gửi lại ảnh nhé.")
+                return
             raw = await resp.read()
+        if len(raw) < 100 or not raw.startswith(b'\xff\xd8') and not raw.startswith(b'\x89PNG') and not raw.startswith(b'RIFF'):
+            logger.warning(f"[IMG] file_id={file_id} tải về {len(raw)} bytes không phải ảnh hợp lệ: {raw[:60]!r}")
+            await send_telegram_message(session, chat_id, "❌ Ảnh tải về bị hỏng (không phải file ảnh) — thử chụp lại và gửi lại.")
+            return
     except Exception as e:
         await send_telegram_message(session, chat_id, f"❌ Lỗi tải ảnh: {e}")
         return
@@ -1712,7 +1722,8 @@ async def handle_update(session, update):
     chat_id = msg.get('chat', {}).get('id')
     text = (msg.get('text') or '').strip()
     photo = msg.get('photo') or []
-    if not chat_id or (not text and not photo):
+    doc = msg.get('document') or {}
+    if not chat_id or (not text and not photo and not doc):
         return
     auto_chats.add(chat_id)
     _save_chats()
@@ -1720,6 +1731,9 @@ async def handle_update(session, update):
     # 📸 Ảnh (screenshot 1xBet...) → AI đọc odds + phân tích kèo trực tiếp
     if photo and not text:
         await cmd_analyze_odds_image(session, chat_id, photo, msg.get('caption') or '')
+        return
+    if doc and doc.get('mime_type', '').startswith('image/') and not text:
+        await cmd_analyze_odds_image(session, chat_id, [doc], msg.get('caption') or '', is_doc=True)
         return
 
     parts = text.split(maxsplit=1)
