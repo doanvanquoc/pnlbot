@@ -2482,6 +2482,12 @@ async def _agent_execute(session, chat_id, name, args):
                 for ln in fetched.split('\n'):
                     if 'SẮP ĐÁ' in ln:
                         target_ln = ln; break
+            # Nếu query có "vs" mà không tìm thấy trận → tìm kết quả qua web search
+            if not target_ln and (' vs ' in q_teams or ' v ' in q_teams):
+                web_result = await tool_web_search(session, f"{q_teams} match result score {now_str}", 5)
+                if web_result and not web_result.startswith("Không"):
+                    return (f"Không tìm thấy trận '{q_teams}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
+                            f"Kết quả tìm kiếm:\n{web_result[:1500]}")
             if target_ln:
                 # Nếu trận đã đá → trả kết quả luôn, không phân tích
                 if 'ĐÃ ĐÁ' in target_ln:
