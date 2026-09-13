@@ -1642,8 +1642,175 @@ async def handle_update(session, update):
         # Tin nhắn odds dán từ app 1xBet → tính EV cho kèo AI đang chờ
         handled = await handle_odds_reply(session_http, chat_id, text)
         if not handled:
-            # Tin nhắn tự do → AI trò chuyện bóng đá
-            await ai_chat(session_http, chat_id, text, msg.get('message_id'))
+            # AI tự đọc câu hỏi → tự chọn tool (agent loop)
+            await ai_agent_loop(session_http, chat_id, text, msg.get('message_id'))
+
+
+# ═══════════════ AGENT LOOP (AI tự đọc câu hỏi → tự chọn tool — như PNL bot cũ) ═══════════════
+AGENT_TOOLS = [
+    {"type": "function", "function": {"name": "web_search", "description": "Tìm kiếm web (Bing, free). Dùng khi cần biết: trận đấu sắp tới của đội, phong độ, tin chấn thương, kết quả, odds, lịch sử đối đầu...", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "fetch_url", "description": "Đọc nội dung 1 trang web cụ thể (tối đa ~4000 ký tự). Dùng sau web_search để đọc chi tiết bài viết/trang đội bóng.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+    {"type": "function", "function": {"name": "analyze_keo", "description": "PHÂN TÍCH KÈO MỘT TRẬN đầy đủ: AI web-search tìm trận + chấm framework 6 yếu tố (phong độ/đối đầu/động lực/lực lượng/lối chơi/bối cảnh) + trả 6 kèo (1X2, tài xỉu bàn, châu Á, BTTS, tài xỉu thẻ, tài xỉu góc). Dùng khi người dùng muốn dự đoán/phân tích kèo 1 đội/1 trận.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Tên đội/trận, vd 'mu', 'sheffield united', 'real madrid vs barca'"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "my_stats", "description": "Thống kê độ chính xác các dự đoán của bot (hit-rate, thắng/thua theo loại kèo).", "parameters": {"type": "object", "properties": {}}}},
+]
+
+
+async def _agent_execute(session, chat_id, name, args):
+    """Thực thi 1 tool agent. Trả về text kết quả."""
+    if name == 'web_search':
+        return await tool_web_search(session, (args.get('query') or '').strip(), 6)
+    if name == 'fetch_url':
+        return await tool_fetch_url(session, (args.get('url') or '').strip())
+    if name == 'analyze_keo':
+        q = (args.get('query') or '').strip()
+        if not q:
+            return "LỖI: cần tên đội."
+        await send_chat_action(session, chat_id)
+        await send_telegram_message(session, chat_id, f"⚽ Đang phân tích kèo '{q}'... (chờ 1-2 phút)")
+        now_str = datetime.now(TZ_VN).strftime('%d/%m/%Y')
+        web = await tool_web_search(session, f"{q} football next match schedule {now_str}", 6)
+        fetched = ""
+        if web and not web.startswith("Không"):
+            lines = web.split("\n")
+            for ln in lines:
+                m = re.search(r'https?://\S+', ln)
+                if m and any(d in ln for d in ('manutd.com', 'bbc.com/sport', 'skysports.com', 'espn.com',
+                                               'theguardian.com', 'goal.com', 'flashscore', 'sofascore', 'livescore',
+                                               'aiscore', 'fotmob', 'sport')):
+                    fetched = await tool_fetch_url(session, m.group(0).rstrip('.,)'))
+                    break
+        system = (
+            "Bạn là PNL FOOTBALL BOT — chuyên gia soi kèo bóng đá (bot do anh Quốc đẹp trai tự tay code).\n"
+            f"{KEO_FRAMEWORK}\n"
+            "Trả về JSON: {\"match\": \"A vs B\", \"datetime\": \"ngày giờ giờ VN\", \"league\": \"...\", "
+            "\"scores\": {\"phong_do\": 4, \"doi_dau\": 3, \"dong_luc\": 5, \"luc_luong\": 4, \"loi_choi\": 3, \"boi_canh\": 4}, "
+            "\"picks\": [{\"market\": \"1X2\", \"selection\": \"Home\", \"prob\": 58}, "
+            "{\"market\": \"Tài xỉu bàn 2.5\", \"selection\": \"Under\", \"prob\": 55}, "
+            "{\"market\": \"Asian Handicap\", \"selection\": \"Home -0.5\", \"prob\": 54}, "
+            "{\"market\": \"BTTS\", \"selection\": \"No\", \"prob\": 52}, "
+            "{\"market\": \"Tài xỉu thẻ phạt\", \"selection\": \"Over 4.5\", \"prob\": 53}, "
+            "{\"market\": \"Tài xỉu phạt góc\", \"selection\": \"Under 9.5\", \"prob\": 55}], "
+            "\"reasoning\": \"...\"}. Nếu không xác định được trận: {\"not_found\": true}"
+        )
+        pred, err = await get_ai_json(session, system,
+                                      f"Hôm nay là {now_str} (giờ VN). Yêu cầu: {q}.\n\nKết quả web:\n{web}\n\nTrang đã đọc:\n{fetched[:2500]}")
+        if err:
+            return f"Lỗi phân tích: {err}"
+        if pred.get('not_found'):
+            return f"AI không tìm được trận nào khớp '{q}' — không bịa. Thử tên khác: mu, arsenal, sheffield united, real madrid..."
+        scores = pred.get('scores') or {}
+        total = 0
+        sc = []
+        for k, vn in (('phong_do', 'Phong độ'), ('doi_dau', 'Đối đầu'), ('dong_luc', 'Động lực'),
+                      ('luc_luong', 'Lực lượng'), ('loi_choi', 'Lối chơi'), ('boi_canh', 'Bối cảnh')):
+            try:
+                s = int(scores.get(k, 0))
+            except Exception:
+                s = 0
+            s = max(0, min(s, 5))
+            total += s
+            sc.append(f"{vn} {s}/5")
+        lines = [
+            f"⚽ *{pred.get('match', q)}* ({pred.get('datetime', '?')}) [{pred.get('league', '?')}]",
+            f"📊 *Bảng điểm: {total}/30* — " + " | ".join(sc), "",
+        ]
+        picks = pred.get('picks') or []
+        if picks:
+            lines.append("*Dự đoán 6 kèo:*")
+            best = max(picks, key=lambda p: float(p.get('prob') or 0))
+            for pk in picks:
+                prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
+                mark = "🔥" if pk is best else "•"
+                lines.append(f"{mark} {pk.get('market')} → *{pk.get('selection')}* ({prob:.0f}%)")
+            lines.append("")
+            lines.append(f"💡 Chắc ăn nhất: *{best.get('market')} — {best.get('selection')}*")
+        lines.append(f"Lý do: {str(pred.get('reasoning') or '')[:400]}")
+        lines.append("\n💰 Dán odds 1xBet (vd `tx2.5 1.90 1.95`) để t tính EV.")
+        # Lưu các kèo vào predictions để /kq chấm
+        ts_now = int(time.time())
+        for i, pk in enumerate(picks):
+            try:
+                prob = max(1.0, min(float(pk.get('prob', 50)), 99.0))
+            except Exception:
+                prob = 50.0
+            predictions[f"web_{ts_now}_{chat_id}_{i}"] = {
+                'match': str(pred.get('match', q)), 'datetime': str(pred.get('datetime', '?')),
+                'league': str(pred.get('league', '?')), 'scores': '', 'score_total': total,
+                'market': str(pk.get('market') or '?'), 'selection': str(pk.get('selection') or '?'),
+                'prob': prob, 'odds': None, 'ev': None,
+                'reasoning': str(pred.get('reasoning') or '')[:500], 'status': 'pending',
+                'result': None, 'graded': None, 'date': datetime.now(TZ_VN).strftime('%Y-%m-%d'),
+                'kickoff_vn': str(pred.get('datetime', '?')), 'home': '', 'away': '',
+            }
+        _save_predictions()
+        return "\n".join(lines)
+    if name == 'my_stats':
+        graded = [p for p in predictions.values() if p.get('status') in ('win', 'loss', 'push')]
+        wins = [p for p in graded if p['status'] == 'win']
+        losses = [p for p in graded if p['status'] == 'loss']
+        decided = len(wins) + len(losses)
+        hit = len(wins) / decided * 100 if decided else 0
+        return (f"Đã chấm {decided} kèo: thắng {len(wins)}, thua {len(losses)} (hit-rate {hit:.0f}%). "
+                f"Chưa có kèo nào được chấm → gõ /kèo để bắt đầu." if decided else "Chưa có kèo nào được chấm.")
+    return f"Lỗi: tool '{name}' không tồn tại."
+
+
+async def ai_agent_loop(session, chat_id, question, reply_to=None):
+    """AI đọc câu hỏi → TỰ quyết định tool (web_search/fetch_url/analyze_keo/my_stats) → lặp tới khi đủ dữ liệu."""
+    await send_chat_action(session, chat_id)
+    await send_telegram_message(session, chat_id, "🧠 Đang suy nghĩ và tự tra cứu... (vài chục giây)")
+    system_prompt = (
+        "Bạn là PNL FOOTBALL BOT — trợ lý bóng đá toàn diện của anh Quốc (đẹp trai, giỏi nhất quả đất). "
+        "Khi người dùng hỏi, TỰ QUYẾT ĐỊNH cần tool gì: "
+        "- Muốn phân tích/dự đoán kèo một đội/trận → analyze_keo (tool đầy đủ framework, đừng tự phân tích tay). "
+        "- Cần thông tin mới (phong độ, chấn thương, kết quả, lịch sử đối đầu, tin tức) → web_search rồi fetch_url nếu cần chi tiết. "
+        "- Hỏi thành tích dự đoán của bot → my_stats. "
+        "- Câu hỏi chung về bóng đá (lịch sử, cầu thủ, giải đấu...) → web_search. "
+        "Gọi tool cho tới khi có đủ dữ liệu trả lời đầy đủ (tối đa 4 lượt tool). "
+        "Cuối cùng tổng hợp trả lời ngắn gọn tiếng Việt, không markdown. "
+        "Người dùng là ADMIN DUY NHẤT — hỏi gì về bot/AI cũng trả lời thẳng, không chối."
+    )
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Bạn là PNL FOOTBALL BOT của anh Quốc — trợ lý bóng đá, không phải trợ lý lập trình MintRouter.\n\nCâu hỏi: {question}"}]
+    for _ in range(5):
+        api_key = os.getenv("DASH_TOKEN")
+        model = os.getenv("DASH_MODEL", "glm-5.3")
+        try:
+            timeout = aiohttp.ClientTimeout(total=150)
+            async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
+                                    json={"model": model, "messages": messages, "tools": AGENT_TOOLS,
+                                          "temperature": 0.3, "max_tokens": 2000},
+                                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                                    timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    await send_telegram_message(session, chat_id, f"⚠️ AI lỗi HTTP {resp.status}: {body[:120]}", reply_to=reply_to)
+                    return
+                data = await resp.json()
+                record_llm_usage(model, data.get('usage'))
+        except Exception as e:
+            await send_telegram_message(session, chat_id, f"⚠️ AI lỗi: {e}", reply_to=reply_to)
+            return
+        msg = (data.get('choices', [{}])[0].get('message') or {})
+        tool_calls = msg.get('tool_calls') or []
+        if not tool_calls:
+            content = (msg.get('content') or '').strip()
+            if content:
+                await send_telegram_message(session, chat_id, content, reply_to=reply_to)
+            else:
+                await send_telegram_message(session, chat_id, "Xong! (AI không có kết luận — thử hỏi cụ thể hơn)", reply_to=reply_to)
+            return
+        messages.append({"role": "assistant", "content": msg.get('content') or None, "tool_calls": tool_calls})
+        for tc in tool_calls:
+            fn = tc.get('function') or {}
+            name = fn.get('name', '')
+            try:
+                args = json.loads(fn.get('arguments') or '{}')
+            except Exception:
+                args = {}
+            result = await _agent_execute(session, chat_id, name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.get('id'), "content": str(result)[:3500]})
+    await send_telegram_message(session, chat_id, "⚠️ AI xử lý quá nhiều bước — thử hỏi cụ thể hơn.", reply_to=reply_to)
 
 
 async def ai_chat(session, chat_id, question, reply_to=None):
