@@ -835,6 +835,20 @@ ODDS_SPORT_KEYS = {
 }
 ODDS_BOARD_CACHE = {}  # sport_key -> (events, ts)
 odds_quota = {'month': '', 'used': 0, 'remaining': None}
+
+
+def _odds_sport_for(league_name):
+    """Map tên giải (kiểu Sky: 'American MLS League') → sport key, khớp mờ."""
+    if not league_name:
+        return None
+    if league_name in ODDS_SPORT_KEYS:
+        return ODDS_SPORT_KEYS[league_name]
+    low = league_name.lower().strip()
+    for key, sk in ODDS_SPORT_KEYS.items():
+        kl = key.lower()
+        if kl in low or low in kl:
+            return sk
+    return None
 _ODDS_BOOKS_PRIORITY = ('onexbet', 'pinnacle')  # 1xBet trước (m chơi 1xBet), rồi Pinnacle sharp
 
 
@@ -3222,7 +3236,9 @@ LEAGUE_SKY_SLUGS = {
     'Champions League': 'champions-league', 'UEFA Champions League': 'champions-league',
     'Europa League': 'europa-league', 'UEFA Europa League': 'europa-league',
     'V.League 1': 'v-league', 'V-League': 'v-league',
-    'MLS': 'mls', 'World Cup': 'world-cup', 'Euro': 'european-championship',
+    'MLS': 'mls', 'American MLS League': 'mls',
+    'EFL Championship': 'efl-championship', 'Championship': 'efl-championship',
+    'World Cup': 'world-cup', 'Euro': 'european-championship',
     'FA Cup': 'fa-cup', 'League Cup': 'league-cup', 'Carabao Cup': 'league-cup',
     'Copa del Rey': 'copa-del-rey', 'Coppa Italia': 'coppa-italia',
     'DFB Pokal': 'dfb-pokal', 'Coupe de France': 'coupe-de-france',
@@ -3462,7 +3478,7 @@ async def _agent_execute(session, chat_id, name, args):
         try:
             _m = re.search(r'\[([^\]]+)\]', target_ln or '')
             _league_bracket = _m.group(1) if _m else ''
-            _sport = ODDS_SPORT_KEYS.get(_league_bracket or '')
+            _sport = _odds_sport_for(_league_bracket or '')
             _ht2, _at2 = _sky_line_teams(target_ln or '')
             if _sport and _ht2 and _at2:
                 _board, _berr = await get_odds_board(session, _sport)
