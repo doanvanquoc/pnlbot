@@ -806,6 +806,88 @@ async def get_api_prediction(session, fixture_id):
     return txt
 
 
+_standings_cache = {}  # league_id -> (data, timestamp)
+_team_stats_cache = {}  # (team_id, league_id) -> (data, timestamp)
+STATS_CACHE_TTL = 3600  # 1 giờ
+
+
+async def get_standings(session, league_id, season=2026):
+    """Lấy bảng xếp hạng từ API-Football. Trả về list teams hoặc rỗng."""
+    cache_key = f"{league_id}_{season}"
+    if cache_key in _standings_cache and time.time() - _standings_cache[cache_key][1] < STATS_CACHE_TTL:
+        return _standings_cache[cache_key][0]
+    data, err = await fb_get(session, "/standings", {'league': league_id, 'season': season})
+    if err or not data:
+        return []
+    try:
+        standings = (data[0] or {}).get('league', {}).get('standings', [[]])[0]
+        _standings_cache[cache_key] = (standings, time.time())
+        return standings
+    except Exception:
+        return []
+
+
+async def get_team_stats(session, team_id, league_id, season=2026):
+    """Lấy thống kê mùa giải của đội (goals, clean sheets, cards, form). Trả về dict hoặc {}."""
+    cache_key = f"{team_id}_{league_id}_{season}"
+    if cache_key in _team_stats_cache and time.time() - _team_stats_cache[cache_key][1] < STATS_CACHE_TTL:
+        return _team_stats_cache[cache_key][0]
+    data, err = await fb_get(session, "/teams/statistics", {'team': team_id, 'league': league_id, 'season': season})
+    if err or not data:
+        return {}
+    _team_stats_cache[cache_key] = (data, time.time())
+    return data
+
+
+def _format_team_stats(stats, team_name):
+    """Format team statistics thành text ngắn gọn cho AI."""
+    if not stats:
+        return ""
+    lines = [f"Thống kê mùa giải {team_name}:"]
+    form = stats.get('form', '')
+    if form:
+        lines.append(f"  Phong độ: {form[-10:]}")
+    goals = stats.get('goals', {})
+    for side in ('for', 'against'):
+        g = goals.get(side, {})
+        total = g.get('total', {})
+        avg = g.get('average', {})
+        if total.get('total') and avg.get('total'):
+            label = "ghi" if side == 'for' else "thủng"
+            lines.append(f"  Bàn {label}: {total.get('total')} ({float(avg.get('total', 0)):.1f}/trận)")
+    cs = stats.get('clean_sheet', {})
+    if cs.get('total'):
+        lines.append(f"  Sạch lưới: {cs['total']} trận")
+    fts = stats.get('failed_to_score', {})
+    if fts.get('total'):
+        lines.append(f"  Tịt ngòi: {fts['total']} trận")
+    cards = stats.get('cards', {})
+    yellow_total = sum(int(v.get('total') or 0) for v in (cards.get('yellow') or {}).values() if isinstance(v, dict))
+    red_total = sum(int(v.get('total') or 0) for v in (cards.get('red') or {}).values() if isinstance(v, dict))
+    if yellow_total or red_total:
+        lines.append(f"  Thẻ: {yellow_total} vàng, {red_total} đỏ")
+    return "\n".join(lines)
+
+
+def _format_standings(standings, team_name):
+    """Format BXH ngắn gọn cho AI."""
+    if not standings:
+        return ""
+    for t in standings:
+        name = t.get('team', {}).get('name', '')
+        if name.lower() == team_name.lower() or team_name.lower() in name.lower() or name.lower() in team_name.lower():
+            rank = t.get('rank', '?')
+            points = t.get('points', '?')
+            goalsDiff = t.get('goalsDiff', '?')
+            form = t.get('form', '')
+            played = t.get('all', {}).get('played', '?')
+            win = t.get('all', {}).get('win', '?')
+            draw = t.get('all', {}).get('draw', '?')
+            lose = t.get('all', {}).get('lose', '?')
+            return f"BXH: #{rank} ({points}đ, {played}tr: {win}T-{draw}H-{lose}B, hiệu số {goalsDiff}, phong độ {form[-8:]})"
+    return ""
+
+
 # ═══════════════ WEB TOOLS (AI tự tìm kiếm — Bing miễn phí) ═══════════════
 
 def _decode_bing_href(href):
@@ -2412,6 +2494,54 @@ async def _agent_execute(session, chat_id, name, args):
                        if any(w in ln.lower() for w in kw) or 'ĐANG ĐÁ' in ln][:15]
                 if rel:
                     data_parts.append("CÁC TRẬN LIÊN QUAN TRONG GIẢI:\n" + "\n".join(rel))
+        # ── API-Football: standings + team stats (dữ liệu thật cho Tài/Xỉu, BTTS) ──
+        api_data_parts = []
+        try:
+            # Tìm fixture từ API-Football theo tên đội + ngày
+            today_str = datetime.now(TZ_VN).strftime('%Y-%m-%d')
+            tomorrow_str = (datetime.now(TZ_VN) + timedelta(days=1)).strftime('%Y-%m-%d')
+            fixtures_today, _ = await get_fixtures_for_date(session, today_str, only_tracked=False, force=False)
+            fixtures_tomorrow, _ = await get_fixtures_for_date(session, tomorrow_str, only_tracked=False, force=False)
+            all_fixtures = (fixtures_today or []) + (fixtures_tomorrow or [])
+            # Tìm fixture khớp tên đội
+            q_tok = re.split(r'[^a-z0-9]+', q.lower())[0] if q else ''
+            opp_tok = re.split(r'[^a-z0-9]+', opponent.lower())[0] if opponent else ''
+            matched_fx = None
+            for fx in all_fixtures:
+                h = (fx.get('teams', {}).get('home', {}).get('name') or '').lower()
+                a = (fx.get('teams', {}).get('away', {}).get('name') or '').lower()
+                if (q_tok and q_tok in h) or (opp_tok and opp_tok in a):
+                    matched_fx = fx
+                    break
+                if (q_tok and q_tok in a) or (opp_tok and opp_tok in h):
+                    matched_fx = fx
+                    break
+            if matched_fx:
+                home_id = matched_fx['teams']['home']['id']
+                away_id = matched_fx['teams']['away']['id']
+                league_id = matched_fx['league']['id']
+                home_name = matched_fx['teams']['home']['name']
+                away_name = matched_fx['teams']['away']['name']
+                # Standings
+                standings = await get_standings(session, league_id)
+                if standings:
+                    st_h = _format_standings(standings, home_name)
+                    st_a = _format_standings(standings, away_name)
+                    if st_h:
+                        api_data_parts.append(f"BXH {home_name}: {st_h}")
+                    if st_a:
+                        api_data_parts.append(f"BXH {away_name}: {st_a}")
+                # Team stats (goals scored/conceded, clean sheets, cards)
+                stats_h = await get_team_stats(session, home_id, league_id)
+                stats_a = await get_team_stats(session, away_id, league_id)
+                formatted_h = _format_team_stats(stats_h, home_name)
+                formatted_a = _format_team_stats(stats_a, away_name)
+                if formatted_h:
+                    api_data_parts.append(formatted_h)
+                if formatted_a:
+                    api_data_parts.append(formatted_a)
+        except Exception as e:
+            logger.warning(f"[analyze_keo] API-Football data error: {e}")
         # ── Historical accuracy feedback: bot học từ quá khứ ──
         hist_lines = []
         q_tok = re.split(r'[^a-z0-9]+', q.lower())[0] if q else ''
@@ -2438,8 +2568,11 @@ async def _agent_execute(session, chat_id, name, args):
         hist_block = ""
         if hist_lines:
             hist_block = "\n\nLỊCH SỬ DỰ ĐOÁN CỦA BOT (dùng để calibrate % — đừng lặp lại sai lầm cũ):\n" + "\n".join(hist_lines[:8])
+        api_block = ""
+        if api_data_parts:
+            api_block = "\n\nDỮ LIỆU THẬT TỪ API-FOOTBALL (thống kê mùa giải + BXH — dùng cho Tài/Xỉu, BTTS):\n" + "\n".join(api_data_parts)
         data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
-                      + "\n\n".join(data_parts) + hist_block) if data_parts else (
+                      + "\n\n".join(data_parts) + api_block + hist_block) if data_parts else (
                       f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(session, f"{q} football next match {now_str}", 5))
         return ("Dữ liệu trận đấu (dùng làm nền tảng chốt 6 kèo):\n\n" + data_block)
     if name == 'my_stats':
