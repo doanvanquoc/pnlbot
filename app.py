@@ -909,6 +909,8 @@ KEO_FRAMEWORK = """BẮT BUỘC chấm điểm 6 yếu tố sau (tối đa 5 đi
 3. ĐỘNG LỰC (5đ): trận này có ý nghĩa gì — đua vô địch/top 4/trụ hạng/cúp; đội có giữ sức cho trận lớn khác; derby; đội hết động lực cuối mùa.
 4. LỰC LƯỢNG (5đ): chấn thương/treo giò cầu thủ chủ chốt, xoay vòng đội hình, chuyển nhượng mới (chỉ dùng dữ liệu web tin cậy, KHÔNG bịa).
 5. LỐI CHƠI & THỐNG KÊ (5đ): phong cách (pressing/để bóng/phản công), xG gần đây nếu biết, kiểm soát bóng, tần suất ghi/thủng bàn.
+   - PHÒNG THỦ: số bàn thua trung bình/trận, số trận sạch lưới gần đây, hàng thủ có chấn thương chủ chốt không.
+   - TỔNG BÀN DỰ KIẾN: ước lượng tổng bàn = (bàn ghi TB đội A + bàn thua TB đội B)/2 + (bàn ghi TB đội B + bàn thua TB đội A)/2. Nếu < 2.5 → XỈU; nếu > 2.8 → TÀI; nếu 2.5-2.8 → xem thêm đối đầu.
    - KÈO THẺ: ước lượng thẻ TB/trận của 2 đội (trọng tài nào bắt, derby hay không, đội nào hay phạm lỗi/rút đè), thẻ đỏ TB.
    - KÈO GÓC: góc TB/trận của 2 đội (biên lấn cánh, tạt nhiều hay cầm bóng trung lộ), góc ở sân nhà/khách.
 6. BỐI CẢNH (5đ): sân nhà/khách, lịch thi đấu dày (đá giữa tuần), thời tiết, trọng tài cụ thể (tên + phong cách rút thẻ), VAR.
@@ -2497,6 +2499,11 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
         "Kết quả cuối PHẢI có 6 dòng kèo (1X2, tài xỉu bàn, châu Á, BTTS, thẻ, góc). "
         "Nếu dữ liệu THIẾU cho kèo nào (thiếu 2+ yếu tố framework) → ghi 'Thiếu dữ liệu' với pct=0, KHÔNG đoán mò. "
         "Nếu đủ dữ liệu → chấm điểm framework rồi mới chốt %, % phải phản ánh tổng điểm (≥21/30 → >60%; 18-20 → 55-60%; <18 → <55%). "
+        "QUY TẮC TÀI/XỈU: PHẢI ước lượng tổng bàn dự kiến TRƯỚC khi chọn (tổng bàn TB hai đội + bàn thua TB). "
+        "Nếu tổng bàn dự kiến < 2.5 → CHỌN XỈU, KHÔNG chọn Tài. "
+        "Nếu tổng bàn dự kiến > 2.8 → chọn Tài. "
+        "Nếu 2.5-2.8 → xem lịch sử đối đầu (nhiều bàn → Tài, ít bàn → Xỉu). "
+        "KHÔNG BAO GIỜ chọn Tài khi tổng bàn dự kiến < 2.2 — đó là kèo THUA. "
         "FORMAT KẾT QUẢ CUỐI (CHÍNH XÁC mẫu — không thêm/bớt):\n"
         "⚽ [giải] TeamA vs TeamB (giờ VN)\n"
         "(🔴 LIVE phút X — tỉ số nếu đang đá)\n"
