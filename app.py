@@ -1637,7 +1637,17 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption=''):
     except Exception as e:
         await send_telegram_message(session, chat_id, f"❌ Lỗi tải ảnh: {e}")
         return
-    import base64
+    import base64, io
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(raw)).convert('RGB')
+        # Nén ảnh: max 1000px, JPEG q85 — ảnh gốc Telegram ~1MB+ dễ bị upstream reject
+        img.thumbnail((1000, 1000))
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        raw = buf.getvalue()
+    except Exception as e:
+        logger.warning(f"Không nén được ảnh: {e}")
     data_url = f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"
     caption_txt = caption.strip()[:300]
     prompt = (
