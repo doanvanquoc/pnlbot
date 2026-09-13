@@ -1775,21 +1775,41 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
     for _ in range(5):
         api_key = os.getenv("DASH_TOKEN")
         model = os.getenv("DASH_MODEL", "glm-5.3")
-        try:
-            timeout = aiohttp.ClientTimeout(total=150)
-            async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
-                                    json={"model": model, "messages": messages, "tools": AGENT_TOOLS,
-                                          "temperature": 0.3, "max_tokens": 2000},
-                                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                                    timeout=timeout) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    await send_telegram_message(session, chat_id, f"⚠️ AI lỗi HTTP {resp.status}: {body[:120]}", reply_to=reply_to)
+        data = None
+        for attempt in range(3):
+            try:
+                timeout = aiohttp.ClientTimeout(total=150)
+                async with session.post(f"{MINTROUTER_BASE_URL}/chat/completions",
+                                        json={"model": model, "messages": messages, "tools": AGENT_TOOLS,
+                                              "temperature": 0.3, "max_tokens": 2000},
+                                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                                        timeout=timeout) as resp:
+                    if resp.status in (502, 503, 504):
+                        logger.warning(f"AI 5xx — chờ {8 * (attempt + 1)}s thử lại")
+                        await asyncio.sleep(8 * (attempt + 1))
+                        continue
+                    if resp.status == 429:
+                        try:
+                            err429 = (await resp.json(content_type=None)) or {}
+                            wait = int((err429.get('error') or {}).get('reset_seconds') or 30)
+                        except Exception:
+                            wait = 30
+                        await asyncio.sleep(min(wait + 2, 90))
+                        continue
+                    if resp.status != 200:
+                        body = await resp.text()
+                        await send_telegram_message(session, chat_id, f"⚠️ AI lỗi HTTP {resp.status}: {body[:120]}", reply_to=reply_to)
+                        return
+                    data = await resp.json()
+                    record_llm_usage(model, data.get('usage'))
+                    break
+            except Exception as e:
+                if attempt == 2:
+                    await send_telegram_message(session, chat_id, f"⚠️ AI lỗi: {e}", reply_to=reply_to)
                     return
-                data = await resp.json()
-                record_llm_usage(model, data.get('usage'))
-        except Exception as e:
-            await send_telegram_message(session, chat_id, f"⚠️ AI lỗi: {e}", reply_to=reply_to)
+                await asyncio.sleep(5)
+        if data is None:
+            await send_telegram_message(session, chat_id, "⚠️ AI lỗi liên tiếp — thử lại sau ít phút.", reply_to=reply_to)
             return
         msg = (data.get('choices', [{}])[0].get('message') or {})
         tool_calls = msg.get('tool_calls') or []
