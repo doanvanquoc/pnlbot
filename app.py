@@ -2160,6 +2160,10 @@ def _strict_keo_format(text):
             out.append(f"- {disp}: {val}")
     if best:
         out.append(best[:90])
+    # Không moi được kèo nào/best nào → đây là câu trả lời hội thoại (vd kèo live):
+    # trả NGUYÊN VĂN đã dọn, cấm cắt cụt thành 1 dòng header
+    if not out_k and not best:
+        return text[:3500]
     return '\n'.join(out)
 
 
