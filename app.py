@@ -1367,15 +1367,33 @@ async def telegram_polling_loop(app):
                     u_kind = 'callback' if update.get('callback_query') else (
                         'msg:' + ((update.get('message') or {}).get('text') or '')[:40])
                     logger.info(f"[TG] update #{update['update_id']} {u_kind}")
-                    try:
-                        await handle_update(session, update)
-                    except Exception:
-                        logger.exception(f"Lỗi xử lý update {update.get('update_id')}")
+                    # Xử lý SONG SONG: /kèo chậm 1-2 phút không được chặn /start của user
+                    asyncio.create_task(_handle_update_safe(session, update))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning(f"Lỗi polling: {e}")
             await asyncio.sleep(5)
+
+
+_chat_locks = {}
+
+
+def _chat_lock(chat_id):
+    """Mỗi chat 1 lock: tránh 2 lệnh /kèo cùng chat chạy song song đốt quota loạn."""
+    if chat_id not in _chat_locks:
+        _chat_locks[chat_id] = asyncio.Lock()
+    return _chat_locks[chat_id]
+
+
+async def _handle_update_safe(session, update):
+    try:
+        chat_id = (update.get('message') or {}).get('chat', {}).get('id') \
+            or (update.get('callback_query') or {}).get('message', {}).get('chat', {}).get('id')
+        async with _chat_lock(chat_id):
+            await handle_update(session, update)
+    except Exception:
+        logger.exception(f"Lỗi xử lý update {update.get('update_id')}")
 
 
 # ═══════════════ STARTUP ═══════════════
