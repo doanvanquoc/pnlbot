@@ -143,6 +143,7 @@ def record_llm_usage(model, usage):
 # ═══════════════ TELEGRAM ═══════════════
 
 _telegram_flood_until = 0.0
+_sent_msg_ids: dict[int, list[int]] = {}  # chat_id → [message_id, ...]
 
 
 def _strip_md_chars(text):
@@ -172,6 +173,11 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None, reply
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
                 if data.get('ok'):
+                    mid = data.get('result', {}).get('message_id')
+                    if mid:
+                        _sent_msg_ids.setdefault(chat_id, []).append(mid)
+                        if len(_sent_msg_ids[chat_id]) > 200:
+                            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
                     return data
                 err = data.get('description', '')
                 if 'parse' in err.lower() or "can't parse" in err.lower():
@@ -194,6 +200,21 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None, reply
             logger.warning(f"Lỗi gửi tin Telegram: {e}")
             await asyncio.sleep(2)
     return None
+
+
+async def delete_telegram_message(session, chat_id, message_id):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False
+    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    try:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                return True
+    except Exception as e:
+        logger.warning(f"Lỗi xóa tin Telegram {message_id}: {e}")
+    return False
 
 
 async def send_long_message(session, chat_id, text, reply_markup=None):
@@ -1695,12 +1716,8 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         f"Trả về DUY NHẤT JSON schema: {UNIFIED_SCHEMA}"
     )
     
-    # 5. Xác định market types cần phân tích
-    market_types = ['match_result', 'total_goals', 'btts', 'asian_handicap']
-    has_corners = any('corner' in m.lower() or 'góc' in m.lower() for m in odds['markets'])
-    has_cards = any('card' in m.lower() or 'booking' in m.lower() or 'thẻ' in m.lower() for m in odds['markets'])
-    if has_corners: market_types.append('corners')
-    if has_cards: market_types.append('cards')
+    # 5. CHỈ 3 kèo chính (tránh 429 rate limit: 6 request → 3 request)
+    market_types = ['match_result', 'total_goals', 'asian_handicap']
     
     # Nếu user chỉ hỏi 1 kèo cụ thể, vẫn phân tích đủ để có scenario anchor
     # nhưng chỉ return kèo đó
@@ -2723,6 +2740,11 @@ async def handle_update(session, update):
 
     if command_base in ('/start', '/help'):
         await send_telegram_message(session_http, chat_id, _help_text())
+    elif command_base == '/clear':
+        ids = _sent_msg_ids.pop(chat_id, [])
+        for mid in ids:
+            await delete_telegram_message(session_http, chat_id, mid)
+        await send_telegram_message(session_http, chat_id, "🧹 Đã xóa tin nhắn cũ.")
     elif command_base == '/lich':
         await cmd_lich(session_http, chat_id, arg)
     elif command_base == '/kèo' or command_base == '/keo':
@@ -2736,19 +2758,6 @@ async def handle_update(session, update):
     else:
         # AI tự đọc câu hỏi → tự chọn tool (agent loop)
         await ai_agent_loop(session_http, chat_id, text, msg.get('message_id'))
-
-
-async def delete_telegram_message(session, chat_id, message_id):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not message_id:
-        return
-    try:
-        async with session.post(f"https://api.telegram.org/bot{token}/deleteMessage",
-                                json={"chat_id": chat_id, "message_id": message_id},
-                                timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            await resp.read()
-    except Exception:
-        pass
 
 
 _status_msgs = {}  # chat_id -> [message_id]

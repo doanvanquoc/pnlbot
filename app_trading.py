@@ -1124,6 +1124,7 @@ def _signed_url(path, params, api_secret, base="https://fapi.binance.com", metho
 # Mốc thời gian (epoch) đến khi hết cửa sổ flood 429 của Telegram — mọi send chia sẻ chung,
 # tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
 _telegram_flood_until = 0.0
+_sent_msg_ids: dict[int, list[int]] = {}  # chat_id → [message_id, ...] cho /clear
 
 # ─── Lệnh /model: list model + giá MintRouter, bấm chọn → đổi .env + restart ───
 MINT_MODEL_PRICES = {
@@ -1501,7 +1502,12 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
             async with session.post(url, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get('result', {}).get('message_id')
+                    mid = data.get('result', {}).get('message_id')
+                    if mid:
+                        _sent_msg_ids.setdefault(chat_id, []).append(mid)
+                        if len(_sent_msg_ids[chat_id]) > 200:
+                            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
+                    return mid
                 # Telegram trả 429 (rate limit): ghi nhớ cửa sổ flood, chờ retry_after rồi thử lại
                 if resp.status == 429 and attempt < max_attempts - 1:
                     try:
@@ -9217,6 +9223,13 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "• Lệnh Limit: `/long btc 1000 98000` (LONG btc với volume 1000 USDT tại giá 98000)"
         )
         await send_telegram_message(request.app['session'], chat_id, welcome_text)
+        
+    elif command_base == '/clear':
+        session = request.app['session']
+        ids = _sent_msg_ids.pop(chat_id, [])
+        for mid in ids:
+            await delete_telegram_message(session, chat_id, mid)
+        await send_telegram_message(session, chat_id, "🧹 Đã xóa tin nhắn cũ.")
         
     elif command_base == '/pnl':
         await handle_pnl_command(request.app['session'], chat_id)
