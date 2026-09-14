@@ -7730,7 +7730,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         if image_data_url:
             user_content = [
                 {"type": "text", "text": user_content},
-                {"type": "image_url", "image_url": {"url": image_data_url}}
+                {"type": "image", "image_url": {"url": image_data_url}}
             ]
 
         history = ai_chat_history.get(chat_id, [])
@@ -9148,7 +9148,7 @@ async def telegram_webhook_handler(request):
         try:
             await process_telegram_message(request, chat_id, text, ai_reply_to, replied_text)
         except Exception as e:
-            logger.error(f"Lỗi xử lý tin nhắn từ {chat_id}: {e}")
+            logger.error(f"Lỗi xử lý tin nhắn từ {chat_id}: {e}", exc_info=True)
 
     asyncio.create_task(run_command())
     return web.Response(status=200)
@@ -9255,7 +9255,12 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
         ids = _sent_msg_ids.pop(chat_id, [])
         for mid in ids:
             await delete_telegram_message(session, chat_id, mid)
-        await send_telegram_message(session, chat_id, "🧹 Đã xóa tin nhắn cũ.")
+        resp = await send_telegram_message(session, chat_id, "🧹 Đã xóa tin nhắn cũ.")
+        if resp and resp.get('ok'):
+            conf_mid = resp.get('result', {}).get('message_id')
+            if conf_mid:
+                await asyncio.sleep(0.3)
+                await delete_telegram_message(session, chat_id, conf_mid)
         
     elif command_base == '/pnl':
         await handle_pnl_command(request.app['session'], chat_id)

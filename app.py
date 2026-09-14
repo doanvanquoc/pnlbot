@@ -2674,7 +2674,7 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=Fal
     payload = {"model": model, "messages": [
         {"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "image", "image_url": {"url": data_url}},
         ]}],
         "max_tokens": 1200, "temperature": 0.3}
     try:
@@ -2691,6 +2691,7 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=Fal
             record_llm_usage(model, data.get('usage'))
             content = (data.get('choices', [{}])[0].get('message') or {}).get('content') or ''
     except Exception as e:
+        logger.error(f"Lỗi gọi AI đọc odds ảnh: {e}", exc_info=True)
         await send_telegram_message(session, chat_id, f"⚠️ Lỗi gọi AI: {e}")
         return
     await send_telegram_message(session, chat_id, "📊 *AI ĐỌC ODDS TỪ ẢNH:*\n\n" + content.strip()[:3800])
