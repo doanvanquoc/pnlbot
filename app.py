@@ -2670,11 +2670,12 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=Fal
         + (f"\n\nGhi chú của người dùng: {caption_txt}" if caption_txt else "")
     )
     api_key = os.getenv("DASH_TOKEN")
-    model = os.getenv("DASH_MODEL", "glm-5.3")
+    # glm-5.3 không hỗ trợ vision → dùng DASH_VISION_MODEL chuyên đọc ảnh
+    model = os.getenv("DASH_VISION_MODEL", "gpt-5.6-sol")
     payload = {"model": model, "messages": [
         {"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image", "image_url": {"url": data_url}},
+            {"type": "image_url", "image_url": {"url": data_url}},
         ]}],
         "max_tokens": 1200, "temperature": 0.3}
     try:

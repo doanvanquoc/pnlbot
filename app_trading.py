@@ -7274,7 +7274,13 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=6000, timeo
     api_key = os.getenv("DASH_TOKEN")
     if not api_key:
         return None, "Chưa cấu hình DASH_TOKEN."
-    model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+    has_image = False
+    for m in messages:
+        c = m.get('content')
+        if isinstance(c, list) and any(isinstance(p, dict) and p.get('type') in ('image', 'image_url') for p in c):
+            has_image = True
+            break
+    model = os.getenv("DASH_VISION_MODEL", "gpt-5.6-sol") if has_image else os.getenv("DASH_MODEL", "claude-sonnet-5")
     url = f"{MINTROUTER_BASE_URL}/chat/completions"
     headers = _ai_headers(api_key, session_id=session_id)
     payload = {
@@ -7292,7 +7298,7 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=6000, timeo
                 logger.warning(f"AI agent trả lỗi HTTP {resp.status}: {body[:200]}")
                 return None, f"HTTP {resp.status}: {body[:200]}"
             data = await resp.json()
-            record_llm_usage(os.getenv("DASH_MODEL", "claude-sonnet-5"), data.get('usage'))
+            record_llm_usage(model, data.get('usage'))
             choice = data.get('choices', [{}])[0]
             msg = choice.get('message')
             if msg is None:
@@ -7730,7 +7736,7 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
         if image_data_url:
             user_content = [
                 {"type": "text", "text": user_content},
-                {"type": "image", "image_url": {"url": image_data_url}}
+                {"type": "image_url", "image_url": {"url": image_data_url}}
             ]
 
         history = ai_chat_history.get(chat_id, [])
