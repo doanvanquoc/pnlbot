@@ -144,6 +144,44 @@ def record_llm_usage(model, usage):
 
 _telegram_flood_until = 0.0
 _sent_msg_ids: dict[int, list[int]] = {}  # chat_id → [message_id, ...]
+SENT_MSG_IDS_FILE = "sent_msg_ids.json"
+
+
+def _load_sent_msg_ids():
+    global _sent_msg_ids
+    try:
+        if os.path.exists(SENT_MSG_IDS_FILE):
+            with open(SENT_MSG_IDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _sent_msg_ids = {int(k): [int(x) for x in v] for k, v in data.items()}
+            total = sum(len(v) for v in _sent_msg_ids.values())
+            logger.info(f"Đã nạp {total} message_id từ {SENT_MSG_IDS_FILE}.")
+    except Exception as e:
+        logger.error(f"Lỗi nạp {SENT_MSG_IDS_FILE}: {e}")
+
+
+def _save_sent_msg_ids():
+    try:
+        data = {str(k): v for k, v in _sent_msg_ids.items()}
+        with open(SENT_MSG_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Lỗi lưu {SENT_MSG_IDS_FILE}: {e}")
+
+
+def _remember_msg_id(chat_id, mid):
+    if not mid:
+        return
+    ids = _sent_msg_ids.setdefault(chat_id, [])
+    # Chống trùng lặp lười (push lại cùng tin khi có nhiều update)
+    if ids and ids[-1] == mid:
+        return
+    ids.append(mid)
+    if len(ids) > 5000:
+        del ids[:-5000]
+    # Tự lưu file khi tích lũy đủ — không bị mất toàn bộ khi bot crash/restart
+    if len(ids) % 25 == 0:
+        _save_sent_msg_ids()
 
 
 def _strip_md_chars(text):
@@ -175,9 +213,7 @@ async def send_telegram_message(session, chat_id, text, reply_markup=None, reply
                 if data.get('ok'):
                     mid = data.get('result', {}).get('message_id')
                     if mid:
-                        _sent_msg_ids.setdefault(chat_id, []).append(mid)
-                        if len(_sent_msg_ids[chat_id]) > 200:
-                            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
+                        _remember_msg_id(chat_id, mid)
                     return data
                 err = data.get('description', '')
                 if 'parse' in err.lower() or "can't parse" in err.lower():
@@ -208,15 +244,29 @@ async def delete_telegram_message(session, chat_id, message_id):
         return False
     url = f"https://api.telegram.org/bot{token}/deleteMessage"
     payload = {"chat_id": chat_id, "message_id": message_id}
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status == 200:
-                return True
-            else:
+    for attempt in range(4):
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status == 429:
+                    wait = 3 * (attempt + 1)
+                    try:
+                        body = await resp.json()
+                        retry_after = (body.get('parameters') or {}).get('retry_after', 0)
+                        if retry_after:
+                            wait = int(retry_after) + 1
+                    except Exception:
+                        pass
+                    logger.warning(f"deleteMessage 429 rate-limit: chờ {wait}s rồi thử lại tin {message_id}")
+                    await asyncio.sleep(wait)
+                    continue
                 body = await resp.text()
                 logger.warning(f"Không thể xóa tin Telegram {message_id}: HTTP {resp.status} - {body}")
-    except Exception as e:
-        logger.warning(f"Lỗi xóa tin Telegram {message_id}: {e}")
+                return False
+        except Exception as e:
+            logger.warning(f"Lỗi xóa tin Telegram {message_id}: {e}")
+            await asyncio.sleep(2)
     return False
 
 
@@ -2740,9 +2790,7 @@ async def handle_update(session, update):
         return
     # Ghi nhận message_id của tin USER để /clear xóa được cả tin user (channel/group cần bot admin)
     if msg.get('message_id'):
-        _sent_msg_ids.setdefault(chat_id, []).append(msg['message_id'])
-        if len(_sent_msg_ids[chat_id]) > 200:
-            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
+        _remember_msg_id(chat_id, msg['message_id'])
     auto_chats.add(chat_id)
     _save_chats()
 
@@ -2768,10 +2816,28 @@ async def handle_update(session, update):
     if command_base in ('/start', '/help'):
         await send_telegram_message(session_http, chat_id, _help_text())
     elif command_base == '/clear':
-        ids = _sent_msg_ids.pop(chat_id, [])
-        for mid in ids:
-            await delete_telegram_message(session_http, chat_id, mid)
-        resp = await send_telegram_message(session_http, chat_id, "🧹 Đã xóa tin nhắn cũ.")
+        ids = list(_sent_msg_ids.get(chat_id, []))
+        deleted = 0
+        kept = []
+        for mid in ids[:800]:
+            ok = await delete_telegram_message(session_http, chat_id, mid)
+            if ok:
+                deleted += 1
+            else:
+                kept.append(mid)
+            await asyncio.sleep(0.12)
+        # Tin còn sót (quá cũ/không xóa được) giữ lại, tin xóa được bỏ khỏi lịch
+        if ids[800:]:
+            _sent_msg_ids[chat_id] = ids[800:] + kept
+        else:
+            _sent_msg_ids[chat_id] = kept
+        _save_sent_msg_ids()
+        total = len(ids)
+        resp = await send_telegram_message(
+            session_http, chat_id,
+            f"🧹 Đã xóa {deleted}/{total} tin nhắn cũ."
+            + (f" ({total - deleted} tin cũ quá 48h/đã xóa sẵn không còn xóa được)" if total - deleted else "")
+        )
         if resp and resp.get('ok'):
             conf_mid = resp.get('result', {}).get('message_id')
             if conf_mid:
@@ -4663,6 +4729,7 @@ async def on_startup(app):
     _load_predictions()
     _load_llm_usage()
     _load_chats()
+    _load_sent_msg_ids()
     app['polling_task'] = asyncio.create_task(telegram_polling_loop(app))
     app['daily_task'] = asyncio.create_task(daily_predictions_loop(app))
     app['results_task'] = asyncio.create_task(results_loop(app))

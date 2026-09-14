@@ -1125,6 +1125,42 @@ def _signed_url(path, params, api_secret, base="https://fapi.binance.com", metho
 # tránh việc đè thêm request khi đang bị khóa và không làm mất tin nhắn.
 _telegram_flood_until = 0.0
 _sent_msg_ids: dict[int, list[int]] = {}  # chat_id → [message_id, ...] cho /clear
+SENT_MSG_IDS_FILE = "sent_msg_ids_trading.json"
+
+
+def _load_sent_msg_ids():
+    global _sent_msg_ids
+    try:
+        if os.path.exists(SENT_MSG_IDS_FILE):
+            with open(SENT_MSG_IDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _sent_msg_ids = {int(k): [int(x) for x in v] for k, v in data.items()}
+            total = sum(len(v) for v in _sent_msg_ids.values())
+            logger.info(f"Đã nạp {total} message_id từ {SENT_MSG_IDS_FILE}.")
+    except Exception as e:
+        logger.error(f"Lỗi nạp {SENT_MSG_IDS_FILE}: {e}")
+
+
+def _save_sent_msg_ids():
+    try:
+        data = {str(k): v for k, v in _sent_msg_ids.items()}
+        with open(SENT_MSG_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Lỗi lưu {SENT_MSG_IDS_FILE}: {e}")
+
+
+def _remember_msg_id(chat_id, mid):
+    if not mid:
+        return
+    ids = _sent_msg_ids.setdefault(chat_id, [])
+    if ids and ids[-1] == mid:
+        return
+    ids.append(mid)
+    if len(ids) > 5000:
+        del ids[:-5000]
+    if len(ids) % 25 == 0:
+        _save_sent_msg_ids()
 
 # ─── Lệnh /model: list model + giá MintRouter, bấm chọn → đổi .env + restart ───
 MINT_MODEL_PRICES = {
@@ -1504,9 +1540,7 @@ async def send_telegram_message(session, chat_id, text, is_auto=False, reply_to=
                     data = await resp.json()
                     mid = data.get('result', {}).get('message_id')
                     if mid:
-                        _sent_msg_ids.setdefault(chat_id, []).append(mid)
-                        if len(_sent_msg_ids[chat_id]) > 200:
-                            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
+                        _remember_msg_id(chat_id, mid)
                     return mid
                 # Telegram trả 429 (rate limit): ghi nhớ cửa sổ flood, chờ retry_after rồi thử lại
                 if resp.status == 429 and attempt < max_attempts - 1:
@@ -1551,15 +1585,29 @@ async def delete_telegram_message(session, chat_id, message_id):
         "chat_id": chat_id,
         "message_id": message_id
     }
-    try:
-        async with session.post(url, json=payload) as resp:
-            if resp.status == 200:
-                return True
-            else:
+    for attempt in range(4):
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status == 429:
+                    wait = 3 * (attempt + 1)
+                    try:
+                        body = await resp.json()
+                        retry_after = (body.get('parameters') or {}).get('retry_after', 0)
+                        if retry_after:
+                            wait = int(retry_after) + 1
+                    except Exception:
+                        pass
+                    logger.warning(f"deleteMessage 429 rate-limit: chờ {wait}s rồi thử lại tin {message_id}")
+                    await asyncio.sleep(wait)
+                    continue
                 body = await resp.text()
                 logger.warning(f"Không thể xóa tin nhắn Telegram {message_id}: HTTP {resp.status} - {body}")
-    except Exception as e:
-        logger.error(f"Lỗi khi xóa tin nhắn Telegram: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Lỗi khi xóa tin nhắn Telegram: {e}")
+            await asyncio.sleep(2)
     return False
 
 # Sửa tin nhắn Telegram
@@ -9072,9 +9120,7 @@ async def telegram_webhook_handler(request):
     is_group_chat = chat_type in ('channel', 'group', 'supergroup')
     # Ghi nhận message_id của tin USER để /clear xóa được cả tin user (channel/group cần bot admin)
     if message.get('message_id'):
-        _sent_msg_ids.setdefault(chat_id, []).append(message['message_id'])
-        if len(_sent_msg_ids[chat_id]) > 200:
-            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
+        _remember_msg_id(chat_id, message['message_id'])
     has_new_activity[chat_id] = True
     if chat_id not in active_chats:
         active_chats.add(chat_id)
@@ -9261,15 +9307,30 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
         
     elif command_base == '/clear':
         session = request.app['session']
-        ids = _sent_msg_ids.pop(chat_id, [])
-        for mid in ids:
-            await delete_telegram_message(session, chat_id, mid)
-        resp = await send_telegram_message(session, chat_id, "🧹 Đã xóa tin nhắn cũ.")
-        if resp and resp.get('ok'):
-            conf_mid = resp.get('result', {}).get('message_id')
-            if conf_mid:
-                await asyncio.sleep(0.3)
-                await delete_telegram_message(session, chat_id, conf_mid)
+        ids = list(_sent_msg_ids.get(chat_id, []))
+        deleted = 0
+        kept = []
+        for mid in ids[:800]:
+            ok = await delete_telegram_message(session, chat_id, mid)
+            if ok:
+                deleted += 1
+            else:
+                kept.append(mid)
+            await asyncio.sleep(0.12)
+        if ids[800:]:
+            _sent_msg_ids[chat_id] = ids[800:] + kept
+        else:
+            _sent_msg_ids[chat_id] = kept
+        _save_sent_msg_ids()
+        total = len(ids)
+        resp = await send_telegram_message(
+            session, chat_id,
+            f"🧹 Đã xóa {deleted}/{total} tin nhắn cũ."
+            + (f" ({total - deleted} tin cũ quá 48h/đã xóa sẵn không còn xóa được)" if total - deleted else "")
+        )
+        if resp:
+            await asyncio.sleep(0.3)
+            await delete_telegram_message(session, chat_id, resp)
         
     elif command_base == '/pnl':
         await handle_pnl_command(request.app['session'], chat_id)
@@ -9636,6 +9697,7 @@ async def on_startup(app):
     _load_ai_alert_state()
     _load_auto_managed()
     _load_llm_usage()
+    _load_sent_msg_ids()
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
     app['session'] = aiohttp.ClientSession(connector=connector)
     
