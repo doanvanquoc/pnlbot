@@ -2041,18 +2041,12 @@ def _grade_stats_market(p, fixture, stats):
 
 
 def _pred_line(p, show_ev=True):
-    ev_txt = ""
-    if show_ev and p.get('ev') is not None:
-        ev = p['ev']
-        badge = "💰 VALUE" if ev > 0.05 else ("⚖️ cân bằng" if ev > -0.05 else "⚠️ rủi ro đắt")
-        ev_txt = f" | EV {ev:+.0%} {badge}"
     o_txt = f" @ odds {p['odds']}" if p.get('odds') else ""
     star = "🔥" if (p.get('ev') or -1) > 0.08 else ("⭐" if (p.get('prob') or 0) >= 65 else "•")
 
     lines = [
         f"{star} {p['kickoff_vn']} [{p['league']}] {p['home']} vs {p['away']}",
-        f"   → CHỌN: {p['market']} — {p['selection']} (xác suất {p['prob']:.0f}%){o_txt}{ev_txt}",
-        f"   {p['reasoning'][:220]}"
+        f"   → CHỌN: {p['market']} — {p['selection']} (xác suất {p['prob']:.0f}%){o_txt}"
     ]
 
     all_analyses = p.get('all_analyses')
@@ -2065,13 +2059,11 @@ def _pred_line(p, show_ev=True):
             # skip best pick (đã hiện ở dòng CHỌN) bằng so khớp market_type + selection
             if _p_mt is not None and a.get('market_type') == _p_mt and (a.get('selection') or '').strip() == _p_sel:
                 continue
-            a_ev = a.get('ev')
-            a_ev_txt = f" EV {a_ev:+.0%}" if a_ev is not None else ""
             a_odds = a.get('odds')
             a_odds_txt = ""
             if a_odds:
                 a_odds_txt = f" @{a_odds:g}" + (f" ({a.get('odds_book')})" if a.get('odds_book') else "")
-            lines.append(f"   • {a['market']}: {a['selection']} ({a['prob']:.0f}%){a_odds_txt}{a_ev_txt}")
+            lines.append(f"   • {a['market']}: {a['selection']} ({a['prob']:.0f}%){a_odds_txt}")
 
     return "\n".join(lines)
 
