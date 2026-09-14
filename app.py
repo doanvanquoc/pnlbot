@@ -1533,18 +1533,23 @@ MARKET_DISPLAY_NAME = {
     'cards': 'Thẻ phạt',
 }
 
+# Semaphore giới hạn concurrent AI calls để tránh rate limit 429
+_AI_CONCURRENCY_LIMIT = 2
+_ai_semaphore = asyncio.Semaphore(_AI_CONCURRENCY_LIMIT)
+
 async def _analyze_single_market_task(session, system_prompt, base_prompt, mtype):
-    """Wrapper để chạy 1 market analysis với timeout."""
-    try:
-        pred, err = await asyncio.wait_for(
-            _ai_analyze_single_market(session, system_prompt, base_prompt),
-            timeout=90
-        )
-        return mtype, pred, err
-    except asyncio.TimeoutError:
-        return mtype, None, "Timeout 90s"
-    except Exception as e:
-        return mtype, None, str(e)
+    """Wrapper để chạy 1 market analysis với timeout và semaphore."""
+    async with _ai_semaphore:
+        try:
+            pred, err = await asyncio.wait_for(
+                _ai_analyze_single_market(session, system_prompt, base_prompt),
+                timeout=180
+            )
+            return mtype, pred, err
+        except asyncio.TimeoutError:
+            return mtype, None, "Timeout 180s"
+        except Exception as e:
+            return mtype, None, str(e)
 
 async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", oddsapi_ev=None, single_market=None):
     """
@@ -1630,11 +1635,16 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
     # nhưng chỉ return kèo đó
     target_types = [single_market] if single_market else market_types
     
-    # 6. Phân tích song song tất cả market (parallel để nhanh)
-    tasks = []
-    for mtype in market_types:
+    # 6. Phân tích song song với semaphore + stagger nhỏ để tránh rate limit 429
+    async def _create_task(mtype):
         system_prompt = UNIFIED_MARKET_PROMPTS.get(mtype, UNIFIED_MARKET_PROMPTS['match_result'])
-        tasks.append(_analyze_single_market_task(session, system_prompt, base_prompt, mtype))
+        return _analyze_single_market_task(session, system_prompt, base_prompt, mtype)
+    
+    tasks = []
+    for i, mtype in enumerate(market_types):
+        if i > 0:
+            await asyncio.sleep(1.5)  # stagger 1.5s giữa các request
+        tasks.append(_create_task(mtype))
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
