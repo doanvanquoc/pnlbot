@@ -1003,17 +1003,20 @@ def _odds_price_book(market_key, pick, ev):
             return None, None
         bk = b.get('key')
         sel = (pick or '').lower()
+        # AI hay trả selection kèm '(Home)'/'(Away)'/kết quả ('thắng','win') — lọc ra cho khớp odds
+        sel_p = re.sub(r'\(\s*(home|away|h|a)\s*\)|thắng|thua|win|wins|won|victory', '', sel)
+        sel_p = re.sub(r'\s+', ' ', sel_p).strip()
         if market_key == '1x2':
             for m in b.get('markets', []) or []:
                 if m.get('key') != 'h2h':
                     continue
                 for x in m.get('outcomes', []) or []:
                     nm = (x.get('name') or '')
-                    if nm.lower() == 'draw' and re.search(r'hòa|draw|x2\s*$|^\s*x\b|1x', sel):
+                    if nm.lower() == 'draw' and re.search(r'hòa|draw|x2\s*$|^\s*x\b|1x', sel_p):
                         return float(x.get('price')), bk
-                    if nm == ev.get('home_team') and _side_eq(sel, nm):
+                    if nm == ev.get('home_team') and _side_eq(sel_p, nm):
                         return float(x.get('price')), bk
-                    if nm == ev.get('away_team') and _side_eq(sel, nm):
+                    if nm == ev.get('away_team') and _side_eq(sel_p, nm):
                         return float(x.get('price')), bk
         elif market_key == 'tai_xiu':
             mline = re.search(r'(\d+(?:[.,]\d+)?)', sel)
@@ -2391,6 +2394,8 @@ def _side_eq(stored, lineside):
     if cs and cl:
         return cs == cl
     fs, fl = _fold(stored), _fold(lineside)
+    # AI đôi khi trả kèm '(Home)'/' (h)' — lọc ra để khớp tên chuẩn
+    fs = re.sub(r'\(\s*(home|away|h|a)\s*\)', '', fs).strip()
     ns = re.sub(r'[^a-z0-9]', '', fs)
     nl = re.sub(r'[^a-z0-9]', '', fl)
     if cs and not cl:
