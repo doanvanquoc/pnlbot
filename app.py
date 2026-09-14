@@ -98,8 +98,19 @@ def _load_predictions():
 
 def _save_predictions():
     try:
+        # Làm sạch trước khi lưu: bỏ các key phức tạp gây circular/không serialize được
+        clean = {}
+        for _k, _v in predictions.items():
+            if not isinstance(_k, str):
+                continue
+            if not isinstance(_v, dict):
+                clean[_k] = _v
+                continue
+            _c = {k2: v2 for k2, v2 in _v.items()
+                  if k2 not in ('all_analyses', 'predictions', 'reasoning_full')}
+            clean[_k] = _c
         with open(PREDICTIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(predictions, f, ensure_ascii=False)
+            json.dump(clean, f, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Lỗi lưu predictions: {e}")
 
@@ -1666,18 +1677,37 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         # Calibrate probability
         prob = calibrate_probability(raw_prob, league, home, away, mtype)
         
-        # Tìm odds
+        # Tìm odds: ưu tiên The Odds API (1xBet/Pinnacle thật) rồi fallback API-Football
         odds_val = None
+        _odds_book_label = None
         if market and selection:
-            vals = odds['markets'].get(market) or next(
-                (v for k, v in odds['markets'].items() if _normalize_team(k) == _normalize_team(market)), None)
-            if vals:
-                odds_val = vals.get(selection)
-                if odds_val is None:
-                    for k, v in vals.items():
-                        if _normalize_team(k) == _normalize_team(selection) or _normalize_team(k) in _normalize_team(selection) or _normalize_team(selection) in _normalize_team(k):
-                            odds_val = v
-                            break
+            # 1) The Odds API event (oddsapi_ev) — có h2h/totals thật
+            if oddsapi_ev:
+                _mk = None
+                if mtype == 'match_result':
+                    _mk = '1x2'
+                elif mtype == 'total_goals':
+                    _mk = 'tai_xiu'
+                if _mk:
+                    try:
+                        _pr, _bk = _odds_price_book(_mk, selection, oddsapi_ev)
+                        if _pr:
+                            odds_val = _pr
+                            _odds_book_label = '1xBet' if _bk == 'onexbet' else 'Pinnacle'
+                    except Exception:
+                        pass
+            # 2) Fallback API-Football odds — match lỏng theo tên market/selection
+            if not odds_val:
+                vals = odds['markets'].get(market) or next(
+                    (v for k, v in odds['markets'].items() if _normalize_team(k) == _normalize_team(market)), None)
+                if vals:
+                    odds_val = vals.get(selection)
+                    if odds_val is None:
+                        for k, v in vals.items():
+                            if _normalize_team(k) == _normalize_team(selection) or _normalize_team(k) in _normalize_team(selection) or _normalize_team(selection) in _normalize_team(k):
+                                odds_val = v
+                                _odds_book_label = str(odds.get('bookmaker') or '')[:10]
+                                break
         
         ev = (prob / 100 * odds_val - 1) if odds_val else None
         
@@ -1692,6 +1722,7 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
             'market': display_market, 'selection': selection, 'prob': prob, 'raw_prob': raw_prob,
             'score': score, 'odds': odds_val, 'ev': round(ev, 3) if ev is not None else None,
             'reasoning': reasoning, 'why': why, 'market_type': mtype,
+            'odds_book': _odds_book_label,
             'estimated_total_goals': float(est_total) if est_total else None
         }
         all_analyses.append(analysis)
@@ -1772,8 +1803,8 @@ async def analyze_match(session, fixture):
     result, err = await analyze_match_unified(session, fixture)
     if err or not result:
         return None, err
-    # Flatten best_pick để backward compatible với code hiện tại
-    best = result['best_pick']
+    # Copy best_pick (best là 1 phần tử trong all_analyses → copy để tránh circular ref)
+    best = {k: v for k, v in result['best_pick'].items()}
     best['all_analyses'] = result['all_analyses']
     best['fixture_id'] = result['fixture_id']
     best['date'] = result['date']
@@ -1950,26 +1981,31 @@ def _pred_line(p, show_ev=True):
         ev_txt = f" | EV {ev:+.0%} {badge}"
     o_txt = f" @ odds {p['odds']}" if p.get('odds') else ""
     star = "🔥" if (p.get('ev') or -1) > 0.08 else ("⭐" if (p.get('prob') or 0) >= 65 else "•")
-    
+
     lines = [
         f"{star} {p['kickoff_vn']} [{p['league']}] {p['home']} vs {p['away']}",
         f"   → CHỌN: {p['market']} — {p['selection']} (xác suất {p['prob']:.0f}%){o_txt}{ev_txt}",
         f"   {p['reasoning'][:220]}"
     ]
-    
+
     all_analyses = p.get('all_analyses')
     if all_analyses:
+        _p_mt = p.get('market_type')
+        _p_sel = (p.get('selection') or '').strip()
         lines.append("")
         lines.append("   📊 *Phân tích các market:*")
         for a in all_analyses:
-            if a is p:
+            # skip best pick (đã hiện ở dòng CHỌN) bằng so khớp market_type + selection
+            if _p_mt is not None and a.get('market_type') == _p_mt and (a.get('selection') or '').strip() == _p_sel:
                 continue
             a_ev = a.get('ev')
             a_ev_txt = f" EV {a_ev:+.0%}" if a_ev is not None else ""
             a_odds = a.get('odds')
-            a_odds_txt = f" @{a_odds}" if a_odds else ""
+            a_odds_txt = ""
+            if a_odds:
+                a_odds_txt = f" @{a_odds:g}" + (f" ({a.get('odds_book')})" if a.get('odds_book') else "")
             lines.append(f"   • {a['market']}: {a['selection']} ({a['prob']:.0f}%){a_odds_txt}{a_ev_txt}")
-    
+
     return "\n".join(lines)
 
 
