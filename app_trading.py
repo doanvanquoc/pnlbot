@@ -9063,7 +9063,7 @@ async def telegram_webhook_handler(request):
         
     chat_id = chat.get('id')
     chat_type = chat.get('type', 'private')
-    is_channel = chat_type == 'channel'
+    is_group_chat = chat_type in ('channel', 'group', 'supergroup')
     # Ghi nhận message_id của tin USER để /clear xóa được cả tin user (channel/group cần bot admin)
     if message.get('message_id'):
         _sent_msg_ids.setdefault(chat_id, []).append(message['message_id'])
@@ -9078,7 +9078,7 @@ async def telegram_webhook_handler(request):
 
     # Trong CHANNEL: bot trading CHỈ xử lý lệnh trading hoặc khi được @mention @soikeotrading_bot.
     # Lệnh bóng đá /ngôn ngữ tự nhiên không mention → bỏ qua (bot bóng đá lo) → không trả lời chồng nhau.
-    if is_channel and text:
+    if is_group_chat and text:
         if text.startswith('/'):
             cand = text.split()[0].lower().split('@')[0]
             _trading_only = {

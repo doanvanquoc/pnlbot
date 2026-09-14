@@ -212,6 +212,9 @@ async def delete_telegram_message(session, chat_id, message_id):
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status == 200:
                 return True
+            else:
+                body = await resp.text()
+                logger.warning(f"Không thể xóa tin Telegram {message_id}: HTTP {resp.status} - {body}")
     except Exception as e:
         logger.warning(f"Lỗi xóa tin Telegram {message_id}: {e}")
     return False
