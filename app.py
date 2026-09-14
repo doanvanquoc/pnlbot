@@ -1034,10 +1034,22 @@ def odds_price_for(market_key, pick, ev):
 _ODDS_BY_MATCH = {}
 
 
+_STRIP_SUFFIX = ('fc', 'sc', 'cf', 'ac', 'as')
+
+
+def _norm_team_key(name):
+    """Chuẩn hóa tên đội để làm key tra odds: slug nếu có, иначе bỏ hậu tố FC/SC... ('San Diego FC' == 'San Diego')."""
+    cs = _canon_team_slug(name or '')
+    if cs:
+        return cs
+    toks = re.sub(r'[^a-z0-9]', ' ', _fold(name or '')).split()
+    while toks and toks[-1] in _STRIP_SUFFIX and len(toks) > 1:
+        toks.pop()
+    return ''.join(toks) or (name or '').lower().strip()
+
+
 def _odds_match_key(home, away):
-    ha = _canon_team_slug(home or '') or (home or '').lower().strip()
-    ab = _canon_team_slug(away or '') or (away or '').lower().strip()
-    return f"{ha}|{ab}"
+    return f"{_norm_team_key(home)}|{_norm_team_key(away)}"
 
 
 def _make_match_key(home, away, kickoff):
