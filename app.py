@@ -1420,7 +1420,7 @@ async def _ai_analyze_single_market(session, system_prompt, user_prompt, max_tok
         {"role": "system", "content": system_prompt + "\nQUAN TRỌNG: trả về DUY NHẤT một khối JSON hợp lệ, không giải thích, không markdown code fence."},
         {"role": "user", "content": user_prompt},
     ]
-    text, err = await get_ai_response(session, base_messages, max_tokens=max_tokens, timeout_s=120)
+    text, err = await get_ai_response(session, base_messages, max_tokens=max_tokens, timeout_s=200)
     if not err and text:
         m = re.search(r'\{.*\}', text, re.S)
         if m:
@@ -1432,7 +1432,7 @@ async def _ai_analyze_single_market(session, system_prompt, user_prompt, max_tok
             {"role": "assistant", "content": (text or '')[:500]},
             {"role": "user", "content": "Trả về DUY NHẤT JSON đúng schema. Không thêm văn xuôi."},
         ]
-        text, err = await get_ai_response(session, retry_messages, max_tokens=800, timeout_s=60)
+        text, err = await get_ai_response(session, retry_messages, max_tokens=800, timeout_s=120)
         if err:
             return None, err
         m = re.search(r'\{.*\}', text, re.S)
@@ -1543,11 +1543,11 @@ async def _analyze_single_market_task(session, system_prompt, base_prompt, mtype
         try:
             pred, err = await asyncio.wait_for(
                 _ai_analyze_single_market(session, system_prompt, base_prompt),
-                timeout=180
+                timeout=260
             )
             return mtype, pred, err
         except asyncio.TimeoutError:
-            return mtype, None, "Timeout 180s"
+            return mtype, None, "Timeout 260s"
         except Exception as e:
             return mtype, None, str(e)
 
