@@ -3802,6 +3802,7 @@ async def _agent_execute(session, chat_id, name, args):
         opponent_slug = None
         q_slugs = _parse_query_teams(q)
         slug_a = q_slugs[0] if q_slugs else None
+        not_found_note = None
         if not slug_a:
             slug_a = _sky_slug_for(q)[0]
         # tên đội mơ hồ (vd 'stade' = Reims/Rennais/Brestois?) → hỏi lại ngay, không search mò
@@ -3890,22 +3891,13 @@ async def _agent_execute(session, chat_id, name, args):
                         break
                     if target_ln:
                         break
-        # query 2 đội mà không thấy trận → web search tên đầy đủ (+football+giải để khỏi trôi sang du lịch)
+        # query 2 đội mà không thấy trận → ghi note nhưng KHÔNG return:
+        # tiếp tục chạy xuống fallback API-Football (có cả J3 League mà Sky không có)
+        not_found_note = None
         if not target_ln and len(q_slugs) >= 2:
-            fulls = [s.replace('-', ' ') for s in q_slugs[:2]]
-            _lg = ''
-            try:
-                _lg = league_hint or ''
-            except Exception:
-                _lg = ''
-            web_result = await tool_web_search(session, f"{' vs '.join(fulls)} football {_lg} score result".strip(), 5)
-            if web_result and not web_result.startswith("Không"):
-                _low = web_result.lower()
-                # rác (vd trang du lịch Paris) → giấu, chỉ báo không tìm thấy
-                if any(f in _low for f in fulls):
-                    return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports (có thể đã đá hoặc chưa có lịch).\n\n"
-                            f"Kết quả tìm kiếm:\n{web_result[:1500]}")
-            return (f"Không tìm thấy trận '{' vs '.join(fulls)}' trong lịch Sky Sports — thử lại sau hoặc hỏi đội khác.")
+            _fulls = [s.replace('-', ' ') for s in q_slugs[:2]]
+            not_found_note = (f"Không tìm thấy trận '{' vs '.join(_fulls)}' trong lịch Sky Sports "
+                              f"(có thể đã đá hoặc chưa có lịch).")
         if target_ln:
             # Nếu trận đã đá → trả kết quả luôn, không phân tích
             if 'ĐÃ ĐÁ' in target_ln:
@@ -4002,9 +3994,22 @@ async def _agent_execute(session, chat_id, name, args):
                     matched_fx = fx
                     break
             if not matched_fx:
+                # match 2 bên chuẩn bằng token thô (đội không có trong map canon — vd J3 League)
+                tok_a = re.split(r'[^a-z0-9]+', q_slugs[0])[0] if q_slugs and q_slugs[0] else None
+                tok_b = re.split(r'[^a-z0-9]+', q_slugs[1])[0] if len(q_slugs) >= 2 and q_slugs[1] else None
+                if tok_a and tok_b and len(tok_a) >= 3 and len(tok_b) >= 3:
+                    for fx in all_fixtures:
+                        h = (fx.get('teams', {}).get('home', {}).get('name') or '').lower()
+                        a = (fx.get('teams', {}).get('away', {}).get('name') or '').lower()
+                        if (tok_a in h and tok_b in a) or (tok_a in a and tok_b in h):
+                            matched_fx = fx
+                            break
+            if not matched_fx:
                 # fallback token cũ cho đội không có trong alias map
                 q_tok = re.split(r'[^a-z0-9]+', q.lower())[0] if q else ''
                 opp_tok = re.split(r'[^a-z0-9]+', opponent.lower())[0] if opponent else ''
+                if not opp_tok and len(q_slugs) >= 2 and q_slugs[0] and q_slugs[1]:
+                    opp_tok = re.split(r'[^a-z0-9]+', q_slugs[1])[0]
                 for fx in all_fixtures:
                     h = (fx.get('teams', {}).get('home', {}).get('name') or '').lower()
                     a = (fx.get('teams', {}).get('away', {}).get('name') or '').lower()
@@ -4148,6 +4153,8 @@ async def _agent_execute(session, chat_id, name, args):
                     return rendered
         
         # Fallback: trả data block để AI tự format (trường hợp không tìm thấy fixture)
+        if not matched_fx and not_found_note:
+            return not_found_note + " Không có trận trong dữ liệu API-Football hôm nay."
         data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
                       + "\n\n".join(data_parts) + api_block + hist_block) if data_parts else (
                       f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(
