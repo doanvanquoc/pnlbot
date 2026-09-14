@@ -1636,15 +1636,12 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
     target_types = [single_market] if single_market else market_types
     
     # 6. Phân tích song song với semaphore + stagger nhỏ để tránh rate limit 429
-    async def _create_task(mtype):
-        system_prompt = UNIFIED_MARKET_PROMPTS.get(mtype, UNIFIED_MARKET_PROMPTS['match_result'])
-        return _analyze_single_market_task(session, system_prompt, base_prompt, mtype)
-    
     tasks = []
     for i, mtype in enumerate(market_types):
         if i > 0:
             await asyncio.sleep(1.5)  # stagger 1.5s giữa các request
-        tasks.append(_create_task(mtype))
+        system_prompt = UNIFIED_MARKET_PROMPTS.get(mtype, UNIFIED_MARKET_PROMPTS['match_result'])
+        tasks.append(_analyze_single_market_task(session, system_prompt, base_prompt, mtype))
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
