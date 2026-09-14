@@ -1524,6 +1524,28 @@ UNIFIED_SCHEMA = (
     '"estimated_total_goals": 2.5}'
 )
 
+MARKET_DISPLAY_NAME = {
+    'match_result': '1X2',
+    'total_goals': 'Tài xỉu',
+    'btts': 'BTTS',
+    'asian_handicap': 'Châu Á',
+    'corners': 'Phạt góc',
+    'cards': 'Thẻ phạt',
+}
+
+async def _analyze_single_market_task(session, system_prompt, base_prompt, mtype):
+    """Wrapper để chạy 1 market analysis với timeout."""
+    try:
+        pred, err = await asyncio.wait_for(
+            _ai_analyze_single_market(session, system_prompt, base_prompt),
+            timeout=90
+        )
+        return mtype, pred, err
+    except asyncio.TimeoutError:
+        return mtype, None, "Timeout 90s"
+    except Exception as e:
+        return mtype, None, str(e)
+
 async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", oddsapi_ev=None, single_market=None):
     """
     Engine phân tích thống nhất cho cả /kèo và ai_agent_loop.
@@ -1608,12 +1630,22 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
     # nhưng chỉ return kèo đó
     target_types = [single_market] if single_market else market_types
     
-    # 6. Phân tích từng market (sequential để AI nhớ context)
-    all_analyses = []
+    # 6. Phân tích song song tất cả market (parallel để nhanh)
+    tasks = []
     for mtype in market_types:
         system_prompt = UNIFIED_MARKET_PROMPTS.get(mtype, UNIFIED_MARKET_PROMPTS['match_result'])
-        pred, err = await _ai_analyze_single_market(session, system_prompt, base_prompt)
+        tasks.append(_analyze_single_market_task(session, system_prompt, base_prompt, mtype))
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    all_analyses = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning(f"[unified] Market task exception: {result}")
+            continue
+        mtype, pred, err = result
         if err or not pred:
+            logger.warning(f"[unified] {mtype}: {err or 'no pred'}")
             continue
         
         market = str(pred.get('market', '')).strip()
@@ -1642,8 +1674,15 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         
         ev = (prob / 100 * odds_val - 1) if odds_val else None
         
+        # Ensure "why" field always has content for logic validation
+        if not why or len(why.strip()) < 10:
+            why = f"Căn cứ {mtype}: {reasoning[:150]}"
+        
+        # Standardize market display name
+        display_market = MARKET_DISPLAY_NAME.get(mtype, market)
+        
         analysis = {
-            'market': market, 'selection': selection, 'prob': prob, 'raw_prob': raw_prob,
+            'market': display_market, 'selection': selection, 'prob': prob, 'raw_prob': raw_prob,
             'score': score, 'odds': odds_val, 'ev': round(ev, 3) if ev is not None else None,
             'reasoning': reasoning, 'why': why, 'market_type': mtype,
             'estimated_total_goals': float(est_total) if est_total else None
