@@ -1633,6 +1633,11 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
     
     if not oddsapi_text:
         oddsapi_text, oddsapi_ev = await get_oddsapi_odds(session, fixture)
+        if oddsapi_ev:
+            try:
+                _ODDS_BY_MATCH[_odds_match_key(home, away)] = oddsapi_ev
+            except Exception:
+                pass
     
     h2h = await get_h2h_summary(session, fixture['teams']['home']['id'], fixture['teams']['away']['id'])
     api_pred = await get_api_prediction(session, fx_id)
