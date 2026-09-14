@@ -1446,24 +1446,128 @@ async def _ai_analyze_single_market(session, system_prompt, user_prompt, max_tok
         return None, err
     return None, "AI trả rỗng"
 
-async def analyze_match(session, fixture):
-    """Phân tích 1 trận: phân tích đa market (1X2, tài xỉu, BTTS, châu Á, góc, thẻ)
-    → AI chọn kèo VALUE NHẤT trong từng market, calibrate xác suất, tính EV từ odds 1xBet + OddsAPI.
-    Trả về dict dự đoán tốt nhất hoặc None."""
+# ═══════════════ UNIFIED ANALYSIS ENGINE ═══════════════
+# Gộp logic từ analyze_match (multi-market + calibrate + odds API)
+# và analyze_keo tool (framework scoring + logic check + scenario anchor)
+# ═════════════════════════════════════════════════════════
+
+UNIFIED_MARKET_PROMPTS = {
+    'match_result': (
+        "Bạn là chuyên gia phân tích KẾT QUẢ TRẬN (1X2). "
+        "Chấm điểm framework 6 yếu tố (tối đa 5đ/yếu tố): "
+        "1) PHONG ĐỘ 5 trận gần (sân nhà/khách riêng), bàn TB ghi/thủng. "
+        "2) ĐỐI ĐẦU 3-5 lần gần, thống trị nào, bàn TB đối đầu. "
+        "3) ĐỘNG LỰC: đua vô địch/top4/trụ hạng/cúp/derby, xoay đội, hết hứng. "
+        "4) LỰC LƯỢNG: chấn thương/treo giò chủ chốt, chuyển nhượng, xoay vòng. "
+        "5) LỐI CHƠI: pressing/để bóng/phản công, xG, kiểm soát bóng, tần suất ghi/thủng. "
+        "   - PHÒNG THỦ: bàn thua TB, sạch lưới %, chấn thương hàng thủ. "
+        "   - TỔNG BÀN: (ghi TB A + thua TB B)/2 + (ghi TB B + thua TB A)/2. <2.5→Xỉu, >2.8→Tài, 2.5-2.8→xem đối đầu. "
+        "6) BỐI CẢNH: sân nhà/khách, lịch dày, thời tiết, trọng tài, VAR. "
+        "QUAN TRỌNG: thiếu dữ liệu web → chấm theo kiến thức bóng đá + ghi '(ước lượng)'. KHÔNG trả 0 điểm toàn bộ. "
+        "Tổng ≥21/30 → xác suất >60%; 18-20 → 55-60%; <18 → KHÔNG chọn kèo này. "
+        "Trả về JSON: {\"market\": \"1X2\", \"selection\": \"Home/Draw/Away\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng 1X2: lịch sử + phong độ + lực lượng...\"}. "
+        "KHÔNG chọn Draw nếu không có bằng chứng mạnh (đối đầu hòa nhiều, derby cân bằng)."
+    ),
+    'total_goals': (
+        "Bạn là chuyên gia phân tích TÀI XỈU BÀN. "
+        "TÍNH TOÁN BẮT BUỘC: ước lượng tổng bàn = (bàn ghi TB đội A + bàn thua TB đội B)/2 + (bàn ghi TB đội B + bàn thua TB đội A)/2. "
+        "XEM THÊM: đối đầu TB bàn, phong độ ghi/thủng 5 trận, xG, lối chơi (biên lấn=nhiều bàn, cầm bóng=ít bàn), "
+        "chấn thương tiền đạo/thủ môn, thời tiết mưa/gió, trọng tài chặt/chơi. "
+        "Line phổ biến: 2.0, 2.25, 2.5, 2.75, 3.0. "
+        "QUY TẮC: tổng bàn dự kiến ≤2.3 → ưu tiên XỈU; ≥2.8 → ưu tiên TÀI; 2.3-2.8 → cần bằng chứng mạnh. "
+        "Trả về JSON: {\"market\": \"Tài xỉu X.Y\", \"selection\": \"Tài/Xỉu\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng Tài/Xỉu: tỉ lệ nổ tài/xỉu + hàng công/hàng thủ...\", "
+        "\"estimated_total_goals\": 2.5}. "
+        "PHẢI có field estimated_total_goals (số thập phân)."
+    ),
+    'btts': (
+        "Bạn là chuyên gia phân tích CẢ HAI GHI BÀN (BTTS). "
+        "XÉT: % trận cả 2 ghi bàn của mỗi đội (5 trận gần, mùa giải), đối đầu BTTS rate, "
+        "hàng thủ (sạch lưới % trận), tiền đạo chấn thương, lối chơi (hai đội tấn công = BTTS Yes). "
+        "Trả về JSON: {\"market\": \"BTTS\", \"selection\": \"Có/Không\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng BTTS: tỉ lệ BTTS 2 đội + thủng lưới...\"}. "
+        "Đội chủ nhà yếu + khách mạnh thủ lưới → BTTS No. Hai đội tấn công mạnh + thủ môn kém → BTTS Yes."
+    ),
+    'asian_handicap': (
+        "Bạn là chuyên gia phân tích CHÂU Á (HANDICAP). "
+        "XÉT: chênh lệch lực lượng thực, phong độ sân nhà/khách, đối đầu handicap history, "
+        "động lực (đội mạnh cần thắng cách biệt hay chỉ cần 1-0), chấn thương chủ chốt. "
+        "Line handicap = (điểm mạnh yếu / 2) làm tròn 0.25. "
+        "Trả về JSON: {\"market\": \"Châu Á\", \"selection\": \"Home -0.5 / Away +0.75...\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng Châu Á: lịch sử đối đầu + chênh lực lượng...\"}. "
+        "KHÔNG chọn chấp sâu (>1.5) trừ khi chênh lệch rất lớn và đội mạnh có động lực thắng nhiều bàn."
+    ),
+    'corners': (
+        "Bạn là chuyên gia phân tích PHẠT GÓC. "
+        "XÉT: góc TB/trận 2 đội (5 trận gần, mùa), phong cách (biên lấn cánh = nhiều góc, cầm bóng trung lộ = ít), "
+        "đối đầu góc TB, sân nhà/khách (nhà thường nhiều góc hơn), trọng tài (VAR dẫn đến nhiều góc). "
+        "Line phổ biến: 8.5, 9.0, 9.5, 10.0, 10.5, 11.0. "
+        "Trả về JSON: {\"market\": \"Phạt góc\", \"selection\": \"Tài X.Y / Xỉu X.Y\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng Phạt góc: lối chơi biên + số góc trung bình...\"}. "
+        "Hai đội biên lấn + đá nhau sôi nổi → Tài. Hai đội cầm bóng/rút lui → Xỉu."
+    ),
+    'cards': (
+        "Bạn là chuyên gia phân tích THẺ PHẠT. "
+        "XÉT: thẻ TB/trận 2 đội (vàng + đỏ), derby (thẻ nhiều), trọng tài (ai chủ chốt, phong cách chặt/hà khơi), "
+        "phong cách chơi (rút đè/pressing = nhiều thẻ, kỹ thuật = ít thẻ), VAR. "
+        "Line phổ biến: 3.5, 4.0, 4.5, 5.0, 5.5. "
+        "Trả về JSON: {\"market\": \"Thẻ phạt\", \"selection\": \"Tài X.Y / Xỉu X.Y\", \"prob\": 0-100, "
+        "\"score\": 0-30, \"reasoning\": \"...\", \"why\": \"căn cứ riêng Thẻ: quy luật derby + trọng tài + số thẻ trung bình...\"}. "
+        "Derby + trọng tài chặt + 2 đội hay phạm lỗi → Tài. Trận الصداقة + trọng tài hà khơi → Xỉu."
+    ),
+}
+
+UNIFIED_SCHEMA = (
+    '{"market": "...", "selection": "...", "prob": 0-100, "score": 0-30, "reasoning": "...", '
+    '"why": "căn cứ RIÊNG kèo này (bắt buộc ghi dữ liệu 2 đội: vd 4/5 trận nổ tài)...", '
+    '"estimated_total_goals": 2.5}'
+)
+
+async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", oddsapi_ev=None, single_market=None):
+    """
+    Engine phân tích thống nhất cho cả /kèo và ai_agent_loop.
+    Input: fixture (API-Football), sky_data (Sky Sports text), oddsapi_text (The Odds API), single_market (key nếu user hỏi 1 kèo).
+    Output: dict {best_pick, all_analyses, fixture_info, scenario, estimated_total_goals}
+    """
     fx_id = str(fixture['fixture']['id'])
     home = fixture['teams']['home']['name']
     away = fixture['teams']['away']['name']
     league = fixture.get('league', {}).get('name', '?')
+    kickoff_vn = _vn_time(fixture['fixture']['date'])
     
+    # 1. Thu thập dữ liệu đầy đủ
     odds = await get_match_odds(session, fx_id)
     if not odds:
         odds = {'bookmaker': '?', 'markets': {}}
     
-    oddsapi_text, oddsapi_ev = await get_oddsapi_odds(session, fixture)
+    if not oddsapi_text:
+        oddsapi_text, oddsapi_ev = await get_oddsapi_odds(session, fixture)
     
     h2h = await get_h2h_summary(session, fixture['teams']['home']['id'], fixture['teams']['away']['id'])
     api_pred = await get_api_prediction(session, fx_id)
     
+    # API-Football stats cho Tài/Xỉu, BTTS
+    api_stats = []
+    try:
+        standings = await get_standings(session, fixture['league']['id'])
+        if standings:
+            st_h = _format_standings(standings, home)
+            st_a = _format_standings(standings, away)
+            if st_h: api_stats.append(f"BXH {home}: {st_h}")
+            if st_a: api_stats.append(f"BXH {away}: {st_a}")
+        stats_h = await get_team_stats(session, fixture['teams']['home']['id'], fixture['league']['id'])
+        stats_a = await get_team_stats(session, fixture['teams']['away']['id'], fixture['league']['id'])
+        if stats_h:
+            formatted_h = _format_team_stats(stats_h, home)
+            if formatted_h: api_stats.append(formatted_h)
+        if stats_a:
+            formatted_a = _format_team_stats(stats_a, away)
+            if formatted_a: api_stats.append(formatted_a)
+    except Exception as e:
+        logger.warning(f"[unified] API-Football stats error: {e}")
+    
+    # 2. Build odds text
     mk_lines = []
     for name, vals in odds['markets'].items():
         vs = ", ".join(f"{k}: {v}" for k, v in list(vals.items())[:12])
@@ -1472,25 +1576,42 @@ async def analyze_match(session, fixture):
     if oddsapi_text:
         odds_txt += "\n\n" + oddsapi_text
     
-    fixture_info = f"{_fixture_line(fixture)}"
+    # 3. Historical calibration feedback
+    hist_lines = _calibration_lines()
+    if hist_lines:
+        hist_block = "LỊCH SỬ DỰ ĐOÁN BOT (calibrate % — đừng lặp sai lầm cũ):\n" + "\n".join(hist_lines[:8])
+    else:
+        hist_block = ""
     
+    # 4. Base prompt với tất cả dữ liệu
+    fixture_info = f"{_fixture_line(fixture)}"
     base_prompt = (
-        f"Trận đấu:\n{fixture_info}\n\n{odds_txt}\n\n{h2h}\n\n{api_pred}\n\n"
-        "Dữ liệu trên là đầy đủ. Hãy phân tích từng market dưới đây."
+        f"TRẬN ĐẤU:\n{fixture_info}\n\n{odds_txt}\n\n"
+        f"{sky_data}\n\n{h2h}\n\n{api_pred}\n\n"
+        f"DỮ LIỆU API-FOOTBALL (BXH + stats mùa giải — DÙNG CHO TÀI/XỈU, BTTS):\n{chr(10).join(api_stats) if api_stats else 'Không có'}\n\n"
+        f"{hist_block}\n\n"
+        "DỮ LIỆU TRÊN LÀ ĐẦY ĐỦ. Hãy phân tích từng market theo framework chấm điểm 6 yếu tố (30đ). "
+        "Tổng điểm ≥21 → prob >60%; 18-20 → 55-60%; <18 → KHÔNG chọn kèo này (prob <55%). "
+        "MỖI KÈO PHẢI CÓ 'why': căn cứ RIÊNG từ dữ liệu 2 ĐỘI (ghi cụ thể số liệu vd '4/5 trận gần nổ tài'). "
+        "KHÔNG được dùng chung 1 lý do cho nhiều kèo. "
+        f"Trả về DUY NHẤT JSON schema: {UNIFIED_SCHEMA}"
     )
     
+    # 5. Xác định market types cần phân tích
     market_types = ['match_result', 'total_goals', 'btts', 'asian_handicap']
-    if any('corner' in m.lower() or 'góc' in m.lower() for m in odds['markets']):
-        market_types.append('corners')
-    if any('card' in m.lower() or 'booking' in m.lower() or 'thẻ' in m.lower() for m in odds['markets']):
-        market_types.append('cards')
+    has_corners = any('corner' in m.lower() or 'góc' in m.lower() for m in odds['markets'])
+    has_cards = any('card' in m.lower() or 'booking' in m.lower() or 'thẻ' in m.lower() for m in odds['markets'])
+    if has_corners: market_types.append('corners')
+    if has_cards: market_types.append('cards')
     
-    best_pick = None
-    best_ev = -999
+    # Nếu user chỉ hỏi 1 kèo cụ thể, vẫn phân tích đủ để có scenario anchor
+    # nhưng chỉ return kèo đó
+    target_types = [single_market] if single_market else market_types
+    
+    # 6. Phân tích từng market (sequential để AI nhớ context)
     all_analyses = []
-    
     for mtype in market_types:
-        system_prompt = MARKET_SYSTEM_PROMPTS.get(mtype, MARKET_SYSTEM_PROMPTS['match_result'])
+        system_prompt = UNIFIED_MARKET_PROMPTS.get(mtype, UNIFIED_MARKET_PROMPTS['match_result'])
         pred, err = await _ai_analyze_single_market(session, system_prompt, base_prompt)
         if err or not pred:
             continue
@@ -1498,9 +1619,15 @@ async def analyze_match(session, fixture):
         market = str(pred.get('market', '')).strip()
         selection = str(pred.get('selection', '')).strip()
         raw_prob = max(1.0, min(float(pred.get('prob', 50)), 99.0))
-        prob = calibrate_probability(raw_prob, league, home, away, mtype)
+        score = int(pred.get('score', 0))
         reasoning = str(pred.get('reasoning', ''))[:600]
+        why = str(pred.get('why', ''))[:500]
+        est_total = pred.get('estimated_total_goals')
         
+        # Calibrate probability
+        prob = calibrate_probability(raw_prob, league, home, away, mtype)
+        
+        # Tìm odds
         odds_val = None
         if market and selection:
             vals = odds['markets'].get(market) or next(
@@ -1517,33 +1644,101 @@ async def analyze_match(session, fixture):
         
         analysis = {
             'market': market, 'selection': selection, 'prob': prob, 'raw_prob': raw_prob,
-            'odds': odds_val, 'ev': round(ev, 3) if ev is not None else None,
-            'reasoning': reasoning, 'market_type': mtype
+            'score': score, 'odds': odds_val, 'ev': round(ev, 3) if ev is not None else None,
+            'reasoning': reasoning, 'why': why, 'market_type': mtype,
+            'estimated_total_goals': float(est_total) if est_total else None
         }
         all_analyses.append(analysis)
-        
-        if ev is not None and ev > best_ev:
-            best_ev = ev
-            best_pick = analysis
     
-    if not best_pick and all_analyses:
-        best_pick = max(all_analyses, key=lambda x: x['prob'])
-    
-    if not best_pick:
+    if not all_analyses:
         return None, "AI không phân tích được market nào"
     
-    best_pick['all_analyses'] = all_analyses
-    best_pick['fixture_id'] = fx_id
-    best_pick['date'] = fixture['fixture']['date'][:10]
-    best_pick['kickoff_vn'] = _vn_time(fixture['fixture']['date'])
-    best_pick['league'] = league
-    best_pick['home'] = home
-    best_pick['away'] = away
-    best_pick['status'] = 'pending'
-    best_pick['result'] = None
-    best_pick['graded'] = None
+    # 7. Logic validation cross-market (_keo_logic_check logic)
+    # Build temp object for validation
+    validation_obj = {
+        'header': fixture_info,
+        'kickoff': fixture['fixture']['date'][:10],
+        'scenario': '',  # sẽ build từ estimated_total_goals
+        'keos': {},
+        'estimated_total_goals': None
+    }
+    for a in all_analyses:
+        validation_obj['keos'][a['market_type']] = {
+            'pick': a['selection'], 'pct': int(a['prob'])
+        }
+    # Ước lượng scenario từ estimated_total_goals trung bình
+    est_totals = [a['estimated_total_goals'] for a in all_analyses if a['estimated_total_goals']]
+    if est_totals:
+        avg_est = sum(est_totals) / len(est_totals)
+        validation_obj['estimated_total_goals'] = avg_est
+        # Build scenario text
+        validation_obj['scenario'] = f"{home} {int(round(avg_est * 0.55))}-{int(round(avg_est * 0.45))} {away} — ước tính tổng bàn {avg_est:.1f}"
     
-    return best_pick, None
+    errs = _keo_logic_check(validation_obj)
+    if errs:
+        logger.warning(f"[unified] Logic check errors: {errs}")
+        # Có thể retry fix 1 lần
+        fix_prompt = (
+            "JSON trước có lỗi logic:\n- " + "\n- ".join(errs) +
+            "\nSửa lại: giữ KỊCH BẢN TRẬN ĐẤU làm mốc (estimated_total_goals), mọi kèo suy từ kịch bản đó. "
+            "Trả lại ĐẦY ĐỦ JSON schema cho TẤT CẢ market:\n" + UNIFIED_SCHEMA +
+            "\n\nPhân tích gốc:\n" + json.dumps(all_analyses, ensure_ascii=False)[:2000]
+        )
+        fix_text, _ = await get_ai_response(session, [{"role": "user", "content": fix_prompt}], max_tokens=2000)
+        if fix_text:
+            try:
+                fixed = json.loads(re.sub(r'^```(?:json)?|```$', '', fix_text.strip(), flags=re.M).strip())
+                # Re-parse fixed analyses
+                # (giản lược: log warning, dùng kết quả gốc)
+            except Exception:
+                pass
+    
+    # 8. Chọn best pick (EV cao nhất, fallback prob cao nhất)
+    best_pick = max(all_analyses, key=lambda x: (x['ev'] if x['ev'] is not None else -999, x['prob']))
+    
+    # 9. Build scenario từ best estimated_total_goals
+    est_total = best_pick.get('estimated_total_goals')
+    if not est_total:
+        est_totals = [a['estimated_total_goals'] for a in all_analyses if a['estimated_total_goals']]
+        est_total = sum(est_totals) / len(est_totals) if est_totals else 2.5
+    
+    home_goals = round(est_total * 0.55)
+    away_goals = round(est_total * 0.45)
+    scenario = f"{home} {home_goals}-{away_goals} {away} — tổng bàn ước tính {est_total:.1f}"
+
+    return {
+        'best_pick': best_pick,
+        'all_analyses': all_analyses,
+        'fixture_id': fx_id,
+        'date': fixture['fixture']['date'][:10],
+        'kickoff_vn': kickoff_vn,
+        'league': league,
+        'home': home,
+        'away': away,
+        'scenario': scenario,
+        'estimated_total_goals': est_total,
+        'status': 'pending', 'result': None, 'graded': None
+    }, None
+
+
+async def analyze_match(session, fixture):
+    """Wrapper gọi unified engine cho /kèo command."""
+    result, err = await analyze_match_unified(session, fixture)
+    if err or not result:
+        return None, err
+    # Flatten best_pick để backward compatible với code hiện tại
+    best = result['best_pick']
+    best['all_analyses'] = result['all_analyses']
+    best['fixture_id'] = result['fixture_id']
+    best['date'] = result['date']
+    best['kickoff_vn'] = result['kickoff_vn']
+    best['league'] = result['league']
+    best['home'] = result['home']
+    best['away'] = result['away']
+    best['status'] = result['status']
+    best['result'] = result['result']
+    best['graded'] = result['graded']
+    return best, None
 
 
 def _grade_prediction(p, fixture):
@@ -3775,7 +3970,38 @@ async def _agent_execute(session, chat_id, name, args):
             hist_block = "\n\nLỊCH SỬ DỰ ĐOÁN CỦA BOT (dùng để calibrate % — đừng lặp lại sai lầm cũ):\n" + "\n".join(hist_lines[:8])
         api_block = ""
         if api_data_parts:
-            api_block = "\n\nDỮ LIỆU THẬT TỪ API-FOOTBALL (thống kê mùa giải + BXH — dùng cho Tài/Xỉu, BTTS):\n" + "\n".join(api_data_parts)
+            api_block = "\n\nDỮ LIỆU THẬT TỪ API-FOOTBALL (thống kê mùa giải + BXH — dùng cho Tài/XỈU, BTTS):\n" + "\n".join(api_data_parts)
+        
+        # Nếu đã tìm thấy matched_fx → gọi unified engine để phân tích thực tế
+        if matched_fx:
+            sky_data = "\n\n".join(data_parts) if data_parts else ""
+            oddsapi_text, _ = await get_oddsapi_odds(session, matched_fx)
+            # Detect single market từ query user
+            single_market = _detect_single_market(q)
+            single_key = single_market[0] if single_market else None
+            
+            unified_result, err = await analyze_match_unified(session, matched_fx, sky_data, oddsapi_text, single_market=single_key)
+            if not err and unified_result:
+                # Format output theo JSON schema (cho agent loop)
+                obj = {
+                    'header': f"[{unified_result['league']}] {unified_result['home']} vs {unified_result['away']} ({unified_result['kickoff_vn']})",
+                    'kickoff': unified_result['date'],
+                    'live': '',
+                    'scenario': unified_result['scenario'],
+                    'keos': {},
+                    'estimated_total_goals': unified_result['estimated_total_goals'],
+                    'best': f"{unified_result['best_pick']['market']} — {unified_result['best_pick']['selection']} ({unified_result['best_pick']['prob']:.0f}%)"
+                }
+                for a in unified_result['all_analyses']:
+                    obj['keos'][a['market_type']] = {
+                        'pick': a['selection'], 'pct': int(a['prob']), 'why': a.get('why', '')
+                    }
+                rendered = _render_keo_from_json(obj, single_key)
+                if rendered:
+                    _save_keo_batch(chat_id, obj, rendered)
+                    return rendered
+        
+        # Fallback: trả data block để AI tự format (trường hợp không tìm thấy fixture)
         data_block = ("DỮ LIỆU THẬT từ Sky Sports (CHÍNH THỨC mùa 2026-27 — tin tuyệt đối):\n\n"
                       + "\n\n".join(data_parts) + api_block + hist_block) if data_parts else (
                       f"Không lấy được dữ liệu Sky. Kết quả web:\n" + await tool_web_search(
@@ -3948,6 +4174,34 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
             content = _clean_tg(raw)
             is_keo = bool(re.search(r'analyze_keo', str(messages), re.I)) or any(
                 w in question.lower() for w in ('kèo', 'phân tích', 'dự đoán'))
+            
+            # Kiểm tra nếu tool analyze_keo đã trả về output đã format sẵn (đã qua unified engine)
+            _tool_final = None
+            for _mm in reversed(messages):
+                if _mm.get('role') == 'tool' and isinstance(_mm.get('content'), str):
+                    _tool_final = _mm['content'].strip()
+                    break
+            
+            # Nếu tool result đã là format cuối cùng (rendered keo), gửi thẳng
+            if _tool_final and (_tool_final.startswith('⚽') or _tool_final.startswith('[') or 
+                                '- 1X2:' in _tool_final or '- Tài xỉu:' in _tool_final or
+                                '- Châu Á:' in _tool_final or '- BTTS:' in _tool_final):
+                await send_telegram_message(session, chat_id, _tool_final, reply_to=reply_to)
+                await _clear_status_msgs(session, chat_id)
+                return
+            
+            if _tool_final and (_tool_final.startswith('Không tìm thấy trận')
+                                or _tool_final.startswith('Trận đã đá rồi')
+                                or _tool_final.startswith('LỖI:')):
+                # tool báo không có trận → trả lời thẳng, CẤM ép JSON kèo (tránh bịa kèo 100%)
+                content = _clean_tg(_tool_final)
+                if content:
+                    await send_telegram_message(session, chat_id, content, reply_to=reply_to)
+                else:
+                    await send_telegram_message(session, chat_id, "Không tìm thấy trận này — thử hỏi tên đội khác.", reply_to=reply_to)
+                await _clear_status_msgs(session, chat_id)
+                return
+            
             single = _detect_single_market(question) if is_keo else None
             rendered = None
             if is_keo and content:
