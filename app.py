@@ -2693,8 +2693,19 @@ async def cmd_analyze_odds_image(session, chat_id, photo, caption='', is_doc=Fal
     await send_telegram_message(session, chat_id, "📊 *AI ĐỌC ODDS TỪ ẢNH:*\n\n" + content.strip()[:3800])
 
 
+# Lệnh thuộc bot trading → bot kèo bỏ qua (tránh 2 bot trả lời chồng nhau trong channel)
+_TRADING_COMMANDS = {
+    '/pnl', '/pos', '/balance', '/wallet', '/sodu', '/top', '/gainers',
+    '/orders', '/lenh', '/cancel', '/huy', '/close', '/c', '/tp', '/sl',
+    '/tpsl', '/leverage', '/lev', '/long', '/l', '/short', '/s', '/chart',
+    '/dca', '/auto', '/autopnl', '/stats', '/trail', '/ai', '/analyze', '/a',
+    '/history', '/lichsu', '/his', '/liq', '/review', '/scans', '/scan',
+    '/risk', '/stopauto', '/fund', '/fomo'
+}
+
+
 async def handle_update(session, update):
-    msg = update.get('message')
+    msg = update.get('message') or update.get('channel_post')
     cb = update.get('callback_query')
     if cb:
         cb_data = cb.get('data', '')
@@ -2722,8 +2733,19 @@ async def handle_update(session, update):
     doc = msg.get('document') or {}
     if not chat_id or (not text and not photo and not doc):
         return
+    # Ghi nhận message_id của tin USER để /clear xóa được cả tin user (channel/group cần bot admin)
+    if msg.get('message_id'):
+        _sent_msg_ids.setdefault(chat_id, []).append(msg['message_id'])
+        if len(_sent_msg_ids[chat_id]) > 200:
+            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
     auto_chats.add(chat_id)
     _save_chats()
+
+    # ✅ Bỏ qua lệnh chỉ dành cho bot trading (tránh 2 bot trả lời chồng nhau trong channel)
+    if text.startswith('/'):
+        cand = text.split(maxsplit=1)[0].split('@')[0].lower()
+        if cand in _TRADING_COMMANDS:
+            return
 
     # 📸 Ảnh (screenshot 1xBet...) → AI đọc odds + phân tích kèo trực tiếp
     if photo and not text:

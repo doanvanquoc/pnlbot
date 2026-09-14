@@ -9053,7 +9053,7 @@ async def telegram_webhook_handler(request):
         asyncio.create_task(handle_order_callback(request.app['session'], callback_query))
         return web.Response(status=200)
 
-    message = data.get('message')
+    message = data.get('message') or data.get('channel_post')
     if not message:
         return web.Response(status=200)
         
@@ -9062,12 +9062,38 @@ async def telegram_webhook_handler(request):
         return web.Response(status=200)
         
     chat_id = chat.get('id')
+    chat_type = chat.get('type', 'private')
+    is_channel = chat_type == 'channel'
+    # Ghi nhận message_id của tin USER để /clear xóa được cả tin user (channel/group cần bot admin)
+    if message.get('message_id'):
+        _sent_msg_ids.setdefault(chat_id, []).append(message['message_id'])
+        if len(_sent_msg_ids[chat_id]) > 200:
+            _sent_msg_ids[chat_id] = _sent_msg_ids[chat_id][-200:]
     has_new_activity[chat_id] = True
     if chat_id not in active_chats:
         active_chats.add(chat_id)
         save_active_chats()
         
     text = message.get('text', '').strip()
+
+    # Trong CHANNEL: bot trading CHỈ xử lý lệnh trading hoặc khi được @mention @soikeotrading_bot.
+    # Lệnh bóng đá /ngôn ngữ tự nhiên không mention → bỏ qua (bot bóng đá lo) → không trả lời chồng nhau.
+    if is_channel and text:
+        if text.startswith('/'):
+            cand = text.split()[0].lower().split('@')[0]
+            _trading_only = {
+                '/pnl', '/pos', '/balance', '/wallet', '/sodu', '/top', '/gainers',
+                '/orders', '/lenh', '/cancel', '/huy', '/close', '/c', '/tp', '/sl',
+                '/tpsl', '/leverage', '/lev', '/long', '/l', '/short', '/s', '/chart',
+                '/dca', '/auto', '/autopnl', '/stats', '/trail', '/ai', '/analyze', '/a',
+                '/history', '/lichsu', '/his', '/liq', '/review', '/scans', '/scan',
+                '/risk', '/stopauto', '/fund', '/fomo', '/clear'
+            }
+            if cand not in _trading_only:
+                return web.Response(status=200)
+        else:
+            if '@soikeotrading_bot' not in text:
+                return web.Response(status=200)
 
     # Nội dung tin nhắn mà người dùng đang REPLY (nếu có) — để AI đọc được cả tin nhắn gốc
     # khi người dùng trả lời nối tiếp (vd reply tin "AI QUÉT 30 PHÚT" rồi hỏi "2 coin này")
