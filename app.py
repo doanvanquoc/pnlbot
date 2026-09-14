@@ -1562,6 +1562,58 @@ async def _analyze_single_market_task(session, system_prompt, base_prompt, mtype
         except Exception as e:
             return mtype, None, str(e)
 
+async def _validate_selection(mtype, selection, est_total=None, home="", away=""):
+    """Chuẩn hóa/chặn selection sai loại kèo. Trả (selection_hop_le, lý_do_loại_hoặc_None).
+    AI hay trả nhầm tên đội thắng cho Tài xỉu/BTTS/thẻ/góc → catch ở đây để không ra kèo rác."""
+    sel = (selection or '').strip()
+    sel_low = sel.lower()
+    if not sel:
+        return None, "thiếu selection"
+    if mtype == 'match_result':
+        # 1X2: phải là Home/Draw/Away hoặc tên đội
+        if any(w in sel_low for w in ('tài', 'xỉu', 'có', 'không', 'over', 'under')):
+            return None, f"1X2 trả nhầm cửa khác: '{sel}'"
+        return sel, None
+    if mtype == 'total_goals':
+        is_over = any(w in sel_low for w in ('tài', 'over', 'trên'))
+        is_under = any(w in sel_low for w in ('xỉu', 'under', 'dưới'))
+        if not (is_over or is_under):
+            # AI trả nhầm tên đội → suy từ estimated_total_goals
+            if est_total is not None:
+                line = 2.5 if est_total == 2.5 else (3.0 if est_total >= 2.8 else (2.0 if est_total <= 2.2 else 2.5))
+                pick = 'Tài' if est_total >= 2.8 else 'Xỉu'
+                fixed = f"{pick} {line:g}"
+                logger.warning(f"[unified] total_goals selection sai '{sel}' → tự suy '{fixed}' từ tổng bàn {est_total}")
+                return fixed, None
+            return None, f"Tài xỉu trả sai: '{sel}'; thiếu estimated_total_goals để tự suy"
+        line_m = re.search(r'(\d+(?:[.,]\d+)?)', sel)
+        # Chuẩn hóa: nếu thiếu line/dị → nối '2.5' mặc định
+        if not line_m:
+            line = 2.5
+        else:
+            line = float(line_m.group(1).replace(',', '.'))
+        return f"{'Tài' if is_over else 'Xỉu'} {line:g}", None
+    if mtype == 'btts':
+        if any(w in sel_low for w in ('có', 'không', 'yes', 'no', 'both', 'cả 2', 'cả hai')):
+            if 'có' in sel_low or 'yes' in sel_low or 'both' in sel_low or 'cả 2' in sel_low or 'cả hai' in sel_low:
+                return 'Có', None
+            return 'Không', None
+        return None, f"BTTS trả sai: '{sel}'"
+    if mtype == 'asian_handicap':
+        if not re.search(r'[+-]?\d+(?:[.,]\d+)?', sel):
+            return None, f"Châu Á trả sai (thiếu mức chấp): '{sel}'"
+        return sel, None
+    if mtype in ('corners', 'cards'):
+        is_over = any(w in sel_low for w in ('tài', 'over', 'trên'))
+        is_under = any(w in sel_low for w in ('xỉu', 'under', 'dưới'))
+        if not (is_over or is_under):
+            return None, f"{'Phạt góc' if mtype=='corners' else 'Thẻ phạt'} trả sai: '{sel}'"
+        line_m = re.search(r'(\d+(?:[.,]\d+)?)', sel)
+        line = float(line_m.group(1).replace(',', '.')) if line_m else (9.5 if mtype == 'corners' else 4.5)
+        return f"{'Tài' if is_over else 'Xỉu'} {line:g}", None
+    return sel, None
+
+
 async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", oddsapi_ev=None, single_market=None):
     """
     Engine phân tích thống nhất cho cả /kèo và ai_agent_loop.
@@ -1673,6 +1725,13 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         reasoning = str(pred.get('reasoning', ''))[:600]
         why = str(pred.get('why', ''))[:500]
         est_total = pred.get('estimated_total_goals')
+        
+        # Validate selection đúng loại kèo (AI hay trả nhầm tên đội cho mọi market)
+        sel_fixed, sel_err = await _validate_selection(mtype, selection, est_total, home, away)
+        if sel_err:
+            logger.warning(f"[unified] {mtype}: loại - {sel_err}")
+            continue
+        selection = sel_fixed
         
         # Calibrate probability
         prob = calibrate_probability(raw_prob, league, home, away, mtype)
