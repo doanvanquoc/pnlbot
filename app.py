@@ -2196,7 +2196,7 @@ async def find_fixture_by_team(session, query):
     seen, suggestions = [], []
     for offset in range(0, 3):
         date_str = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
-        fixtures, err = await get_fixtures_for_date(session, date_str)
+        fixtures, err = await get_fixtures_for_date(session, date_str, only_tracked=False)
         if err or not fixtures:
             continue
         for fx in fixtures[:30]:
@@ -2220,7 +2220,7 @@ async def _find_one_team(session, query):
     seen, suggestions = [], []
     for offset in list(range(0, 5)) + [-1, -2]:
         date_str = (today + timedelta(days=offset)).strftime('%Y-%m-%d')
-        fixtures, err = await get_fixtures_for_date(session, date_str)
+        fixtures, err = await get_fixtures_for_date(session, date_str, only_tracked=False)
         if err or not fixtures:
             continue
         if len(suggestions) < 20:
@@ -2769,7 +2769,12 @@ async def handle_update(session, update):
         ids = _sent_msg_ids.pop(chat_id, [])
         for mid in ids:
             await delete_telegram_message(session_http, chat_id, mid)
-        await send_telegram_message(session_http, chat_id, "🧹 Đã xóa tin nhắn cũ.")
+        resp = await send_telegram_message(session_http, chat_id, "🧹 Đã xóa tin nhắn cũ.")
+        if resp and resp.get('ok'):
+            conf_mid = resp.get('result', {}).get('message_id')
+            if conf_mid:
+                await asyncio.sleep(0.3)
+                await delete_telegram_message(session_http, chat_id, conf_mid)
     elif command_base == '/lich':
         await cmd_lich(session_http, chat_id, arg)
     elif command_base == '/kèo' or command_base == '/keo':
