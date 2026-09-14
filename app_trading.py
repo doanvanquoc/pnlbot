@@ -9103,6 +9103,9 @@ async def telegram_webhook_handler(request):
         replied_text = (rtm.get('text') or rtm.get('caption') or '').strip()
 
     if not text:
+        # Group/channel: bot trading KHÔNG xử lý ảnh (bot soi kèo lo) — tránh reply chồng nhau
+        if is_group_chat:
+            return web.Response(status=200)
         # Tin nhắn ảnh (kèm/không kèm caption): giữ lại tin nhắn, đưa cho AI agent phân tích
         photos = message.get('photo')
         if photos:
