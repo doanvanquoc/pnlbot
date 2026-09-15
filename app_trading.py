@@ -5682,7 +5682,7 @@ def _save_ai_alert_state():
 
 # ─── Pump radar: phát hiện coin "bất ngờ bay vút" CÒN nhiên liệu để pump tiếp ───
 PUMP_RADAR_INTERVAL = int(float(os.getenv('PUMP_RADAR_INTERVAL', '600')))  # 10 phút
-PUMP_SCORE_MIN = float(os.getenv('PUMP_SCORE_MIN', '6.5'))                 # ngưỡng điểm báo
+PUMP_SCORE_MIN = float(os.getenv('PUMP_SCORE_MIN', '10'))                 # ngưỡng điểm báo — chỉ báo kèo 10/10
 PUMP_CHANGE_MIN = 15.0            # % tăng 24h tối thiểu để coi là "đang bay"
 PUMP_COOLDOWN_SEC = 2 * 3600      # không báo lại cùng coin trong 2h
 PUMP_MAX_ITEMS = 3
@@ -5874,7 +5874,7 @@ def _fmt_pump_message(cands, mode="auto"):
         if hot:
             rr = abs((c['fomo_tp'] or 0) - c['close']) / (abs(c['close'] - (c['fomo_sl'] or c['close'])) + 1e-10)
             lines.append(
-                f"  ⚡ *FOMO ngay* (điểm ≥8, momentum chưa gãy): entry MARKET {format_price(c['close'])}, "
+                f"  ⚡ *FOMO ngay* (điểm 10/10, momentum chưa gãy): entry MARKET {format_price(c['close'])}, "
                 f"TP {format_price(c['fomo_tp'])} (R:R 1:{rr:.1f}), SL {format_price(c['fomo_sl'])} (stop scalp -2.5%). "
                 f"Size ≤ 5% vốn, chốt nửa lệnh khi +2%"
             )
@@ -5883,8 +5883,8 @@ def _fmt_pump_message(cands, mode="auto"):
                 f"  ⏳ *Chờ pullback* về VWAP 15m {format_price(c['vwap15m'])} rồi long — TP {format_price(c['tp'])}, SL {format_price(c['sl'])}"
             )
     lines.append(
-        "\n⚠️ Điểm ≥8 = FOMO được vì mọi tầng momentum còn nguyên + nhiên liệu squeeze; 6.5-8 = đuổi giá dễ móm, chờ pullback; <5 = cháy đuồi bỏ qua. "
-        "Coin bay >60%/24h luôn chia nhỏ vào 2 lần, không all-in."
+        "\n⚠️ Chỉ báo kèo *điểm 10/10* — mọi tầng momentum còn nguyên + nhiên liệu squeeze. "
+        "Dưới 10 = đuổi giá dễ móm, bỏ qua. Coin bay >60%/24h luôn chia nhỏ vào 2 lần, không all-in."
     )
     return "\n".join(lines)
 
@@ -5911,6 +5911,16 @@ async def pump_radar_loop(app):
             if alertable:
                 for c in alertable:
                     pump_last_alerted[c['symbol']] = now
+                    record_signal({
+                        'symbol': c['symbol'],
+                        'signal': 'LONG',
+                        'close': c['close'],
+                        'tp': c['fomo_tp'],
+                        'sl': c['fomo_sl'],
+                        'long_score': c['score'],
+                        'short_score': c['score'],
+                        'confidence': c['confidence'],
+                    }, origin='pump')
                 _save_pump_state()
                 msg = _fmt_pump_message(alertable)
                 if msg:
@@ -5936,7 +5946,7 @@ async def handle_fomo_command(session, chat_id, arg=None):
         _save_auto_state()
         await send_telegram_message(session, chat_id,
             "🚀 *Đã BẬT auto PUMP RADAR* — quét tự động mỗi 10 phút.\n"
-            "Coin bay vút còn nhiên liệu (điểm ≥8) sẽ báo kèm lệnh FOMO ngay. Tắt: `/fomo off`")
+            "Coin bay vút còn nhiên liệu (điểm 10/10) sẽ báo kèm lệnh FOMO ngay. Tắt: `/fomo off`")
         return
     if arg == 'off':
         AUTO_STATE['pump_radar_off'] = True
@@ -5946,8 +5956,9 @@ async def handle_fomo_command(session, chat_id, arg=None):
         return
     await send_telegram_message(session, chat_id, "🚀 Đang quét coin bay vút... (chờ ~1 phút)")
     cands = await detect_pump_candidates(session, limit=8)
-    msg = _fmt_pump_message(cands, mode="manual") if cands else \
-        "Không có coin nào tăng ≥15%/24h đủ thanh khoản — thị trường đang lặng."
+    hot = [c for c in cands if c['score'] >= PUMP_SCORE_MIN]
+    msg = _fmt_pump_message(hot) if hot else \
+        "Không có coin nào đạt điểm 10/10 để FOMO — đang quá muộn, bỏ qua các loại khác."
     await send_telegram_message(session, chat_id, msg)
 
 
