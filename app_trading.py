@@ -159,52 +159,70 @@ def load_signal_history():
 
 def save_signal_history():
     try:
-        with open(SIGNAL_HISTORY_FILE, "w", encoding="utf-8") as f:
+        temporary = SIGNAL_HISTORY_FILE + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as f:
             json.dump(signal_history, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, SIGNAL_HISTORY_FILE)
     except Exception as e:
         logger.error(f"Lỗi khi lưu signal_history: {e}")
 
 def prune_signal_history(max_keep=500):
     global signal_history
     cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
-    signal_history = [s for s in signal_history if s.get('ts', 0) >= cutoff]
-    if len(signal_history) > max_keep:
-        signal_history = signal_history[-max_keep:]
+    pending = [s for s in signal_history if s.get('status') == 'open']
+    resolved = [s for s in signal_history if s.get('status') != 'open' and s.get('ts', 0) >= cutoff]
+    signal_history = sorted(pending + resolved[-max_keep:], key=lambda s: s.get('ts', 0))
 
-def record_signal(res, ai_verdict=None, origin='manual'):
-    """Lưu MỌI đề xuất có hướng + TP/SL vào bộ nhớ để theo dõi kết quả (win/loss/expired)
-    và cho AI tự học. origin: 'manual' (/a), 'query' (/a <coin>), 'scan' (quét thị trường),
-    'auto' (AI tự vào lệnh), 'ai' (agent /ai đề xuất)."""
-    if not isinstance(res, dict):
-        return
-    if res.get('signal') not in ('LONG', 'SHORT'):
-        return
-    if not res.get('tp') or not res.get('sl'):
-        return
-    # Tránh ghi trùng: cùng symbol + side còn mở trong 4 giờ gần nhất
+def record_signal(res, ai_verdict=None, origin='manual', execution=None):
+    """Tách tín hiệu giả lập và giao dịch thật; lệnh thật chống trùng bằng order ID."""
+    if not isinstance(res, dict) or res.get('signal') not in ('LONG', 'SHORT'):
+        return None
+    if not res.get('sl') or (not execution and not res.get('tp')):
+        return None
     now = time.time()
     for s in signal_history:
-        if (s.get('status') == 'open' and s.get('symbol') == res['symbol']
-                and s.get('side') == res['signal'] and now - s.get('ts', 0) < 4 * 3600):
-            return
+        if execution:
+            old = s.get('execution') or {}
+            if s.get('symbol') == res['symbol'] and str(old.get('order_id')) == str(execution['order_id']):
+                return s['id']
+        elif (not s.get('execution') and s.get('origin') == origin
+              and s.get('status') == 'open' and s.get('symbol') == res['symbol']
+              and s.get('side') == res['signal'] and now - s.get('ts', 0) < 4 * 3600):
+            return s['id']
     verdict = ai_verdict or {}
-    signal_history.append({
-        'id': f"{res['symbol']}_{res['signal']}_{int(now)}",
-        'ts': now,
-        'symbol': res['symbol'],
-        'side': res['signal'],
-        'entry': res['close'],
-        'tp': res['tp'],
-        'sl': res['sl'],
-        'score': res['long_score'] if res['signal'] == 'LONG' else res['short_score'],
-        'confidence': res['confidence'],
-        'ai': verdict.get('direction'),
+    signal_id = f"{res['symbol']}_{origin}_{execution['order_id'] if execution else time.time_ns()}"
+    sig = {
+        'id': signal_id, 'ts': now, 'symbol': res['symbol'], 'side': res['signal'],
+        'entry': float(res['close']), 'tp': res.get('tp'), 'sl': float(res['sl']),
+        'score': res.get('long_score' if res['signal'] == 'LONG' else 'short_score', 0),
+        'confidence': res.get('confidence', 'Thấp'), 'ai': verdict.get('direction'),
         'ai_score': verdict.get('long_score' if res['signal'] == 'LONG' else 'short_score'),
-        'origin': origin,
-        'status': 'open'
-    })
+        'origin': origin, 'status': 'open', 'tracking_version': 2,
+        'model': os.getenv('DASH_MODEL', 'claude-sonnet-5'), 'analysis_version': 2,
+        'snapshot': {k: res.get(k) for k in ('rsi', 'adx', 'atr', 'vol_ratio', 'bb_pct',
+                                           'ema9', 'ema21', 'ema50', 'ema200', 'funding_rate')},
+        'ai_verdict': verdict,
+        'ai_input': res.get('ai_input'), 'ai_gate_passed': res.get('ai_gate_passed'),
+    }
+    if execution:
+        sig['execution'] = dict(execution)
+        sig['ts'] = float(execution.get('entry_time', now))
+    else:
+        # Không dùng OHLC của phút vào tín hiệu: high/low có thể xảy ra trước entry.
+        sig['next_open_ms'] = (int(now * 1000) // 60000 + 1) * 60000
+    signal_history.append(sig)
     prune_signal_history()
     save_signal_history()
+    return signal_id
+
+
+def _verified_execution(s):
+    """Chỉ kết quả lệnh đã đối soát mới được điều khiển gate và bài học AI."""
+    return (bool(s.get('execution')) and s.get('reconciled') is True
+            and s.get('status') in ('win', 'loss', 'be')
+            and isinstance(s.get('net_pnl'), (int, float)) and math.isfinite(s['net_pnl']))
 
 SCAN_HISTORY_FILE = "scan_history_trading.json"
 SCAN_HISTORY_MAX = 200
@@ -244,43 +262,37 @@ def record_scan(kind, coins):
     save_scan_history()
 
 def get_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
-    """Thống kê win/loss/expired theo band độ tin cậy (4⭐/5⭐) trong `days` ngày gần nhất.
-    Chỉ tính tín hiệu 4-5 sao (Mạnh/Rất mạnh) — bỏ qua tín hiệu yếu (Trung bình/Yếu)
-    phát sinh từ /a <coin> hoặc /ai chat để không làm sai lệch win-rate hiển thị.
-    'expired' = tín hiệu không chạm TP/SL trong 72h (TP 1:1 quá xa/đi sideway)."""
+    """Win-rate lệnh thật đã đối soát, không trộn với cảnh báo/giả lập."""
     cutoff = time.time() - days * 86400
     stats = {}
     for s in signal_history:
-        if (s.get('status') not in ('win', 'loss', 'expired') or s.get('ts', 0) < cutoff
-                or s.get('confidence') not in ('Mạnh', 'Rất mạnh')):
+        if not _verified_execution(s) or s.get('ts', 0) < cutoff:
             continue
         band = '5⭐' if s.get('confidence') == 'Rất mạnh' else '4⭐'
-        st = stats.setdefault(band, {'win': 0, 'loss': 0, 'expired': 0})
-        st['expired' if s['status'] == 'expired' else s['status']] += 1
+        if s.get('confidence') not in ('Mạnh', 'Rất mạnh'):
+            continue
+        st = stats.setdefault(band, {'win': 0, 'loss': 0, 'be': 0, 'net_pnl': 0.0})
+        st[s['status']] += 1
+        st['net_pnl'] += s['net_pnl']
     return stats
 
 def format_signal_stats(days=SIGNAL_MAX_AGE_DAYS):
-    """Dòng thống kê win-rate thực tế để hiển thị trong output /a. Rỗng nếu chưa có dữ liệu."""
+    """Win-rate sau chi phí của lệnh thật; hòa vốn được tính trong mẫu."""
     stats = get_signal_stats(days)
-    if not stats:
-        return ""
     parts = []
-    for band in ('5⭐', '4⭐'):
-        if band in stats:
-            st = stats[band]
-            decided = st['win'] + st['loss']
-            total = decided + st['expired']
-            wr = st['win'] / decided * 100 if decided else 0.0
-            parts.append(f"{band} {st['win']}W/{st['loss']}L ({wr:.0f}%{f', hết hạn {st['expired']}' if st['expired'] else ''})")
-    if not parts:
-        return ""
-    return f"📈 *Win-rate thực tế {days} ngày:* " + " | ".join(parts)
+    for band, st in stats.items():
+        total = st['win'] + st['loss'] + st['be']
+        parts.append(f"{band} {st['win']}W/{st['loss']}L/{st['be']}BE "
+                     f"({st['win'] / total * 100:.0f}%), net {st['net_pnl']:+.2f} USDT")
+    return f"📈 *Lệnh thật đã đối soát {days} ngày:* " + ' | '.join(parts) if parts else ''
 
 def band_winrate_ok(confidence, min_samples=10, min_wr=0.5):
     """Adaptive gate: chặn nhóm tín hiệu có win-rate thực tế dưới 50% (tối thiểu min_samples mẫu)."""
     cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
     wins = losses = 0
     for s in signal_history:
+        if not _verified_execution(s) or s.get('origin') != 'auto':
+            continue
         if (s.get('confidence') != confidence or s.get('status') not in ('win', 'loss')
                 or s.get('ts', 0) < cutoff):
             continue
@@ -294,15 +306,14 @@ def band_winrate_ok(confidence, min_samples=10, min_wr=0.5):
     return (wins / total) >= min_wr
 
 def side_winrate_ok(side, min_samples=None, min_wr=0.5):
-    """Adaptive gate theo CHIỀU (LONG/SHORT): chặn side có win-rate thực tế < min_wr với đủ mẫu.
-    Bổ sung cho band_winrate_ok — bắt đúng bệnh SHORT thua dù band vẫn tốt (backtest: SHORT 37.5%).
-    Chỉ tính tín hiệu 4-5 sao (Mạnh/Rất mạnh) — khớp đúng population mà auto-trader dùng,
-    không bị nhiễu bởi tín hiệu yếu phát sinh từ /a <coin> hoặc /ai chat."""
+    """Adaptive gate theo chiều, chỉ dùng lệnh auto đã đối soát sau chi phí."""
     if min_samples is None:
         min_samples = AI_AUTO_SIDE_MIN_SAMPLES
     cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
     wins = losses = 0
     for s in signal_history:
+        if not _verified_execution(s) or s.get('origin') != 'auto':
+            continue
         if (s.get('side') != side or s.get('status') not in ('win', 'loss')
                 or s.get('ts', 0) < cutoff or s.get('confidence') not in ('Mạnh', 'Rất mạnh')):
             continue
@@ -315,136 +326,240 @@ def side_winrate_ok(side, min_samples=None, min_wr=0.5):
         return True
     return (wins / total) >= min_wr
 
+async def _track_paper_signal(session, sig, now):
+    """Đọc bù nến ĐÃ ĐÓNG; chỉ tiến cursor sau khi nhận đủ dữ liệu liên tục."""
+    start = int(sig.get('next_open_ms', (int(sig['ts'] * 1000) // 60000 + 1) * 60000))
+    deadline = (int(sig['ts'] * 1000 + SIGNAL_TIMEOUT_HOURS * 3600000) // 60000) * 60000
+    end = min(int(now * 1000) // 60000 * 60000, deadline)
+    changed = False
+    for _ in range(8):
+        if start >= end:
+            if end >= deadline and sig.get('status') == 'open':
+                sig.update(status='expired', closed_ts=deadline / 1000)
+                changed = True
+            break
+        params = {'symbol': sig['symbol'], 'interval': '1m', 'startTime': start,
+                  'endTime': end - 1, 'limit': 1000}
+        async with session.get('https://fapi.binance.com/fapi/v1/klines', params=params) as resp:
+            if resp.status != 200:
+                return changed
+            candles = await resp.json()
+        if not isinstance(candles, list) or not candles:
+            return changed
+        for candle in candles:
+            open_ms = int(candle[0])
+            if open_ms < start:
+                continue
+            if open_ms != start or open_ms + 60000 > end:
+                return changed
+            high, low = float(candle[2]), float(candle[3])
+            hit_sl = low <= sig['sl'] if sig['side'] == 'LONG' else high >= sig['sl']
+            hit_tp = high >= sig['tp'] if sig['side'] == 'LONG' else low <= sig['tp']
+            start = open_ms + 60000
+            sig['next_open_ms'] = start
+            changed = True
+            if hit_sl or hit_tp:
+                sig.update(status='loss' if hit_sl else 'win', closed_ts=start / 1000,
+                           outcome_basis='paper_closed_candle')
+                return True
+    return changed
+
+
+def _execution_trade_result(sig, trades):
+    """Đối soát toàn bộ fills tới khi flat; không gán PnL khi có lệnh mở xen vào."""
+    execution = sig['execution']
+    entry_id = str(execution['order_id'])
+    side = 'BUY' if sig['side'] == 'LONG' else 'SELL'
+    pos_side = execution.get('position_side', 'BOTH')
+    rows = sorted({int(t['id']): t for t in trades
+                   if t.get('positionSide', 'BOTH') == pos_side}.values(), key=lambda t: int(t['id']))
+    entries = [t for t in rows if str(t['orderId']) == entry_id]
+    if not entries:
+        return None
+    first_id = min(int(t['id']) for t in entries)
+    balance = gross = fees = 0.0
+    tolerance = max(float(execution['quantity']) * 1e-8, 1e-12)
+    expected = sum(float(t['qty']) for t in entries)
+    if abs(expected - float(execution['quantity'])) > tolerance:
+        return None
+    used = []
+    for trade in rows:
+        if int(trade['id']) < first_id:
+            continue
+        qty = float(trade['qty'])
+        if trade['side'] == side:
+            if str(trade['orderId']) != entry_id:
+                return None
+            balance += qty
+        else:
+            if qty > balance + tolerance:
+                return None
+            balance -= qty
+        commission = float(trade.get('commission', 0))
+        if commission and trade.get('commissionAsset') != 'USDT':
+            return None  # Không giả định phí BNB hoặc tài sản khác bằng USDT.
+        gross += float(trade.get('realizedPnl', 0))
+        fees += commission
+        used.append(trade)
+        if balance <= tolerance:
+            return {'gross_pnl': gross, 'commission': fees,
+                    'closed_ts': int(trade['time']) / 1000,
+                    'entry_time': min(int(t['time']) for t in entries) / 1000,
+                    'trade_ids': [int(t['id']) for t in used]}
+    return None
+
+
+async def reconcile_execution_outcomes(session):
+    """REST fills + funding là nguồn thật; không suy diễn lệnh đã đóng từ cache WS."""
+    changed = False
+    now_ms = int(time.time() * 1000)
+    for sig in list(signal_history):
+        if not sig.get('execution') or sig.get('status') != 'open':
+            continue
+        execution = sig['execution']
+        start = int(float(execution.get('entry_time', sig['ts'])) * 1000)
+        # userTrades chỉ tra được 3 tháng gần nhất — quá hạn thì giữ 'open', không gán PnL suy diễn.
+        if now_ms - start > 85 * 86400000:
+            sig['reconciliation_note'] = 'Quá hạn 3 tháng của API userTrades — không suy diễn PnL.'
+            continue
+        trades = []
+        complete = True
+        cursor = start
+        # UserTrades chỉ nhận khoảng thời gian tối đa 7 ngày mỗi request.
+        while cursor <= now_ms:
+            end = min(cursor + 7 * 86400000 - 1, now_ms)
+            page, err = await binance_signed_request(session, 'GET', '/fapi/v1/userTrades',
+                {'symbol': sig['symbol'], 'startTime': cursor, 'endTime': end, 'limit': 1000})
+            if err or not isinstance(page, list):
+                complete = False
+                break
+            trades.extend(page)
+            if len(page) == 1000:
+                # Phân trang bằng ID để không mất các fills cùng millisecond.
+                from_id = int(page[-1]['id']) + 1
+                while True:
+                    page, err = await binance_signed_request(session, 'GET', '/fapi/v1/userTrades',
+                        {'symbol': sig['symbol'], 'fromId': from_id, 'limit': 1000})
+                    if err or not isinstance(page, list):
+                        complete = False
+                        break
+                    trades.extend(t for t in page if int(t['time']) <= now_ms)
+                    if len(page) < 1000 or int(page[-1]['time']) > now_ms:
+                        break
+                    next_id = int(page[-1]['id']) + 1
+                    if next_id <= from_id:
+                        complete = False
+                        break
+                    from_id = next_id
+                break
+            cursor = end + 1
+        if not complete:
+            continue
+        result = _execution_trade_result(sig, trades)
+        if result is None:
+            sig['reconciliation_note'] = 'Chờ fills đầy đủ/phân bổ phí; không suy diễn PnL từ nến.'
+            continue
+        closed_ms = int(result['closed_ts'] * 1000)
+        # Đợi income có thời gian cập nhật; không finalize ngay sau fill cuối.
+        if now_ms - closed_ms < 60000:
+            continue
+        funding, err = await fetch_income_paginated(session, income_type='FUNDING_FEE',
+            start_ms=int(result['entry_time'] * 1000), end_ms=closed_ms)
+        if err or funding is None:
+            continue
+        funding = [f for f in funding if f.get('symbol') == sig['symbol']]
+        # Income funding không có positionSide. Nếu hai chiều overlap thì chưa thể phân bổ chính xác.
+        if funding and execution.get('position_side', 'BOTH') != 'BOTH':
+            opposite = any(t.get('positionSide', 'BOTH') != execution['position_side']
+                           and start <= int(t['time']) <= closed_ms for t in trades)
+            if opposite or not execution.get('symbol_flat_at_entry'):
+                sig['reconciliation_note'] = 'Funding hedge không đủ bằng chứng để phân bổ theo chiều.'
+                continue
+        if any(f.get('asset') != 'USDT' for f in funding):
+            continue
+        funding_net = sum(float(f['income']) for f in funding)
+        net = result['gross_pnl'] - result['commission'] + funding_net
+        initial_risk = abs(sig['entry'] - sig['sl']) * float(execution['quantity'])
+        sig.update(result, funding=funding_net, net_pnl=net,
+                   realized_r=net / initial_risk if initial_risk > 0 else None,
+                   reconciled=True, outcome_basis='exchange_fills',
+                   status='win' if net > 1e-8 else ('loss' if net < -1e-8 else 'be'))
+        changed = True
+    return changed
+
+
 async def signal_tracking_loop(app):
-    """Task nền: theo dõi kết quả các tín hiệu đang mở (TP chạm trước hay SL trước).
-    Dùng nến 1m high/low khớp mô hình backtest thay vì chỉ giá last mỗi 30s:
-    - LONG: high >= TP → win; low <= SL → loss; cả hai cùng nến → SL ưu tiên (loss).
-    - SHORT: mirror."""
+    """Tín hiệu: nến đóng; lệnh thật: đối soát fills, commission và funding."""
     await asyncio.sleep(10)
     while True:
         try:
-            open_signals = [s for s in signal_history if s.get('status') == 'open']
-            if open_signals:
-                session = app['session']
-                now = time.time()
-                sem = asyncio.Semaphore(8)
-
-                async def resolve_signal(sig):
-                    async with sem:
-                        url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={sig['symbol']}"
-                               f"&interval=1m&limit=3")
-                        try:
-                            async with session.get(url) as resp:
-                                if resp.status != 200:
-                                    return False
-                                candles = await resp.json()
-                        except Exception:
-                            return False
-                        if not isinstance(candles, list):
-                            return False
-                        for c in candles:
-                            try:
-                                open_ms = int(c[0])
-                                high = float(c[2])
-                                low = float(c[3])
-                            except (TypeError, ValueError, IndexError):
-                                continue
-                            if open_ms < sig.get('checked_ts', sig.get('ts', 0)) * 1000:
-                                continue
-                            if sig['side'] == 'LONG':
-                                hit_tp = high >= sig['tp']
-                                hit_sl = low <= sig['sl']
-                            else:
-                                hit_tp = low <= sig['tp']
-                                hit_sl = high >= sig['sl']
-                            if hit_tp and hit_sl:
-                                sig['status'] = 'loss'  # cùng nến: SL ưu tiên (khớp backtest)
-                            elif hit_tp:
-                                sig['status'] = 'win'
-                            elif hit_sl:
-                                sig['status'] = 'loss'
-                            else:
-                                continue
-                            sig['closed_ts'] = now
-                            return True
-                        return False
-
-                results = await asyncio.gather(*(resolve_signal(s) for s in open_signals), return_exceptions=True)
-                changed = sum(1 for r in results if r is True) > 0
-                for sig in open_signals:
-                    if sig['status'] == 'open' and now - sig.get('ts', 0) > SIGNAL_TIMEOUT_HOURS * 3600:
-                        sig['status'] = 'expired'
-                        sig['closed_ts'] = now
-                        changed = True
-                    # Mốc thời gian đã quét (memory-only; mất khi restart thì quét lại vô hại)
-                    sig['checked_ts'] = now
-                if changed:
-                    prune_signal_history()
-                    save_signal_history()
+            session = app['session']
+            sem = asyncio.Semaphore(8)
+            now = time.time()
+            async def track(sig):
+                async with sem:
+                    return await _track_paper_signal(session, sig, now)
+            pending = [s for s in signal_history if s.get('status') == 'open'
+                       and not s.get('execution')]
+            await asyncio.gather(*(track(s) for s in pending), return_exceptions=True)
+            # Cursor có thể tiến trước khi một request sau bị lỗi: vẫn persist tiến độ đã đọc.
+            if pending:
+                save_signal_history()
+            if await reconcile_execution_outcomes(session):
+                prune_signal_history()
+                save_signal_history()
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error(f"Lỗi trong signal_tracking_loop: {e}")
+        except Exception:
+            logger.error('Lỗi theo dõi kết quả; giữ nguyên trạng thái để đối soát lại.')
             await asyncio.sleep(30)
 
 
 def format_detailed_stats_text(days=SIGNAL_MAX_AGE_DAYS):
-    """Thống kê chi tiết & trung thực cho lệnh /stats: theo chiều, band, coin, mức AI chấm."""
+    """Tách rõ lệnh thật đã đối soát và kết quả tín hiệu giả lập theo nguồn."""
     cutoff = time.time() - days * 86400
-    sigs = [s for s in signal_history if s.get('ts', 0) >= cutoff
-            and s.get('confidence') in ('Mạnh', 'Rất mạnh')]
-    decided = [s for s in sigs if s.get('status') in ('win', 'loss')]
-    expired = [s for s in sigs if s.get('status') == 'expired']
-    if len(decided) + len(expired) < 10:
-        return ""
-    lines = [f"📊 *STATS {days} NGÀY (chỉ 4-5⭐)*", "----------------------------------"]
-    wins = sum(1 for s in decided if s['status'] == 'win')
-    if decided:
-        lines.append(f"🎯 Tổng: {wins}W/{len(decided) - wins}L "
-                     f"({wins / len(decided) * 100:.0f}%) + {len(expired)} hết hạn")
-    for side in ('LONG', 'SHORT'):
-        sub = [s for s in decided if s.get('side') == side]
-        if sub:
-            w = sum(1 for s in sub if s['status'] == 'win')
-            lines.append(f"{'🟢' if side == 'LONG' else '🔴'} {side}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
-    for band in ('Rất mạnh', 'Mạnh'):
-        sub = [s for s in decided if s.get('confidence') == band]
-        if sub:
-            w = sum(1 for s in sub if s['status'] == 'win')
-            stars = '⭐⭐⭐⭐⭐' if band == 'Rất mạnh' else '⭐⭐⭐⭐'
-            lines.append(f"{stars}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
-    # Theo coin (tối thiểu 3 lệnh decided) — 3 tốt nhất / 3 tệ nhất
-    sym_stats = {}
-    for s in decided:
-        st = sym_stats.setdefault(s['symbol'], {'win': 0, 'loss': 0})
-        st[s['status']] += 1
-    ranked = sorted(((sym, st['win'] / (st['win'] + st['loss']), st['win'] + st['loss'])
-                     for sym, st in sym_stats.items() if st['win'] + st['loss'] >= 3),
-                    key=lambda x: x[1])
-    if len(ranked) >= 3:
-        best = [f"{sym} {wr * 100:.0f}% ({n}l)" for sym, wr, n in ranked[-3:][::-1]]
-        worst = [f"{sym} {wr * 100:.0f}% ({n}l)" for sym, wr, n in ranked[:3]]
-        lines.append(f"🏆 Tốt nhất: {' | '.join(best)}")
-        lines.append(f"💀 Tệ nhất: {' | '.join(worst)}")
-    # Hiệu chuẩn AI: bucket nào AI phóng tay (thua thật dù chấm cao)
-    for bucket, lo, hi in (('AI < 5', 0, 5), ('AI 5-6', 5, 6), ('AI 6-7', 6, 7), ('AI ≥ 7', 7, 11)):
-        sub = [s for s in decided if s.get('ai_score') is not None and lo <= s['ai_score'] < hi]
-        if sub:
-            w = sum(1 for s in sub if s['status'] == 'win')
-            lines.append(f"🤖 {bucket}: {w}/{len(sub)} ({w / len(sub) * 100:.0f}%)")
-    if expired:
-        long_exp = sum(1 for s in expired if s.get('side') == 'LONG')
-        lines.append(f"⏰ Hết hạn: {long_exp} LONG / {len(expired) - long_exp} SHORT "
-                     f"(TP 1:1 chưa chạm trong {SIGNAL_TIMEOUT_HOURS}h)")
-    return "\n".join(lines)
+    recent = [s for s in signal_history if s.get('ts', 0) >= cutoff]
+    if not recent:
+        return ''
+    lines = [f"📊 *STATS {days} NGÀY*", 'Lệnh thật: PnL ròng sau commission/funding.']
+    for origin in sorted({s.get('origin', 'manual') for s in recent}):
+        group = [s for s in recent if s.get('origin', 'manual') == origin]
+        real = [s for s in group if _verified_execution(s)]
+        pending = sum(bool(s.get('execution')) and not _verified_execution(s) for s in group)
+        if real:
+            wins = sum(s['net_pnl'] > 1e-8 for s in real)
+            pnl = sum(s['net_pnl'] for s in real)
+            gains = sum(max(0, s['net_pnl']) for s in real)
+            losses = sum(max(0, -s['net_pnl']) for s in real)
+            pf = f'{gains / losses:.2f}' if losses else '—'
+            rs = [s['realized_r'] for s in real if s.get('realized_r') is not None]
+            ev = f'{sum(rs) / len(rs):+.3f}R' if rs else '—'
+            lines.append(f"• {origin}: {len(real)} lệnh, WR {wins / len(real) * 100:.1f}%, "
+                         f"net {pnl:+.2f} USDT, EV {ev}, PF {pf}")
+        if pending:
+            lines.append(f'• {origin}: {pending} lệnh đang mở/chờ đối soát, chưa tính WR.')
+        paper = [s for s in group if not s.get('execution')]
+        if paper:
+            wins = sum(s.get('status') == 'win' for s in paper)
+            losses = sum(s.get('status') == 'loss' for s in paper)
+            expired = sum(s.get('status') == 'expired' for s in paper)
+            lines.append(f'• {origin} [GIẢ LẬP, không phải PnL]: {wins}W/{losses}L, {expired} hết hạn.')
+    candidates = [s for s in recent if s.get('origin') == 'candidate'
+                  and s.get('status') in ('win', 'loss')]
+    if candidates:
+        accepted = [s for s in candidates if s.get('ai_gate_passed') is True]
+        lines.append(f"So sánh GIẢ LẬP cùng tập ứng viên: rule {sum(s['status'] == 'win' for s in candidates)}/{len(candidates)} thắng; "
+                     f"AI giữ {sum(s['status'] == 'win' for s in accepted)}/{len(accepted)} thắng. "
+                     'Chưa trừ phí; không phải bằng chứng EV hoặc xác suất điểm AI.')
+    return '\n'.join(lines)
 
 
 async def handle_stats_command(session, chat_id):
     """Lệnh /stats: thống kê chi tiết win-rate thực tế 30 ngày."""
     text = format_detailed_stats_text()
     if not text:
-        await send_telegram_message(session, chat_id, "ℹ️ Chưa đủ dữ liệu tín hiệu (cần ≥10 lệnh 4-5⭐ trong 30 ngày).")
+        await send_telegram_message(session, chat_id, "ℹ️ Chưa có dữ liệu tín hiệu hoặc lệnh thật trong 30 ngày.")
         return
     await send_telegram_message(session, chat_id, text)
 
@@ -502,10 +617,21 @@ async def handle_trail_command(session, chat_id, coin_name, action_str=None):
     real_qty = abs(amount)
     close_side = 'SELL' if side == 'LONG' else 'BUY'
 
-    # Thay SL cũ (nếu có) bằng SL 1.5×ATR; KHÔNG đụng TP người dùng đã đặt
-    await cancel_existing_tpsl(session, api_key, api_secret, symbol,
-                               position_side=(None if pos_side == 'BOTH' else pos_side),
-                               cancel_tp=False, cancel_sl=True)
+    # Đặt bảo vệ mới trước; không hủy SL đang bảo vệ nếu API đặt mới thất bại.
+    old_orders, old_err = await binance_signed_request(session, 'GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol})
+    if old_err or not isinstance(old_orders, list):
+        await send_telegram_message(session, chat_id, '⚠️ Không đối soát được SL hiện tại; giữ nguyên bảo vệ.')
+        return
+    old_stops = [o for o in old_orders
+                 if (o.get('orderType') or o.get('type')) == 'STOP_MARKET'
+                 and o.get('positionSide', 'BOTH') == pos_side and o.get('side') == close_side]
+    for stop in old_stops:
+        trigger = float(stop.get('triggerPrice', 0) or 0)
+        if trigger > 0:
+            sl_price = max(sl_price, trigger) if side == 'LONG' else min(sl_price, trigger)
+    if (side == 'LONG' and sl_price >= mark) or (side == 'SHORT' and sl_price <= mark):
+        await send_telegram_message(session, chat_id, '⚠️ SL đã vượt giá mark; không thay bảo vệ hiện tại.')
+        return
     ok, info = await _place_conditional_tpsl(session, symbol, close_side, 'STOP_MARKET',
                                              f"{sl_price:.{price_p}f}",
                                              f"{real_qty:.{qty_p}f}",
@@ -514,7 +640,13 @@ async def handle_trail_command(session, chat_id, coin_name, action_str=None):
         await send_telegram_message(session, chat_id, f"❌ Không đặt được SL: {info}")
         return
 
-    algo_id = info if isinstance(info, str) and str(info).isdigit() else None
+    algo_id = str(info) if info is not None and str(info).isdigit() else None
+    if not algo_id:
+        await send_telegram_message(session, chat_id, '⚠️ Chưa xác nhận được ID SL mới; giữ SL cũ.')
+        return
+    for stop in old_stops:
+        if str(stop.get('algoId')) != algo_id:
+            await _cancel_algo_sl(session, api_key, api_secret, symbol, stop.get('algoId'))
     pos_key = f"{symbol}_{pos_side}"
     auto_managed[pos_key] = {
         'symbol': symbol, 'side': side, 'origin': 'manual',
@@ -729,18 +861,18 @@ async def get_ai_analysis(session, digest, lessons=None):
 def get_symbol_history_text(symbol, limit=6):
     """Lịch sử kết quả các lần hệ thống từng đề xuất symbol — để AI 'nhớ' coin đó khi phân tích lại."""
     past = [s for s in signal_history
-            if s.get('symbol') == symbol and s.get('status') in ('win', 'loss', 'expired')]
+            if s.get('symbol') == symbol and _verified_execution(s)]
     if not past:
         return None
     wins = sum(1 for s in past if s['status'] == 'win')
-    lines = [f"📌 *{symbol}: hệ thống từng đề xuất {len(past)} lần, {wins} win / {len(past) - wins} loss/expired:*"]
+    lines = [f"📌 *{symbol}: {len(past)} lệnh thật đã đối soát, {wins} thắng; net {sum(s['net_pnl'] for s in past):+.2f} USDT:*"]
     for s in past[-limit:]:
         age_h = int((time.time() - s.get('ts', 0)) // 3600)
         age_txt = f"{age_h}h" if age_h < 24 else f"{age_h // 24}d"
         ai_sc = f" (AI chấm {s['ai_score']:.1f})" if s.get('ai_score') is not None else ""
         lines.append(
             f"  · {s.get('side')} entry {format_price(s.get('entry'))} TP {format_price(s.get('tp'))} "
-            f"SL {format_price(s.get('sl'))} → *{s['status']}*{ai_sc} ({age_txt} trước)"
+            f"SL {format_price(s.get('sl'))} → *{s['status']}*, net {s['net_pnl']:+.2f} USDT{ai_sc} ({age_txt} trước)"
         )
     lines.append("  → Rút kinh nghiệm từ kết quả này khi đánh giá lần này.")
     return "\n".join(lines)
@@ -796,8 +928,8 @@ def build_ai_digest(symbol, timeframe_results, oi_change=None, taker_ratio=None,
         if 'vwap' in res and not math.isnan(res['vwap']):
             vwap_dev = (c - res['vwap']) / c * 100
             extra_ta.append(f"VWAP {'trên' if vwap_dev > 0 else 'dưới'} {abs(vwap_dev):.1f}%")
-        if 'macd' in res and 'macd_signal' in res:
-            extra_ta.append(f"MACD {res['macd']:+.5g}/sig {res['macd_signal']:+.5g}")
+        if 'macd' in res and 'signal_line' in res:
+            extra_ta.append(f"MACD {res['macd']:+.5g}/sig {res['signal_line']:+.5g}")
         if 'upper_band' in res and 'lower_band' in res and res['upper_band'] > 0:
             extra_ta.append(f"BB {format_price(res['lower_band'])}-{format_price(res['upper_band'])}")
         if res.get('price_change_24') is not None:
@@ -839,12 +971,13 @@ async def get_ai_verdict_cached(session, cache_key, digest):
     """Gọi AI có cache TTL 10 phút để tiết kiệm usage.
     Key cache gắn thêm hash digest: digest đổi (giá/điểm mới) → verdict mới, không dùng kết luận cũ."""
     now = time.time()
-    digest_hash = hashlib.md5(digest.encode('utf-8')).hexdigest()[:8]
+    lessons = await get_ai_lessons(session)
+    model = os.getenv('DASH_MODEL', 'claude-sonnet-5')
+    digest_hash = hashlib.sha256(f'{model}\n{lessons}\n{digest}'.encode('utf-8')).hexdigest()
     full_key = f"{cache_key}_{digest_hash}"
     cached = ai_verdict_cache.get(full_key)
     if cached and now - cached['ts'] < AI_CACHE_TTL:
         return cached['verdict']
-    lessons = await get_ai_lessons(session)
     verdict = await get_ai_analysis(session, digest, lessons=lessons)
     if verdict:
         ai_verdict_cache[full_key] = {'verdict': verdict, 'ts': now}
@@ -861,18 +994,19 @@ ai_lessons_state = {'text': None, 'ts': 0, 'resolved_count': -1}
 ai_lessons_lock = asyncio.Lock()
 
 def build_signal_lessons_digest():
-    """Dựng digest từ lịch sử tín hiệu đã kết thúc (win/loss) để AI rút bài học.
-    Chỉ dùng tín hiệu 4-5 sao (Mạnh/Rất mạnh) — đúng population quét/auto,
-    tránh tín hiệu 1-3⭐ từ /a <coin> hay /ai chat làm sai lệch bài học."""
-    resolved = [s for s in signal_history
-                if s.get('status') in ('win', 'loss')
-                and s.get('confidence') in ('Mạnh', 'Rất mạnh')]
+    """Bài học theo lệnh auto đã đối soát của cùng model/phiên bản phân tích."""
+    cutoff = time.time() - SIGNAL_MAX_AGE_DAYS * 86400
+    resolved = [s for s in signal_history if _verified_execution(s)
+                and s.get('origin') == 'auto' and s.get('ts', 0) >= cutoff
+                and s.get('model') == os.getenv('DASH_MODEL', 'claude-sonnet-5')
+                and s.get('analysis_version') == 2]
     if len(resolved) < 5:
         return None
     wins = sum(1 for s in resolved if s['status'] == 'win')
     lines = [
-        f"Thống kê {len(resolved)} tín hiệu gần nhất của hệ thống (TP chạm trước = win, SL chạm trước = loss):",
-        f"- Tổng: {wins} win / {len(resolved) - wins} loss ({wins / len(resolved) * 100:.0f}%)"
+        f"Thống kê {len(resolved)} lệnh auto đã đối soát; win/loss theo PnL ròng sau phí/funding:",
+        f"- {wins} win / {len(resolved)} lệnh (bao gồm hòa vốn), net {sum(s['net_pnl'] for s in resolved):+.2f} USDT",
+        "- Đây là mẫu lệnh đã chọn, không chứng minh điểm AI là xác suất thắng hay AI tốt hơn rule-only."
     ]
     for side in ('LONG', 'SHORT'):
         sub = [s for s in resolved if s.get('side') == side]
@@ -896,12 +1030,11 @@ def build_signal_lessons_digest():
         ai_note = f", AI nhận định lúc đó: {s.get('ai')}" if s.get('ai') else ", AI lúc đó: không có"
         ai_sc = f" (AI chấm {s['ai_score']:.1f})" if s.get('ai_score') is not None else ""
         lines.append(
-            f"  · {s['symbol']} {s['side']} ({s.get('confidence')}, điểm {s.get('score', 0):.1f}{ai_sc}) -> {s['status']}{ai_note}"
+            f"  · {s['symbol']} {s['side']} ({s.get('confidence')}, điểm {s.get('score', 0):.1f}{ai_sc}) -> {s['status']}, net {s['net_pnl']:+.2f} USDT{ai_note}"
         )
     lines.append(
-        "Hãy rút ra 3-5 bài học ngắn gọn về pattern nào đang hiệu quả/kém hiệu quả (side, band điểm, mức điểm AI nào "
-        "thắng thật hay chỉ 'ảo'), và DÙNG ĐIỂM NÀY ĐỂ HIỆU CHUẨN thang điểm của bạn cho những lần chấm sau — "
-        "nếu nhóm điểm cao của bạn thắng ít thì lần sau phải siết chặt hơn (đừng phóng tay). Trả lời bằng tiếng Việt, "
+        "Hãy tóm tắt 3-5 quan sát về rủi ro, nêu cỡ mẫu và độ bất định. Không suy ra quan hệ nhân quả "
+        "hoặc xác suất thắng từ điểm tự chấm; không tự đề xuất đổi ngưỡng từ mẫu nhỏ. Trả lời bằng tiếng Việt, "
         "không dùng ký tự markdown (*, _, `). Chỉ trả lời bằng MỘT JSON hợp lệ: {\"lessons\": [\"gạch đầu dòng, mỗi dòng dưới 200 ký tự\"]}"
     )
     return "\n".join(lines)
@@ -910,18 +1043,18 @@ def build_signal_lessons_digest():
 async def get_ai_lessons(session, force=False):
     """Bài học AI rút từ lịch sử tín hiệu. Cache 12h, chỉ refresh khi có tín hiệu mới kết thúc.
     force=True → bỏ qua cache, ép AI đánh giá lại ngay (dùng cho lệnh thủ công)."""
-    resolved_count = sum(1 for s in signal_history if s.get('status') in ('win', 'loss'))
     st = ai_lessons_state
-    if not force and st['text'] and resolved_count == st['resolved_count'] and time.time() - st['ts'] < AI_LESSONS_TTL:
-        return st['text']
     async with ai_lessons_lock:
-        resolved_count = sum(1 for s in signal_history if s.get('status') in ('win', 'loss'))
-        if not force and st['text'] and resolved_count == st['resolved_count'] and time.time() - st['ts'] < AI_LESSONS_TTL:
-            return st['text']
         digest = build_signal_lessons_digest()
-        if not digest or not os.getenv("DASH_TOKEN"):
+        if not digest or not os.getenv('DASH_TOKEN'):
+            st.update(text=None, ts=0, resolved_count=-1)
+            return None
+        model = os.getenv('DASH_MODEL', 'claude-sonnet-5')
+        evidence_key = hashlib.sha256(f'{model}\n{digest}'.encode('utf-8')).hexdigest()
+        if (not force and st['text'] and st.get('evidence_key') == evidence_key
+                and time.time() - st['ts'] < AI_LESSONS_TTL):
             return st['text']
-        model = os.getenv("DASH_MODEL", "claude-sonnet-5")
+        st['text'] = None
         url = f"{MINTROUTER_BASE_URL}/chat/completions"
         headers = _ai_headers(os.getenv('DASH_TOKEN'))
         payload = {
@@ -943,7 +1076,7 @@ async def get_ai_lessons(session, force=False):
                     if lessons and isinstance(lessons.get('lessons'), list) and lessons['lessons']:
                         st['text'] = "\n".join(f"- {str(x).strip()[:200]}" for x in lessons['lessons'][:5])
                         st['ts'] = time.time()
-                        st['resolved_count'] = resolved_count
+                        st['evidence_key'] = evidence_key
                         logger.info("Đã cập nhật bài học AI từ lịch sử tín hiệu.")
         except Exception as e:
             logger.warning(f"Lỗi gọi AI lessons: {e}")
@@ -2588,11 +2721,7 @@ STATUS_LABEL = {
 
 
 async def handle_kq_command(session, chat_id, filter_arg=None):
-    """Lệnh /kq: thống kê các lệnh đã vào THEO AI (auto/ai/alert) và thắng hay thua.
-    /kq            → 20 lệnh gần nhất theo AI
-    /kq auto       → chỉ lệnh AI TỰ vào
-    /kq thua       → chỉ lệnh thua
-    /kq thang      → chỉ lệnh thắng"""
+    """Lệnh /kq: chỉ lệnh thật có order ID; cảnh báo/giả lập xem riêng qua /stats."""
     fl = (filter_arg or '').strip().lower()
     want_status = None
     want_origin = None
@@ -2610,7 +2739,7 @@ async def handle_kq_command(session, chat_id, filter_arg=None):
         want_origin = 'alert'
 
     pool = [s for s in signal_history
-            if s.get('origin') in ORIGIN_LABEL
+            if s.get('execution') and s.get('origin') in ORIGIN_LABEL
             and (want_status is None or s.get('status') == want_status)
             and (want_origin is None or s.get('origin') == want_origin)]
     pool.sort(key=lambda s: s.get('ts', 0), reverse=True)
@@ -2629,14 +2758,15 @@ async def handle_kq_command(session, chat_id, filter_arg=None):
             f"{t_str} {disp} {s['side']} @{format_price(s.get('entry', 0))} "
             f"{ORIGIN_LABEL.get(s.get('origin'), '')} → {STATUS_LABEL.get(s.get('status'), s.get('status'))} "
             f"(điểm {s.get('score', 0):.1f}{ai_sc})"
+            + (f", net {s['net_pnl']:+.2f} USDT" if _verified_execution(s) else ', chờ đối soát PnL')
         )
     # Tổng kết cả pool (không chỉ 20 lệnh hiển thị)
-    cnt = {'win': 0, 'loss': 0, 'expired': 0, 'open': 0}
+    cnt = {'win': 0, 'loss': 0, 'be': 0, 'expired': 0, 'open': 0}
     for s in pool:
         st = s.get('status')
         if st in cnt:
             cnt[st] += 1
-    decided = cnt['win'] + cnt['loss']
+    decided = cnt['win'] + cnt['loss'] + cnt['be']
     total_n = len(pool)
     wr_txt = f"{cnt['win']}/{decided} ({cnt['win'] / decided * 100:.0f}%)" if decided else "—"
     lines.append("----------------------------------")
@@ -3078,10 +3208,10 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
     df['atr'] = true_range.ewm(span=14, adjust=False).mean()
     
     # ─── 7. ADX (14) ───
-    plus_dm = df['high'].diff()
-    minus_dm = -df['low'].diff()
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    up_move = df['high'].diff()
+    down_move = -df['low'].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
     atr_14 = df['atr']
     plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean() / (atr_14 + 1e-10))
     minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean() / (atr_14 + 1e-10))
@@ -3371,8 +3501,7 @@ async def analyze_market(session, symbol, interval='1h', df=None, fetch_extras=T
     # ═══ TÍNH TP/SL DỰA TRÊN ATR ═══
     tp_price = 0.0
     sl_price = 0.0
-    # RR 1:1 được backtest 571 tín hiệu (10 coin × 2000 nến 1h) xác nhận là cấu hình
-    # có edge dương duy nhất: win-rate 54.9%, EV +0.10R (RR 1:2 chỉ còn 30.7%, EV âm)
+    # Giữ RR hiện có; hiệu quả phải đo lại với simulator có phí và expiry MTM.
     rr_ratio = 1.0
     
     # Lấy thông tin làm tròn
@@ -3581,7 +3710,7 @@ async def scan_market_signals(session):
     for symbol, res_1h in potential_res_1h.items():
         res_4h = results_4h_map.get(symbol)
         res_1d = results_1d_map.get(symbol)
-        mtf_pass = True
+        mtf_pass = res_4h is not None and res_1d is not None
         
         if res_4h:
             close_4h = res_4h['close']
@@ -3655,6 +3784,7 @@ async def scan_market_signals(session):
                                           [("15m", res_15m), ("1h", res), ("4h", res.get('res_4h')), ("1d", res.get('res_1d'))],
                                           oi_change=res.get('oi_change'), taker_ratio=res.get('taker_ratio'),
                                           funding_rate=res.get('funding_rate'), orderbook=ob, btc_dominance=dom)
+                res['ai_input'] = digest
                 verdict = await get_ai_verdict_cached(session, f"ai_{res['symbol']}", digest)
             res['ai'] = verdict
             return res
@@ -3672,9 +3802,12 @@ async def scan_market_signals(session):
             margin = (ai_score - opp_ai) if (ai_score is not None and opp_ai is not None) else None
             # Fallback rule-only nếu AI lỗi/không trả lời; gate chặt khi AI có kết luận độc lập:
             # cùng chiều + AI chấm ≥ 4.5 + cách biệt với chiều ngược ≥ 1.0 (tránh tín hiệu lưng chừng)
-            if verdict is None or (verdict.get('direction') == r['signal']
-                                   and (ai_score is None or ai_score >= 4.5)
-                                   and (margin is None or margin >= 1.0)):
+            passed = (verdict is not None and verdict.get('direction') == r['signal']
+                      and ai_score is not None and ai_score >= 4.5
+                      and margin is not None and margin >= 1.0)
+            r['ai_gate_passed'] = passed
+            record_signal(r, verdict, origin='candidate')
+            if verdict is None or passed:
                 if r['signal'] == 'LONG':
                     long_signals.append(r)
                 else:
@@ -3686,7 +3819,7 @@ async def scan_market_signals(session):
                     logger.info(f"AI gate loại bỏ tín hiệu {r['signal']} của {r['symbol']} "
                                 f"(AI chấm {ai_score:.1f} vs ngược {opp_ai:.1f}, cách biệt < 1.0)")
                 else:
-                    logger.info(f"AI gate loại bỏ tín hiệu {r['signal']} của {r['symbol']} (AI tự chấm {ai_score:.1f} < 4.5)")
+                    logger.info(f"AI gate loại bỏ tín hiệu {r['signal']} của {r['symbol']} (điểm AI thiếu hoặc dưới ngưỡng)")
         long_signals.sort(key=lambda x: x['long_score'], reverse=True)
         short_signals.sort(key=lambda x: x['short_score'], reverse=True)
     
@@ -4565,42 +4698,21 @@ async def handle_scan_history_command(session, chat_id):
     )
 
 
-def _clamp_stop_for_liquidation(is_long, entry_price, stop_price, max_lev):
-    """Giới hạn SL nằm trong vùng an toàn TRƯỚC thanh lý (chỉ dùng 50% khoảng cách tới thanh lý).
-    Trả về (stop_price_đã_clamp, có_clamp_hay_không). SL từ tín hiệu quét có thể xa hơn thanh lý khi đòn bẩy cao."""
-    try:
-        entry_price = float(entry_price)
-        stop_price = float(stop_price)
-        max_lev = float(max_lev)
-    except (TypeError, ValueError):
-        return stop_price, False
-    if entry_price <= 0 or stop_price <= 0 or max_lev <= 1:
-        return stop_price, False
-    safe_dist = (0.5 / max_lev) * entry_price
-    if is_long:
-        safe_sl = entry_price - safe_dist
-        if stop_price < safe_sl:
-            return safe_sl, True
-    else:
-        safe_sl = entry_price + safe_dist
-        if stop_price > safe_sl:
-            return safe_sl, True
-    return stop_price, False
-
-
 def _safe_leverage_for_sl(entry_price, sl_price, max_lev):
-    """Chọn đòn bẩy tối đa để SL gốc vẫn nằm trong vùng an toàn trước thanh lý.
+    """Chọn đòn bẩy vừa đủ để SL gốc nằm trong vùng an toàn trước thanh lý (KHÔNG kéo SL).
     Hàm clamp dùng `safe_dist = 0.5/lev × entry`, nên lev cao → safe_dist nhỏ → SL bị kéo sát entry.
     Trả về đòn bẩy phù hợp (≥ 1, ≤ max_lev) để khoảng cách SL gốc không bị clamp."""
     try:
         entry_price = float(entry_price)
         sl_price = float(sl_price)
-        max_lev = float(max_lev)
+        max_lev = float(max_lev or 0)
     except (TypeError, ValueError):
-        return int(max_lev) if max_lev > 0 else 20
+        return 1
+    if max_lev <= 0:
+        return 1
     sl_dist = abs(entry_price - sl_price)
     if entry_price <= 0 or sl_dist <= 0 or max_lev <= 1:
-        return int(max_lev)
+        return max(1, int(max_lev))
     # Cần: 0.5/lev × entry >= sl_dist  →  lev <= 0.5 × entry / sl_dist
     lev = int(0.5 * entry_price / sl_dist)
     return max(1, min(int(max_lev), lev))
@@ -4608,14 +4720,15 @@ def _safe_leverage_for_sl(entry_price, sl_price, max_lev):
 
 # ─── AI tự động vào lệnh mỗi 5 giờ ───
 AI_AUTO_TRADER_INTERVAL = 5 * 3600
-AI_AUTO_MIN_SCORE = 5.0  # Chỉ tự vào lệnh khi tín hiệu 4-5 sao + điểm ≥ ngưỡng này (backtest: band 5.0-6.0 thắng 55.6%, band ≥6.0 chỉ 45.5%)
+# LƯU Ý: các ngưỡng dưới đây là GIÁ TRỊ LEGACY — hiệu chỉnh bằng simulator cũ (đã phát hiện
+# thiên lệch look-ahead/exit), CHƯA được chứng minh lại bằng backtest đúng. Giữ nguyên giá trị,
+# chỉ dùng như rào chắn thận trọng cho tới khi có kết quả backtest corrected/full-strategy.
+AI_AUTO_MIN_SCORE = 5.0  # Điểm hệ thống tối thiểu mới tự vào lệnh
 AI_AUTO_AI_MIN_SCORE = 5.0  # AI tự chấm chiều tín hiệu phải ≥ ngưỡng này (điểm AI độc lập, không thể thiếu)
-# SHORT bị siết chặt hơn LONG theo bằng chứng backtest (6 coin × 2000 nến 1h):
-#   LONG thắng 70% (28/40 quyết định), SHORT chỉ 37.5% (12/32) → SHORT có edge âm ở RR 1:1.
-# → SHORT cần điểm hệ thống & AI tự chấm CAO HƠN hẳn LONG, cộng bộ lọc side dựa trên win-rate thực tế.
-AI_AUTO_SHORT_MIN_SCORE = 5.5      # SHORT hệ thống phải ≥ 5.5 (5.0-5.5 SHORT thắng dưới 40%)
-AI_AUTO_SHORT_AI_MIN_SCORE = 6.0   # SHORT phải có AI tự chấm ≥ 6.0 (rất tự tin) mới đủ sức thắng edge âm
-AI_AUTO_SIDE_MIN_SAMPLES = 12      # Số lệnh kết thúc tối thiểu để bộ lọc side có hiệu lực (5 mẫu quá nhỏ, dễ chặn nhầm)
+# SHORT bị siết chặt hơn LONG theo số liệu LEGACY (simulator cũ, chưa tái kiểm chứng) — giữ để thận trọng.
+AI_AUTO_SHORT_MIN_SCORE = 5.5      # SHORT hệ thống phải ≥ ngưỡng này
+AI_AUTO_SHORT_AI_MIN_SCORE = 6.0   # SHORT phải có AI tự chấm ≥ ngưỡng này
+AI_AUTO_SIDE_MIN_SAMPLES = 12      # Số lệnh kết thúc tối thiểu để bộ lọc side có hiệu lực (mẫu nhỏ dễ chặn nhầm)
 AI_AUTO_SIDE_MIN_WR = 0.5          # Win-rate tối thiểu của 1 side; dưới mức này → chặn side đó tự vào lệnh
 
 # ─── Rào chắn an toàn cho tự động hoá (giúp AI tự trade nhiều mà không liều) ───
@@ -4629,28 +4742,59 @@ AUTO_STATE = {'circuit_break_until': 0.0, 'last_notify': 0.0}
 AUTO_MAX_FUNDING = 0.001          # Funding cực đoan (≥ 0.1%/h) theo hướng đám đông → bỏ qua (nguy cơ đảo chiều)
 AUTO_MAX_SLIP_PCT = 0.005         # Giá hiện tại cách close lúc quét > 0.5% → tín hiệu đã cũ, bỏ qua
 
+# ─── Ngân sách rủi ro dùng chung cho MỌI lệnh thật (auto 5h + AI /ai) ───
+# Trước đây mỗi lệnh auto được phép lỗ tới 20% số dư khả dụng — lớn hơn cả hạn lỗ ngày
+# (AUTO_DAILY_MAX_LOSS) nên chỉ 1 lệnh thua là đã vượt trần ngày. Nay size tính từ RỦI RO:
+AUTO_RISK_PER_TRADE_PCT = 0.005   # rủi ro tối đa 1 lệnh = 0.5% equity (equity = totalMarginBalance)
+AUTO_RISK_PORTFOLIO_PCT = 0.015   # tổng rủi ro đang mở của cả danh mục ≤ 1.5% equity
+AUTO_MARGIN_MAX_PCT = 0.25        # margin 1 lệnh ≤ 25% số dư KHẢ DỤNG (available)
+AUTO_TRADE_COST_PCT = 0.0015      # đệm phí+trượt giá khi tính size (0.05% phí ×2 chiều + đệm trượt)
+_ENTRY_LOCK = None                # khoá tuần tự hoá lệnh MỞ thật (xem _entry_lock())
+_SYMBOL_FILTERS = {}              # symbol -> {'step', 'min_qty', 'min_notional'} từ exchangeInfo
+_SYMBOL_FILTERS_TS = 0.0
+
+# ─── Cổng rollout cho lệnh auto THẬT ───
+# Backtest corrected (6 coin × 2000 nến 1h, có phí/trượt/funding, SL-first, expiry MTM):
+#   TRAIN n=116: EV -0.208R / PF 0.66 ; TEST n=57: EV -0.054R / PF 0.90 → EV ÂM ở cả hai tập.
+# Vì vậy auto vào lệnh thật MẶC ĐỊNH TẮT; chỉ bật khi người vận hành đặt AUTO_TRADE_ENABLED=true
+# sau khi có bằng chứng EV dương. KHÔNG tự bật lại trong code.
+AUTO_TRADE_ENABLED = os.getenv('AUTO_TRADE_ENABLED', 'false').strip().lower() == 'true'
+AUTO_TRADE_OFF_REASON = (
+    "auto vào lệnh thật đang TẮT (AUTO_TRADE_ENABLED != true): backtest corrected cho EV âm ở cả "
+    "TRAIN (-0.208R, PF 0.66) và TEST (-0.054R, PF 0.90) — chỉ bật khi có bằng chứng EV dương."
+)
+
+
+def _auto_trade_enabled():
+    """Cổng bật lệnh auto thật. Đọc env tại thời điểm kiểm tra vì .env chỉ được nạp trong main()
+    (sau khi module đã import), mặc định lấy hằng số AUTO_TRADE_ENABLED."""
+    raw = os.getenv('AUTO_TRADE_ENABLED')
+    if raw is None:
+        return AUTO_TRADE_ENABLED
+    return raw.strip().lower() == 'true'
+
 # ─── Trailing stop + breakeven cho vị thế AI tự mở ───
-# Ngưỡng được hiệu chỉnh từ backtest (6 coin × 2000 nến 1h, sau khi nâng ngưỡng tín hiệu ≥ 5.0):
-#   Baseline: EV +0.09R / PF 1.29 / MaxDD 9.0R
-#   Trail 0.8R + cancel TP (tốt nhất): EV +0.10R / PF 1.33 / MaxDD 8.5R
-# Breakeven bị TẮT (0.0): với tín hiệu ≥5.0, BE cắt bớt lệnh thắng → EV thấp hơn baseline.
-AUTO_BE_RR = 0.0                  # Tắt breakeven (số liệu backtest không ủng hộ khi tín hiệu ≥ 5.0)
+# Ngưỡng dưới đây là GIÁ TRỊ LEGACY (hiệu chỉnh bằng simulator cũ đã phát hiện thiên lệch),
+# CHƯA được tái kiểm chứng bằng backtest corrected/full-strategy — giữ nguyên, không suy diễn thêm.
+AUTO_BE_RR = 0.0                  # Tắt breakeven (legacy: bật BE bị cho là cắt lệnh thắng — chưa tái kiểm chứng)
 AUTO_TRAIL_START_RR = 0.8         # Đạt +0.8R → bắt đầu trailing stop
 AUTO_TRAIL_ATR_MULT = 1.0         # SL trailing cách giá hiện tại 1.0×ATR
 AUTO_CANCEL_TP_ON_TRAIL = True    # Khi trailing kích hoạt → bỏ TP cố định, để lời chạy theo trailing
 AUTO_TRAIL_MIN_RR = 0.25          # Chỉ cập nhật SL khi cải thiện ≥ 0.25R (tránh spam API)
 AUTO_TRAIL_CHECK_SEC = 30         # Chu kỳ kiểm tra (giây)
 
-# ─── Chốt lời một phần (partial TP) cho vị thế auto — backtest xác nhận EV/R tăng ───
-# Sweep (6 coin × 2000 nến 1h): partial 1.5R (50%) EV +0.11 / PF 1.39 / MaxDD 5.94R
-# so với 2.0R: EV +0.11 / PF 1.36 / MaxDD 6.19R → 1.5R chốt sớm hơn, drawdown thấp hơn.
+# ─── Chốt lời một phần (partial TP) cho vị thế auto ───
+# Giá trị LEGACY (sweep bằng simulator cũ, chưa tái kiểm chứng) — giữ nguyên ngưỡng.
 AUTO_PARTIAL_TP_RR = 1.5          # Đạt +1.5R → chốt 50% khối lượng, phần còn lại chạy tiếp
 AUTO_PARTIAL_TP_PCT = 0.5         # Tỷ lệ chốt sớm
-AUTO_MAX_HOLD_HOURS = 72          # Vị thế auto mở quá 72h (khớp MAX_HOLD_BARS của backtest) → đóng thị trường
+AUTO_MAX_HOLD_HOURS = 72          # Vị thế auto mở quá 72h → đóng thị trường (khớp MAX_HOLD_BARS của backtest cũ)
 
 AUTO_MANAGED_FILE = "auto_managed_trading.json"
 
-auto_managed = {}   # position_key -> meta lệnh AI tự mở để trailing: symbol, side, entry, sl_initial, risk, atr, qty, pos_side, sl_algo_id, tp_algo_id, last_sl, ts
+# position_key -> meta lệnh đã vào thật: symbol, side, entry, sl_initial, risk, atr, qty, pos_side,
+# sl_algo_id, tp_algo_id, last_sl, ts, signal_id, managed (False = vị thế /ai, không trailing),
+# close_pending (đang chờ đóng lại cho tới khi hết vị thế), stale_sl_ids, be_arm, partial_done.
+auto_managed = {}
 
 # ─── Setup mặc định cho lệnh thủ công (/long, /short) ───
 # Người dùng yêu cầu TẮT tự động đặt TP/SL khi vào lệnh thủ công: /l và /s chỉ đặt
@@ -4687,7 +4831,9 @@ def _count_auto_open_positions():
     """Số vị thế AI TỰ vào đang mở (đếm theo auto_managed — chỉ lệnh loop 5h tự mở,
     KHÔNG tính lệnh người dùng đặt tay hay nhờ AI /ai đặt)."""
     cnt = 0
-    for key in auto_managed:
+    for key, meta in auto_managed.items():
+        if not meta.get('managed', True):
+            continue  # vị thế do /ai đặt: không tính vào hạn mức tự động
         pos = positions.get(key)
         if pos and float(pos.get('positionAmt', 0) or 0) != 0:
             cnt += 1
@@ -5068,15 +5214,20 @@ async def ai_review_loop(app):
 
 
 async def _auto_trade_guard(session):
-    """Kiểm tra an toàn trước khi tự vào lệnh. Trả về (ok: bool, reason: str)."""
+    """Kiểm tra an toàn trước khi tự vào lệnh. Trả về (ok: bool, reason: str).
+    Mọi lỗi đọc dữ liệu tài khoản/rủi ro ⇒ chặn (fail closed)."""
+    # 0. Cổng rollout: chưa có bằng chứng EV dương ⇒ KHÔNG tự vào lệnh thật
+    if not _auto_trade_enabled():
+        return False, AUTO_TRADE_OFF_REASON
     now = time.time()
     if now < AUTO_STATE.get('circuit_break_until', 0):
         left_min = int((AUTO_STATE['circuit_break_until'] - now) // 60)
         return False, f"đang tạm nghỉ (thua {AUTO_MAX_CONSEC_LOSSES} lệnh liên tiếp), còn ~{left_min}p."
-    # 1. Chuỗi thua liên tiếp từ các lệnh auto đã kết thúc
+    # 1. Chuỗi thua liên tiếp — CHỈ tính lệnh THẬT đã đối soát (execution + net_pnl).
     resolved = sorted([s for s in signal_history
-                       if s.get('origin') == 'auto' and s.get('status') in ('win', 'loss')],
-                      key=lambda s: s.get('ts', 0), reverse=True)
+                       if s.get('origin') == 'auto' and _verified_execution(s)
+                       and s.get('status') in ('win', 'loss')],
+                      key=lambda s: s.get('closed_ts', s.get('ts', 0)), reverse=True)
     streak = 0
     for s in resolved:
         if s['status'] == 'loss':
@@ -5084,17 +5235,29 @@ async def _auto_trade_guard(session):
         else:
             break
     if streak >= AUTO_MAX_CONSEC_LOSSES:
-        AUTO_STATE['circuit_break_until'] = now + AUTO_CIRCUIT_BREAK_HOURS * 3600
-        return False, f"thua {streak} lệnh auto liên tiếp — nghỉ {AUTO_CIRCUIT_BREAK_HOURS}h."
-    # 2. Giới hạn lỗ trong ngày (income hôm nay theo UTC)
-    day_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-    recs, err = await fetch_income_paginated(session, start_ms=day_start)
-    if err is None and recs:
-        day_pnl = sum(float(r.get('income', 0)) for r in recs
-                      if r.get('incomeType') in ('REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION'))
-        if day_pnl < -AUTO_DAILY_MAX_LOSS:
-            return False, f"lỗ hôm nay {day_pnl:+.1f} USDT đã vượt ngưỡng {AUTO_DAILY_MAX_LOSS:g} — nghỉ tới hết ngày."
-    # 3. Giới hạn số vị thế AI TỰ vào (không tính lệnh user đặt tay / nhờ /ai đặt)
+        newest_loss_ts = resolved[0].get('closed_ts', resolved[0].get('ts', 0))
+        # KHÔNG tự gia hạn vô hạn trên cùng chuỗi thua cũ: chỉ khoá lại khi có lệnh thua MỚI.
+        if newest_loss_ts > AUTO_STATE.get('circuit_break_loss_ts', 0):
+            AUTO_STATE['circuit_break_loss_ts'] = newest_loss_ts
+            AUTO_STATE['circuit_break_until'] = now + AUTO_CIRCUIT_BREAK_HOURS * 3600
+            _save_auto_state()
+            return False, f"thua {streak} lệnh auto liên tiếp — nghỉ {AUTO_CIRCUIT_BREAK_HOURS}h."
+        logger.info("[AI-AUTO] Chuỗi thua cũ đã nghỉ đủ thời gian — cho phép trade lại "
+                    "(chỉ lệnh thua MỚI mới khoá tiếp).")
+    # 2. Hạn lỗ trong ngày (income hôm nay theo UTC) — lỗi đọc ⇒ không trade
+    remaining, derr = await _daily_loss_budget(session)
+    if derr:
+        return False, f"không đo được hạn lỗ ngày ({derr}) — tạm không tự vào lệnh (fail closed)."
+    if remaining <= 0:
+        return False, f"đã dùng hết hạn lỗ ngày {AUTO_DAILY_MAX_LOSS:g} USDT — nghỉ tới hết ngày."
+    # 3. Đo rủi ro danh mục: vị thế không có SL ⇒ không đo được ⇒ chặn auto mới (KHÔNG tự đóng lệnh thủ công)
+    snap, serr = await _account_risk_snapshot(session)
+    if serr:
+        return False, f"không đo được rủi ro tài khoản ({serr}) — tạm không tự vào lệnh (fail closed)."
+    if snap['unprotected']:
+        return False, ("có vị thế chưa đặt SL nên không đo được rủi ro danh mục "
+                       f"({', '.join(snap['unprotected'][:5])}) — đặt SL cho các vị thế đó rồi thử lại.")
+    # 4. Giới hạn số vị thế AI TỰ vào (không tính lệnh user đặt tay / nhờ /ai đặt)
     open_auto = _count_auto_open_positions()
     if open_auto >= AUTO_MAX_OPEN_POSITIONS:
         return False, f"đã có {open_auto}/{AUTO_MAX_OPEN_POSITIONS} vị thế AI tự vào đang mở."
@@ -5113,17 +5276,872 @@ async def get_available_balance(session):
         return None
 
 
+# ═══ Khối rủi ro + thực thi lệnh thật dùng chung (auto 5h + AI /ai) ═══
+# Nguyên tắc: đo rủi ro bằng EQUITY, đo margin bằng AVAILABLE; mọi lỗi đọc dữ liệu
+# tài khoản/rủi ro đều FAIL CLOSED (không mở lệnh), và KHÔNG bao giờ kéo SL cho vừa
+# ngân sách — thiếu chỗ thì giảm size hoặc bỏ lệnh.
+
+def _entry_lock():
+    """Khoá tuần tự hoá lệnh MỞ thật: tránh 2 lệnh vào cùng lúc cùng vượt trần danh mục."""
+    global _ENTRY_LOCK
+    if _ENTRY_LOCK is None:
+        _ENTRY_LOCK = asyncio.Lock()
+    return _ENTRY_LOCK
+
+
+def _min_step_qty(qty_p):
+    """Bước khối lượng suy từ precision (10^-qty_p) — chỉ dùng khi chưa đọc được LOT_SIZE."""
+    return 10 ** (-int(qty_p))
+
+
+def _round_to_step(value, step):
+    """Làm tròn XUỐNG theo bội số stepSize thật của sàn (tránh lỗi -1111 / mất khối lượng)."""
+    if step is None or step <= 0:
+        return value
+    return math.floor(value / step + 1e-9) * step
+
+
+async def _load_symbol_filters(session, ttl=3600):
+    """Nạp LOT_SIZE.stepSize / MIN_NOTIONAL của toàn bộ symbol futures (cache theo tiến trình).
+    Trả True nếu có dữ liệu (kể cả dữ liệu cũ trong TTL)."""
+    global _SYMBOL_FILTERS_TS
+    now = time.time()
+    if _SYMBOL_FILTERS and now - _SYMBOL_FILTERS_TS < ttl:
+        return True
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(f"Không nạp được filters exchangeInfo: HTTP {resp.status}")
+                return bool(_SYMBOL_FILTERS)
+            data = await resp.json()
+    except Exception as e:
+        logger.warning(f"Lỗi nạp filters exchangeInfo: {e}")
+        return bool(_SYMBOL_FILTERS)
+    filters = {}
+    for s in data.get('symbols', []) or []:
+        step = min_qty = min_notional = 0.0
+        for f in s.get('filters', []) or []:
+            ftype = f.get('filterType')
+            try:
+                if ftype == 'LOT_SIZE':
+                    step = float(f.get('stepSize') or 0)
+                    min_qty = float(f.get('minQty') or 0)
+                elif ftype == 'MARKET_LOT_SIZE' and not step:
+                    step = float(f.get('stepSize') or 0)
+                    min_qty = float(f.get('minQty') or 0)
+                elif ftype == 'MIN_NOTIONAL':
+                    min_notional = max(min_notional, float(f.get('notional') or 0))
+            except (TypeError, ValueError):
+                continue
+        filters[s.get('symbol')] = {'step': step, 'min_qty': min_qty, 'min_notional': min_notional}
+    if filters:
+        _SYMBOL_FILTERS.clear()
+        _SYMBOL_FILTERS.update(filters)
+        _SYMBOL_FILTERS_TS = now
+        logger.info(f"Đã nạp stepSize/minNotional cho {len(filters)} symbol.")
+    return bool(_SYMBOL_FILTERS)
+
+
+async def _symbol_constraints(session, symbol, qty_p):
+    """(step, min_qty, min_notional) thật của symbol; thiếu dữ liệu ⇒ suy từ precision (đã log)."""
+    await _load_symbol_filters(session)
+    info = _SYMBOL_FILTERS.get(symbol) or {}
+    step = float(info.get('step') or 0)
+    if step <= 0:
+        step = _min_step_qty(qty_p)
+    return step, float(info.get('min_qty') or 0), float(info.get('min_notional') or 0)
+
+
+def _normalize_order_id(value):
+    """Binance trả id dạng int hoặc str — lưu luôn dạng str, rỗng thì None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _new_client_order_id(prefix):
+    """clientOrderId chống trùng khi kết quả gửi lệnh không chắc chắn (≤ 36 ký tự)."""
+    return f"{prefix}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"[:36]
+
+
+async def _max_leverage_strict(session, symbol):
+    """Đòn bẩy tối đa của symbol. Lỗi đọc bracket → (None, lý do): nơi gọi fail closed."""
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v1/leverageBracket', {'symbol': symbol})
+    if err:
+        return None, f"không đọc được leverageBracket {symbol}: {err}"
+    brackets = []
+    if isinstance(data, list) and data:
+        brackets = (data[0] or {}).get('brackets') or []
+    if not isinstance(brackets, list) or not brackets:
+        return None, f"leverageBracket {symbol} trả về dữ liệu lạ."
+    try:
+        lev = int(brackets[0].get('initialLeverage') or 0)
+    except (TypeError, ValueError):
+        return None, f"leverageBracket {symbol} thiếu initialLeverage."
+    if lev <= 0:
+        return None, f"leverageBracket {symbol} có initialLeverage ≤ 0."
+    return lev, None
+
+
+async def _fetch_open_algo_orders(session, symbol=None):
+    """Lệnh điều kiện đang treo. Truyền `symbol` để tránh weight=40 khi bỏ trống.
+    Trả (list|None, err) — dùng để ĐO RỦI RO nên phải fail closed."""
+    params = {'symbol': symbol} if symbol else None
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v1/openAlgoOrders', params)
+    if err:
+        return None, err
+    if data is None:
+        return [], None
+    if not isinstance(data, list):
+        return None, "openAlgoOrders trả về dữ liệu lạ."
+    return data, None
+
+
+def _position_stop_candidates(orders, symbol, side, pos_side, entry, mark=0.0, pos_qty=0.0):
+    """Lệnh STOP hợp lệ bảo vệ 1 vị thế: đúng symbol/positionSide, đúng chiều ĐÓNG,
+    và kích hoạt được (nằm phía giá hiện tại: LONG cần trigger < mark, SHORT cần > mark).
+    SL hoà vốn/lãi (trigger tốt hơn entry) vẫn tính là bảo vệ (rủi ro 0)."""
+    want_close_side = 'SELL' if side == 'LONG' else 'BUY'
+    ref = float(mark or entry or 0)
+    out = []
+    for o in orders or []:
+        if o.get('symbol') != symbol:
+            continue
+        otype = (o.get('orderType') or o.get('type') or '').upper()
+        if 'STOP' not in otype or 'TAKE_PROFIT' in otype:
+            continue
+        if (o.get('positionSide') or 'BOTH').upper() not in ('BOTH', pos_side):
+            continue
+        o_side = (o.get('side') or '').upper()
+        if o_side and o_side != want_close_side:
+            continue
+        try:
+            trig = float(o.get('triggerPrice') or 0)
+            qty = float(o.get('quantity') or o.get('origQty') or 0)
+        except (TypeError, ValueError):
+            continue
+        if trig <= 0 or ref <= 0:
+            continue
+        # Lệnh closePosition=true gửi quantity 0 → coi như bảo vệ toàn bộ vị thế
+        if qty <= 0:
+            qty = float(pos_qty or 0)
+        if qty <= 0:
+            continue
+        # Trigger sai phía giá hiện tại (LONG: SL ≥ mark) ⇒ không còn là bảo vệ
+        if (side == 'LONG' and trig >= ref) or (side == 'SHORT' and trig <= ref):
+            continue
+        out.append({'trigger': trig, 'qty': qty,
+                    'id': _normalize_order_id(o.get('algoId') or o.get('orderId'))})
+    return out
+
+
+def _stop_risk_usdt(side, entry, qty, candidates):
+    """(rủi ro xấu nhất USDT, đã bảo vệ đủ khối lượng chưa).
+    Dùng SL xa entry nhất (kịch bản xấu nhất); SL hoà vốn/lãi ⇒ rủi ro 0 nhưng vẫn là bảo vệ.
+    KHÔNG coi là bảo vệ nếu khối lượng được SL phủ nhỏ hơn khối lượng vị thế."""
+    if entry <= 0 or qty <= 0 or not candidates:
+        return 0.0, False
+    covered = max((c['qty'] for c in candidates if c.get('qty')), default=0.0)
+    if covered < qty:
+        return 0.0, False
+    worst = max(candidates, key=lambda c: abs(entry - c['trigger']))
+    risk = (entry - worst['trigger']) if side == 'LONG' else (worst['trigger'] - entry)
+    return max(0.0, risk) * qty, True
+
+
+async def _open_risk_snapshot(session):
+    """Rủi ro đang mở của TOÀN tài khoản + vị thế KHÔNG đo được rủi ro (thiếu SL).
+    Trả (dict|None, err). Số liệu lạ/không hữu hạn ⇒ lỗi (nơi gọi fail closed).
+    Vị thế chưa có SL ⇒ unprotected (chặn auto mới, KHÔNG tự đóng lệnh thủ công)."""
+    pos_data, perr = await get_position_risk(session)
+    if perr:
+        return None, f"không đọc được vị thế: {perr}"
+    if not isinstance(pos_data, list):
+        return None, "positionRisk trả về dữ liệu lạ."
+    # Đọc vị thế trước để biết symbol nào cần hỏi SL (openAlgoOrders bỏ symbol = weight 40)
+    symbols = []
+    for p in pos_data:
+        if not isinstance(p, dict):
+            continue
+        try:
+            amt = float(p.get('positionAmt') or 0)
+        except (TypeError, ValueError):
+            return None, "positionRisk có positionAmt không đọc được."
+        if amt != 0 and p.get('symbol') not in symbols:
+            symbols.append(p.get('symbol'))
+    orders = []
+    for symbol in symbols:
+        chunk, oerr = await _fetch_open_algo_orders(session, symbol)
+        if oerr:
+            return None, f"không đọc được SL đang treo của {symbol}: {oerr}"
+        orders.extend(chunk or [])
+    open_risk = 0.0
+    unprotected = []
+    open_symbols = []
+    for p in pos_data:
+        if not isinstance(p, dict):
+            return None, "positionRisk có bản ghi không phải object."
+        try:
+            amt = float(p.get('positionAmt') or 0)
+            entry = float(p.get('entryPrice') or 0)
+            mark = float(p.get('markPrice') or 0)
+        except (TypeError, ValueError):
+            return None, "positionRisk có trường số không đọc được."
+        if not all(math.isfinite(v) for v in (amt, entry, mark)):
+            return None, "positionRisk có giá trị không hữu hạn."
+        if amt == 0:
+            continue
+        symbol = p.get('symbol')
+        if symbol not in open_symbols:
+            open_symbols.append(symbol)
+        raw_pos_side = (p.get('positionSide') or 'BOTH').upper()
+        side = 'LONG' if (amt > 0 if raw_pos_side == 'BOTH' else raw_pos_side == 'LONG') else 'SHORT'
+        pos_side = 'BOTH' if raw_pos_side == 'BOTH' else raw_pos_side
+        qty = abs(amt)
+        cands = _position_stop_candidates(orders, symbol, side, pos_side, entry, mark, qty)
+        # TP/SL gắn thẳng trên vị thế (đặt từ UI Binance) cũng là SL hợp lệ
+        try:
+            attached = float(p.get('slPrice') or 0)
+        except (TypeError, ValueError):
+            attached = 0.0
+        if attached > 0 and (mark <= 0 or (side == 'LONG' and attached < mark) or (side == 'SHORT' and attached > mark)):
+            cands.append({'trigger': attached, 'qty': qty, 'id': None})
+        risk, protected = _stop_risk_usdt(side, entry, qty, cands)
+        open_risk += risk
+        if not protected:
+            unprotected.append(f"{display_symbol(symbol)} {side} ({qty:g})")
+    return {'open_risk': open_risk, 'unprotected': unprotected, 'open_symbols': open_symbols}, None
+
+
+async def _daily_loss_budget(session):
+    """Phần hạn lỗ ngày còn lại (USDT). Lỗi đọc income → (None, lý do) để nơi gọi fail closed."""
+    day_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    recs, err = await fetch_income_paginated(session, start_ms=day_start)
+    if err:
+        return None, f"không đọc được income trong ngày: {err}"
+    day_pnl = 0.0
+    for r in recs or []:
+        if r.get('incomeType') in ('REALIZED_PNL', 'FUNDING_FEE', 'COMMISSION'):
+            try:
+                day_pnl += float(r.get('income', 0) or 0)
+            except (TypeError, ValueError):
+                return None, "income trong ngày có giá trị không đọc được."
+    return max(0.0, AUTO_DAILY_MAX_LOSS + day_pnl), None
+
+
+async def _account_risk_snapshot(session):
+    """Ảnh chụp tài khoản để quyết định size: equity (risk) + available (margin)
+    + rủi ro đang mở + hạn lỗ ngày còn lại. Số liệu thiếu/lạ/không hữu hạn → (None, lý do)."""
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/account')
+    if err:
+        return None, f"không đọc được tài khoản: {err}"
+    if not isinstance(data, dict):
+        return None, "tài khoản trả về dữ liệu lạ."
+    try:
+        wallet = float(data.get('totalWalletBalance') or 0)
+        upnl = float(data.get('totalUnrealizedProfit') or 0)
+        equity = float(data.get('totalMarginBalance') or 0) or (wallet + upnl)
+        available = float(data.get('availableBalance') or 0)
+    except (TypeError, ValueError):
+        return None, "tài khoản thiếu trường số dư."
+    if not all(math.isfinite(v) for v in (wallet, upnl, equity, available)):
+        return None, "số dư tài khoản không hữu hạn."
+    if available < 0 or wallet < 0:
+        return None, "số dư tài khoản âm — không đo được ngân sách."
+    if equity <= 0:
+        return None, "equity ≤ 0 — không đo được ngân sách rủi ro."
+    daily_remaining, derr = await _daily_loss_budget(session)
+    if derr:
+        return None, derr
+    risk, rerr = await _open_risk_snapshot(session)
+    if rerr:
+        return None, rerr
+    snap = {'equity': equity, 'available': available, 'wallet': wallet, 'upnl': upnl,
+            'daily_remaining': daily_remaining}
+    snap.update(risk)
+    return snap, None
+
+
+def _risk_budget_allowance(equity, open_risk, daily_remaining):
+    """Ngân sách rủi ro cho MỘT lệnh mới:
+    min(0.5% equity, room 1.5% equity − rủi ro đang mở, hạn lỗ ngày còn lại − rủi ro đang mở).
+    Rủi ro đang mở được trừ ở CẢ HAI trần vì các vị thế đó vẫn có thể lỗ."""
+    per_trade = AUTO_RISK_PER_TRADE_PCT * equity
+    portfolio_room = AUTO_RISK_PORTFOLIO_PCT * equity - open_risk
+    return min(per_trade, portfolio_room, daily_remaining - open_risk)
+
+
+def _plan_entry_size(price, sl_price, side, *, equity, available, open_risk, daily_remaining,
+                     leverage, step, min_qty=0.0, min_notional=0.0, notional_cap=None):
+    """Kích thước lệnh theo ngân sách rủi ro (đã trừ phí+trượt giá dự phòng).
+    KHÔNG nới SL cho vừa ngân sách — thiếu chỗ thì giảm size hoặc bỏ lệnh. Trả (ok, quantity|None, msg)."""
+    try:
+        price = float(price)
+        sl_price = float(sl_price)
+        step = float(step or 0)
+    except (TypeError, ValueError):
+        return False, None, "giá entry/SL/step không hợp lệ."
+    if price <= 0 or sl_price <= 0 or step <= 0:
+        return False, None, "giá entry/SL/step không hợp lệ."
+    is_long = side == 'LONG'
+    if (is_long and sl_price >= price) or (not is_long and sl_price <= price):
+        return False, None, "SL nằm sai phía entry — không đo được rủi ro."
+    # rủi ro biên trên mỗi đơn vị: khoảng cách SL + đệm phí/trượt giá
+    risk_per_unit = abs(price - sl_price) + price * AUTO_TRADE_COST_PCT
+    budget = _risk_budget_allowance(equity, open_risk, daily_remaining)
+    if budget <= 0:
+        return False, None, ("hết ngân sách rủi ro (trần/lệnh "
+                             f"{AUTO_RISK_PER_TRADE_PCT * 100:g}% equity, trần danh mục "
+                             f"{AUTO_RISK_PORTFOLIO_PCT * 100:g}% equity trừ rủi ro đang mở, "
+                             "hạn lỗ ngày còn lại).")
+    quantity = _round_to_step(budget / risk_per_unit, step)
+    if leverage and leverage > 0:
+        quantity = min(quantity, _round_to_step(available * AUTO_MARGIN_MAX_PCT * leverage / price, step))
+    if notional_cap:
+        quantity = min(quantity, _round_to_step(notional_cap / price, step))
+    quantity = _round_to_step(quantity, step)
+    min_ok = max(step, float(min_qty or 0))
+    if quantity < min_ok:
+        return False, None, (f"khối lượng tối thiểu {min_ok:g} vượt ngân sách rủi ro "
+                             f"({budget:,.2f} USDT cho SL cách entry {abs(price - sl_price):,.8g}).")
+    notional = quantity * price
+    if min_notional and notional < min_notional:
+        return False, None, (f"notional {notional:,.2f} USDT dưới mức tối thiểu của sàn "
+                            f"({min_notional:,.2f} USDT).")
+    risk = quantity * risk_per_unit
+    if risk > budget + 1e-9:
+        return False, None, "size vượt ngân sách rủi ro."
+    return True, quantity, (f"rủi ro khi SL khớp {quantity * abs(price - sl_price):,.2f} USDT "
+                            f"(≈{quantity * abs(price - sl_price) / equity * 100:.2f}% equity, "
+                            f"đã tính đệm phí/trượt {AUTO_TRADE_COST_PCT * 100:g}%, ngân sách {budget:,.2f} USDT)")
+
+
+def _fill_from_order(data):
+    """(executed_qty, avg_price) từ response lệnh. None nếu CHƯA xác định được giá khớp thật
+    (tuyệt đối không lấy ticker làm giá vào)."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        qty = float(data.get('executedQty') or 0)
+        avg = float(data.get('avgPrice') or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0:
+        return None
+    if avg <= 0:
+        try:
+            cum = float(data.get('cumQuote') or 0)
+        except (TypeError, ValueError):
+            cum = 0.0
+        if cum > 0:
+            avg = cum / qty
+    if avg <= 0:
+        return None
+    return qty, avg
+
+
+async def _query_order(session, symbol, order_id=None, client_id=None):
+    """Tra 1 lệnh theo orderId hoặc clientOrderId (dùng khi kết quả gửi lệnh không chắc chắn)."""
+    params = {'symbol': symbol}
+    if order_id:
+        params['orderId'] = _normalize_order_id(order_id)
+    elif client_id:
+        params['origClientOrderId'] = client_id
+    else:
+        return None, "thiếu orderId/origClientOrderId."
+    return await binance_signed_request(session, 'GET', '/fapi/v1/order', params)
+
+
+async def _submit_entry_order(session, symbol, side, qty_str, pos_side, client_id,
+                              order_type='MARKET', price_str=None):
+    """Gửi lệnh MỞ (MARKET dùng newOrderRespType=RESULT để có giá khớp).
+    Khi kết quả không chắc chắn → tra lại theo clientOrderId, KHÔNG gửi lại (chống trùng lệnh)."""
+    params = {'symbol': symbol, 'side': side, 'type': order_type, 'quantity': qty_str,
+              'newClientOrderId': client_id, 'newOrderRespType': 'RESULT'}
+    if order_type == 'LIMIT':
+        if not price_str:
+            return None, "lệnh LIMIT thiếu giá."
+        params['price'] = price_str
+        params['timeInForce'] = 'GTC'
+    if pos_side and pos_side != 'BOTH':
+        params['positionSide'] = pos_side
+    data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
+    if err:
+        found, qerr = await _query_order(session, symbol, client_id=client_id)
+        if not qerr and isinstance(found, dict) and found.get('orderId'):
+            logger.warning(f"[EXEC] {symbol}: submit báo lỗi '{err}' nhưng lệnh ĐÃ tồn tại "
+                           f"(orderId={found.get('orderId')}) — không gửi lại.")
+            return found, None
+        return None, err
+    return data, None
+
+
+async def _fill_from_position_risk(session, symbol, pos_side):
+    """Giá vào thật lấy từ positionRisk (khi response lệnh thiếu avgPrice). None nếu chưa có vị thế."""
+    data, err = await get_position_risk(session, {'symbol': symbol})
+    if err or not isinstance(data, list):
+        return None
+    for p in data:
+        try:
+            amt = float(p.get('positionAmt', 0) or 0)
+            entry = float(p.get('entryPrice', 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt == 0 or entry <= 0:
+            continue
+        if pos_side and pos_side != 'BOTH' and (p.get('positionSide') or 'BOTH').upper() != pos_side:
+            continue
+        return abs(amt), entry
+    return None
+
+
+async def _live_position(session, symbol, pos_side=None):
+    """Vị thế ĐANG MỞ thật của symbol (theo REST): (positionSide, side, qty) hoặc None nếu đã phẳng.
+    Lỗi đọc → None kèm cờ err ở phần tử thứ 2 để nơi gọi fail closed."""
+    data, err = await get_position_risk(session, {'symbol': symbol})
+    if err:
+        return None, err
+    if not isinstance(data, list):
+        return None, "positionRisk trả về dữ liệu lạ."
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        try:
+            amt = float(p.get('positionAmt') or 0)
+        except (TypeError, ValueError):
+            return None, "positionRisk có positionAmt không đọc được."
+        if not math.isfinite(amt) or amt == 0:
+            continue
+        raw_side = (p.get('positionSide') or 'BOTH').upper()
+        if pos_side and pos_side != 'BOTH' and raw_side not in (pos_side, 'BOTH'):
+            continue
+        side = 'LONG' if (amt > 0 if raw_side == 'BOTH' else raw_side == 'LONG') else 'SHORT'
+        return {'pos_side': 'BOTH' if raw_side == 'BOTH' else raw_side, 'side': side, 'qty': abs(amt)}, None
+    return None, None
+
+
+async def _emergency_reduce_close(session, symbol, side, pos_side=None, qty_cap=None):
+    """Đóng giảm vị thế bằng MARKET khi KHÔNG đặt được SL (hoặc lệnh bảo vệ hỏng).
+    - Khối lượng lấy từ VỊ THẾ THẬT đang mở (đọc lại ngay trước khi gửi) → không bao giờ
+      gửi dư khối lượng kiểu hedge (dư 1 chiều = MỞ vị thế ngược, rất nguy hiểm).
+    - Kết quả gửi lệnh không chắc chắn ⇒ CHỈ tra theo clientOrderId, KHÔNG gửi lại.
+    - Chỉ coi là thành công khi xác nhận ĐÃ KHỚP (executedQty > 0); ngược lại trả False để
+      nơi gọi giữ close_pending và thử lại vòng sau.
+    Trả (ok, msg)."""
+    live, lerr = await _live_position(session, symbol, pos_side)
+    if lerr:
+        return False, f"không đọc được vị thế để đóng: {lerr}"
+    if live is None:
+        return True, "vị thế đã phẳng — không cần đóng"
+    qty_p, _, _ = await get_symbol_precisions(session, symbol)
+    step, _, _ = await _symbol_constraints(session, symbol, qty_p)
+    qty = live['qty'] if not qty_cap else min(live['qty'], float(qty_cap))
+    qty = _round_to_step(qty, step)
+    if qty < max(step, _min_step_qty(qty_p)) or qty <= 0:
+        return False, f"khối lượng còn lại {live['qty']:g} dưới bước tối thiểu — cần đóng tay"
+    close_side = 'SELL' if live['side'] == 'LONG' else 'BUY'
+    client_id = _new_client_order_id('pnlbot_emg')
+    params = {'symbol': symbol, 'side': close_side, 'type': 'MARKET',
+              'quantity': f"{qty:.{qty_p}f}", 'newOrderRespType': 'RESULT',
+              'newClientOrderId': client_id}
+    if live['pos_side'] != 'BOTH':
+        params['positionSide'] = live['pos_side']
+    else:
+        params['reduceOnly'] = 'true'
+    data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
+    if err:
+        # Không rõ lệnh có vào sàn hay không → tra theo clientOrderId, tuyệt đối không gửi lại
+        found, qerr = await _query_order(session, symbol, client_id=client_id)
+        fill = _fill_from_order(found) if not qerr else None
+        if fill:
+            return True, f"lệnh đóng đã khớp {fill[0]:g} @ {fill[1]:g} (xác nhận qua tra cứu)"
+        if not qerr and isinstance(found, dict) and found.get('orderId'):
+            return False, f"lệnh đóng đang treo chưa khớp (orderId={found.get('orderId')}) — sẽ thử lại"
+        return False, err
+    fill = _fill_from_order(data)
+    if fill:
+        return True, f"đã đóng {fill[0]:g} @ {fill[1]:g}"
+    order_id = _normalize_order_id((data or {}).get('orderId'))
+    if order_id:
+        found, qerr = await _query_order(session, symbol, order_id=order_id)
+        fill = _fill_from_order(found) if not qerr else None
+        if fill:
+            return True, f"đã đóng {fill[0]:g} @ {fill[1]:g} (xác nhận qua tra cứu)"
+    return False, "lệnh đóng chưa xác nhận khớp — sẽ thử lại vòng sau"
+
+
+async def _execute_protected_entry(session, *, symbol, side, quantity, price, sl_price, tp_price,
+                                   qty_p, price_p, step, pos_side, max_lev, open_symbols=(),
+                                   risk_budget=None):
+    """Mở vị thế MARKET + bảo vệ ĐÚNG THỨ TỰ: fill thật → SL → TP.
+    - Không vào lệnh nếu symbol đang có vị thế (chồng lệnh, không đối soát được funding hedge).
+    - Rủi ro CHỐT LẠI theo giá khớp thật (đã tính đệm phí/trượt): vượt ngân sách ⇒ giảm size, không đủ thì đóng.
+    - Thiếu SL ⇒ đóng khẩn cấp (không để vị thế trần); không báo 'đã bảo vệ' khi SL lỗi.
+    Trả dict: ok, stage, order_id, entry_time, entry_qty (khớp gốc), filled_qty (còn được bảo vệ),
+    entry_price, sl_id, tp_id, msg, emergency, close_pending."""
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    order_side = 'BUY' if side == 'LONG' else 'SELL'   # API Binance dùng BUY/SELL, không dùng LONG/SHORT
+    close_side = 'SELL' if side == 'LONG' else 'BUY'
+    if symbol in set(open_symbols or ()):
+        return {'ok': False, 'stage': 'flat_check',
+                'msg': f"{display_symbol(symbol)} đang có vị thế — không mở chồng (rủi ro/funding không đối soát được)."}
+    lev = _safe_leverage_for_sl(price, sl_price, max_lev)
+    if not await set_leverage(session, api_key, api_secret, symbol, lev):
+        return {'ok': False, 'stage': 'leverage',
+                'msg': f"không set được đòn bẩy {lev}x cho {symbol} — không mở lệnh (fail closed)."}
+    qty_str = f"{quantity:.{qty_p}f}"
+    client_id = _new_client_order_id('pnlbot_entry')
+    submit_ts = time.time()   # mốc thời gian TRƯỚC khi gửi: đối soát dùng startTime nên phải sớm hơn fill
+    order, oerr = await _submit_entry_order(session, symbol, order_side, qty_str, pos_side, client_id)
+    if oerr:
+        return {'ok': False, 'stage': 'entry', 'entry_time': submit_ts,
+                'msg': f"đặt lệnh thất bại: {oerr}"}
+    order_id = _normalize_order_id((order or {}).get('orderId'))
+    fill = _fill_from_order(order)
+    if fill is None and order_id:
+        queried, qerr = await _query_order(session, symbol, order_id=order_id)
+        if not qerr:
+            fill = _fill_from_order(queried)
+    if fill is None:
+        fill = await _fill_from_position_risk(session, symbol, pos_side)
+    if fill is None:
+        emg_ok, emg_msg = await _emergency_reduce_close(session, symbol, side, pos_side, quantity)
+        return {'ok': False, 'stage': 'fill', 'order_id': order_id, 'entry_time': submit_ts,
+                'emergency': emg_ok, 'close_pending': not emg_ok,
+                'msg': f"không xác nhận được giá khớp → {'đóng khẩn cấp: ' if emg_ok else 'CHƯA đóng được: '}{emg_msg}"}
+    entry_qty, entry_price = fill   # entry_qty = khối lượng KHỚP GỐC (đối soát PnL), không phải phần còn lại
+    remaining_qty = entry_qty
+    # Rủi ro THẬT theo giá khớp (không theo ticker): trượt giá làm vượt ngân sách ⇒ giảm size ngay
+    sl_dist_fill = abs(entry_price - sl_price) + entry_price * AUTO_TRADE_COST_PCT
+    if risk_budget is not None and sl_dist_fill > 0:
+        actual_risk = entry_qty * sl_dist_fill
+        if actual_risk > risk_budget + 1e-9:
+            allowed_qty = _round_to_step(risk_budget / sl_dist_fill, step)
+            if allowed_qty < max(step, _min_step_qty(qty_p)):
+                emg_ok, emg_msg = await _emergency_reduce_close(session, symbol, side, pos_side, entry_qty)
+                return {'ok': False, 'stage': 'risk_trim', 'order_id': order_id, 'entry_time': submit_ts,
+                        'entry_price': entry_price, 'entry_qty': entry_qty, 'filled_qty': entry_qty,
+                        'emergency': emg_ok, 'close_pending': not emg_ok, 'lev': lev,
+                        'msg': (f"trượt giá làm rủi ro {actual_risk:,.2f} > ngân sách {risk_budget:,.2f} USDT "
+                                f"và size tối thiểu cũng vượt ngân sách → "
+                                f"{'đóng khẩn cấp: ' if emg_ok else 'CHƯA đóng được: '}{emg_msg}")}
+            excess_qty = entry_qty - allowed_qty
+            red_ok, red_msg = await _emergency_reduce_close(session, symbol, side, pos_side, excess_qty)
+            if not red_ok:
+                emg_ok, emg_msg = await _emergency_reduce_close(session, symbol, side, pos_side, entry_qty)
+                return {'ok': False, 'stage': 'risk_trim', 'order_id': order_id, 'entry_time': submit_ts,
+                        'entry_price': entry_price, 'entry_qty': entry_qty, 'filled_qty': entry_qty,
+                        'emergency': emg_ok, 'close_pending': not emg_ok, 'lev': lev,
+                        'msg': (f"không giảm được size theo rủi ro thật ({red_msg}) → "
+                                f"{'đóng khẩn cấp: ' if emg_ok else 'CHƯA đóng được: '}{emg_msg}")}
+            logger.warning(f"[EXEC] {symbol}: trượt giá → giảm size {entry_qty:g} → {allowed_qty:g} "
+                           f"(rủi ro thật {actual_risk:,.2f} > ngân sách {risk_budget:,.2f} USDT).")
+            remaining_qty = allowed_qty
+    close_qty_str = f"{round_down(remaining_qty, qty_p):.{qty_p}f}"
+    ok_sl, sl_info = await _place_conditional_tpsl(
+        session, symbol, close_side, 'STOP_MARKET', f"{sl_price:.{price_p}f}", close_qty_str,
+        pos_side, client_id=_new_client_order_id('pnlbot_sl'))
+    if not ok_sl:
+        emg_ok, emg_msg = await _emergency_reduce_close(session, symbol, side, pos_side, remaining_qty)
+        return {'ok': False, 'stage': 'sl', 'order_id': order_id, 'entry_time': submit_ts,
+                'entry_price': entry_price, 'entry_qty': entry_qty, 'filled_qty': remaining_qty,
+                'emergency': emg_ok, 'close_pending': not emg_ok, 'lev': lev,
+                'msg': (f"KHÔNG đặt được SL ({sl_info}) → "
+                        f"{'đóng khẩn cấp: ' if emg_ok else 'vẫn CHƯA đóng được: '}{emg_msg}")}
+    result = {'ok': True, 'stage': 'done', 'order_id': order_id, 'entry_time': submit_ts,
+              'entry_price': entry_price, 'entry_qty': entry_qty, 'filled_qty': remaining_qty,
+              'sl_id': _normalize_order_id(sl_info), 'tp_id': None,
+              'lev': lev, 'emergency': False, 'close_pending': False, 'msg': ''}
+    if tp_price:
+        ok_tp, tp_info = await _place_conditional_tpsl(
+            session, symbol, close_side, 'TAKE_PROFIT_MARKET', f"{tp_price:.{price_p}f}", close_qty_str,
+            pos_side, client_id=_new_client_order_id('pnlbot_tp'))
+        if ok_tp:
+            result['tp_id'] = _normalize_order_id(tp_info)
+        else:
+            result['msg'] = f"SL đã đặt nhưng TP lỗi: {tp_info}"
+    return result
+
+
+async def _replace_protective_sl(session, meta, new_sl, close_qty, close_side, pos_side, price_p, qty_p):
+    """Đặt SL MỚI trước, chỉ hủy SL cũ SAU khi SL mới đã xác nhận.
+    last_sl chỉ đổi khi SL mới thật sự đặt thành công. Trả id SL đang hiệu lực (hoặc None)."""
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    old_id = _normalize_order_id(meta.get('sl_algo_id'))
+    ok, info = await _place_conditional_tpsl(
+        session, meta['symbol'], close_side, 'STOP_MARKET', f"{new_sl:.{price_p}f}",
+        f"{close_qty:.{qty_p}f}", pos_side, client_id=_new_client_order_id('pnlbot_sl'))
+    if not ok:
+        logger.warning(f"[AI-TRAIL] SL mới {format_price(new_sl)} cho {meta['symbol']} thất bại: {info} "
+                       f"— GIỮ SL cũ {format_price(meta.get('last_sl', meta.get('sl_initial')))}.")
+        return None
+    new_id = _normalize_order_id(info)
+    meta['sl_algo_id'] = new_id or old_id
+    meta['last_sl'] = new_sl
+    _save_auto_managed()
+    if old_id and new_id and old_id != new_id:
+        if not await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], old_id):
+            stale = list(meta.get('stale_sl_ids') or [])
+            if old_id not in stale:
+                stale.append(old_id)
+            meta['stale_sl_ids'] = stale
+            _save_auto_managed()
+            logger.warning(f"[AI-TRAIL] Không hủy được SL cũ {old_id} của {meta['symbol']} "
+                           "(SL mới đã hoạt động) — sẽ dọn ở vòng sau.")
+    return meta['sl_algo_id']
+
+
+async def _cleanup_stale_sl(session, meta):
+    """Dọn các SL cũ chưa hủy được ở vòng trước (chỉ khi SL mới đã hoạt động)."""
+    stale = list(meta.get('stale_sl_ids') or [])
+    if not stale:
+        return
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    remain = []
+    for aid in stale:
+        if aid == _normalize_order_id(meta.get('sl_algo_id')):
+            continue
+        if not await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], aid):
+            remain.append(aid)
+    if remain:
+        meta['stale_sl_ids'] = remain
+    else:
+        meta.pop('stale_sl_ids', None)
+    _save_auto_managed()
+
+
+def _execution_record(*, order_id, quantity, pos_side, side, entry_time, flat_at_entry=True):
+    """Dict `execution` cho record_signal: đối soát độc lập bằng fills REST (không dùng nến).
+    entry_time = mốc TRƯỚC khi gửi lệnh (epoch giây) để đối soát startTime không bỏ sót fill vào.
+    quantity = khối lượng KHỚP GỐC của lệnh vào (các lần đóng sớm sẽ cộng dồn theo order_id này)."""
+    pos = pos_side if pos_side in ('LONG', 'SHORT') else ('LONG' if side == 'LONG' else 'SHORT')
+    return {
+        'order_id': _normalize_order_id(order_id),
+        'quantity': float(quantity),
+        'position_side': pos,
+        'entry_time': float(entry_time),
+        'symbol_flat_at_entry': bool(flat_at_entry),
+    }
+
+
+# ═══ Lệnh MỞ LIMIT chờ khớp: gắn bảo vệ NGAY khi có khối lượng khớp ═══
+# Sàn TỪ CHỐI lệnh SL reduce-only khi chưa có vị thế (-2022), nên lệnh LIMIT chưa khớp
+# không thể đặt SL trước. Theo dõi lệnh tới khi khớp rồi mới gắn SL (trước) + TP (sau).
+PENDING_ENTRIES_FILE = "pending_entries_trading.json"
+PENDING_ENTRY_CHECK_SEC = 20
+PENDING_ENTRY_MAX_AGE_SEC = 7 * 86400
+pending_entries = {}   # client_order_id -> {symbol, side, pos_side, order_id, client_order_id,
+                       #   quantity, sl, tp, limit_price, entry_time, ts, signal_id, entry_price,
+                       #   sl_algo_id, tp_algo_id, source}
+
+
+def save_pending_entries():
+    """Ghi NGUYÊN TỬ (tmp + fsync + os.replace) để restart giữa chừng không mất bảo vệ."""
+    try:
+        temporary = PENDING_ENTRIES_FILE + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as f:
+            json.dump(pending_entries, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, PENDING_ENTRIES_FILE)
+    except Exception as e:
+        logger.error(f"Lỗi lưu pending_entries: {e}")
+
+
+def load_pending_entries():
+    """Nạp lại các lệnh MỞ đang chờ khớp sau restart (watcher sẽ gắn bảo vệ tiếp)."""
+    global pending_entries
+    try:
+        if os.path.exists(PENDING_ENTRIES_FILE):
+            with open(PENDING_ENTRIES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                pending_entries = data
+            logger.info(f"Đã nạp {len(pending_entries)} lệnh MỞ đang chờ khớp.")
+    except Exception as e:
+        logger.error(f"Lỗi nạp pending_entries: {e}")
+
+
+def _drop_pending_entry(key, reason):
+    """Bỏ theo dõi 1 lệnh MỞ đang chờ (đã khớp + bảo vệ xong, huỷ, hoặc quá hạn)."""
+    if pending_entries.pop(key, None) is not None:
+        save_pending_entries()
+    logger.info(f"[ENTRY-WATCH] Bỏ theo dõi {key}: {reason}")
+
+
+def _register_ai_position_meta(*, symbol, side, pos_side, entry_price, sl_price, tp_price, qty,
+                               sl_id, tp_id, signal_id, close_pending=False):
+    """Lưu meta vị thế do /ai mở. managed=False: loop trailing KHÔNG quản lý vị thế của người dùng,
+    chỉ dùng để (a) giữ liên kết signal_id và (b) đóng khẩn cấp lại nếu lệnh bảo vệ hỏng."""
+    auto_managed[f"{symbol}_{pos_side}"] = {
+        'symbol': symbol, 'side': side, 'entry': float(entry_price or 0),
+        'sl_initial': float(sl_price or 0),
+        'risk': abs(float(entry_price or 0) - float(sl_price or 0)),
+        'atr': 0.0, 'tp': tp_price or None, 'qty': float(qty or 0), 'pos_side': pos_side,
+        'sl_algo_id': _normalize_order_id(sl_id), 'tp_algo_id': _normalize_order_id(tp_id),
+        'last_sl': float(sl_price or 0), 'ts': time.time(), 'signal_id': signal_id,
+        'managed': False, 'close_pending': bool(close_pending),
+    }
+    _save_auto_managed()
+
+
+async def _protect_entry_fill(session, pend, order_data):
+    """Gắn bảo vệ cho 1 lệnh MỞ đã có khối lượng khớp: record_signal (1 lần) → SL → TP,
+    khối lượng theo VỊ THẾ THẬT. Thiếu SL ⇒ đóng khẩn cấp + giữ meta close_pending. Trả (ok, msg)."""
+    symbol = pend.get('symbol')
+    side = str(pend.get('side') or '').upper()
+    pos_side = str(pend.get('pos_side') or 'BOTH')
+    sl_price = float(pend.get('sl') or 0)
+    if sl_price <= 0:
+        return False, "thiếu SL — không thể bảo vệ vị thế"
+    live, lerr = await _live_position(session, symbol, None if pos_side == 'BOTH' else pos_side)
+    if lerr:
+        return False, f"không đọc được vị thế {symbol}: {lerr}"
+    if live is None:
+        return False, "chưa có vị thế (hoặc đã phẳng)"
+    qty_p, price_p, _ = await get_symbol_precisions(session, symbol)
+    step, min_qty, _ = await _symbol_constraints(session, symbol, qty_p)
+    qty = _round_to_step(live['qty'], step)
+    if qty < max(step, min_qty):
+        return False, "khối lượng vị thế dưới bước tối thiểu của sàn"
+    close_side = 'SELL' if live['side'] == 'LONG' else 'BUY'
+    prot_pos_side = None if pos_side == 'BOTH' else pos_side
+
+    # 1. Ghi lịch sử tín hiệu theo KHỚP THẬT (chống trùng bằng order_id của lệnh vào)
+    if not pend.get('signal_id'):
+        fill = _fill_from_order(order_data)
+        entry_price = fill[1] if fill and fill[1] > 0 else float(pend.get('limit_price') or 0)
+        entry_qty = fill[0] if fill else qty
+        if entry_price > 0:
+            execution = _execution_record(
+                order_id=pend.get('order_id'), quantity=entry_qty, pos_side=pos_side, side=side,
+                entry_time=pend.get('entry_time') or pend.get('ts') or time.time())
+            pend['signal_id'] = record_signal(
+                {'symbol': symbol, 'signal': side, 'close': entry_price, 'tp': pend.get('tp') or None,
+                 'sl': sl_price, 'confidence': 'AI chat'}, origin='ai', execution=execution)
+            pend['entry_price'] = entry_price
+            save_pending_entries()
+
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    old_id = _normalize_order_id(pend.get('sl_algo_id'))
+    # 2. SL TRƯỚC (đặt mới rồi mới hủy cái cũ nếu khối lượng vị thế đã tăng thêm)
+    ok_sl, sl_info = await _place_conditional_tpsl(
+        session, symbol, close_side, 'STOP_MARKET', f"{sl_price:.{price_p}f}",
+        f"{qty:.{qty_p}f}", prot_pos_side, client_id=_new_client_order_id('pnlbot_sl'))
+    new_id = _normalize_order_id(sl_info) if ok_sl else None
+    if not new_id:
+        emg_ok, emg_msg = await _emergency_reduce_close(session, symbol, live['side'],
+                                                       prot_pos_side, qty)
+        _register_ai_position_meta(
+            symbol=symbol, side=side, pos_side=pos_side,
+            entry_price=pend.get('entry_price') or pend.get('limit_price'),
+            sl_price=sl_price, tp_price=None, qty=qty, sl_id=None, tp_id=None,
+            signal_id=pend.get('signal_id'), close_pending=not emg_ok)
+        return False, (f"KHÔNG đặt được SL ({sl_info}) → "
+                       f"{'đóng khẩn cấp: ' if emg_ok else 'CHƯA đóng được: '}{emg_msg}")
+    if old_id and new_id != old_id:
+        await _cancel_algo_sl(session, api_key, api_secret, symbol, old_id)
+    pend['sl_algo_id'] = new_id
+    save_pending_entries()
+
+    # 3. TP SAU khi SL đã xác nhận
+    tp_price = float(pend.get('tp') or 0)
+    if tp_price > 0 and not pend.get('tp_algo_id'):
+        ok_tp, tp_info = await _place_conditional_tpsl(
+            session, symbol, close_side, 'TAKE_PROFIT_MARKET', f"{tp_price:.{price_p}f}",
+            f"{qty:.{qty_p}f}", prot_pos_side, client_id=_new_client_order_id('pnlbot_tp'))
+        if ok_tp:
+            pend['tp_algo_id'] = _normalize_order_id(tp_info)
+            save_pending_entries()
+        else:
+            logger.warning(f"[ENTRY-WATCH] {symbol}: SL đã gắn nhưng TP lỗi ({tp_info}).")
+    _register_ai_position_meta(
+        symbol=symbol, side=side, pos_side=pos_side,
+        entry_price=pend.get('entry_price') or pend.get('limit_price'),
+        sl_price=sl_price, tp_price=tp_price or None, qty=qty, sl_id=new_id,
+        tp_id=pend.get('tp_algo_id'), signal_id=pend.get('signal_id'))
+    return True, f"đã gắn SL {format_price(sl_price)} cho {qty:g} {display_symbol(symbol)}"
+
+
+async def _refresh_pending_entries(session):
+    """Một vòng: kiểm tra mọi lệnh MỞ đang chờ khớp, gắn bảo vệ ngay khi có vị thế."""
+    now = time.time()
+    for key, pend in list(pending_entries.items()):
+        try:
+            if now - float(pend.get('ts') or now) > PENDING_ENTRY_MAX_AGE_SEC:
+                _drop_pending_entry(key, "quá 7 ngày chưa khớp — bỏ theo dõi")
+                await _notify_all_chats(
+                    session,
+                    f"⚠️ *Lệnh MỞ treo quá 7 ngày* của {display_symbol(pend.get('symbol'))} "
+                    f"(#{pend.get('order_id')}) đã bị bỏ theo dõi — kiểm tra và hủy tay nếu cần."
+                )
+                continue
+            data, err = await _query_order(session, pend.get('symbol'), order_id=pend.get('order_id'))
+            if err:
+                logger.warning(f"[ENTRY-WATCH] Không đọc được lệnh {key}: {err}")
+                continue
+            status = str((data or {}).get('status') or '').upper()
+            fill = _fill_from_order(data)
+            if status in ('CANCELED', 'EXPIRED', 'REJECTED') and not fill:
+                _drop_pending_entry(key, f"lệnh {status} và chưa khớp")
+                continue
+            if not fill and status == 'NEW':
+                continue   # chưa khớp: chưa có gì để bảo vệ
+            if fill and status in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                # Lệnh đã kết thúc: nếu vị thế đã phẳng (bị đóng tay/SL) thì không còn gì phải bảo vệ
+                live, lerr = await _live_position(session, pend.get('symbol'),
+                                                 None if str(pend.get('pos_side') or 'BOTH') == 'BOTH'
+                                                 else pend.get('pos_side'))
+                if not lerr and live is None:
+                    _drop_pending_entry(key, f"lệnh {status} và vị thế đã phẳng")
+                    continue
+            ok, msg = await _protect_entry_fill(session, pend, data)
+            logger.info(f"[ENTRY-WATCH] {key}: {msg}")
+            if not ok:
+                continue   # giữ pending + meta close_pending để vòng sau/recovery xử lý tiếp
+            if status in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                _drop_pending_entry(key, f"lệnh {status} — bảo vệ đã gắn")
+                await _notify_all_chats(
+                    session,
+                    f"🛡️ *Đã gắn bảo vệ lệnh MỞ* {display_symbol(pend.get('symbol'))} "
+                    f"({pend.get('side')}) — {msg}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[ENTRY-WATCH] Lỗi xử lý {key}: {e}")
+
+
+async def pending_entry_watch_loop(app):
+    """Mỗi PENDING_ENTRY_CHECK_SEC: gắn SL/TP cho lệnh MỞ LIMIT ngay khi khớp (không để vị thế trần)."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if pending_entries:
+                await _refresh_pending_entries(app['session'])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Lỗi trong pending_entry_watch_loop: {e}")
+        await asyncio.sleep(PENDING_ENTRY_CHECK_SEC)
+
+
 async def _notify_all_chats(session, text):
     """Gửi thông báo tới tất cả chat đã biết (auto chats + active chats)."""
     for cid in list(set(auto_chats) | set(active_chats)):
         await send_telegram_message(session, cid, text, is_auto=True)
 
 
-async def _auto_place_order(session, best, available):
-    """Đặt 1 lệnh tự động cho tín hiệu `best`. Trả về True nếu đặt thành công."""
+async def _auto_place_order(session, best, snapshot):
+    """Đặt 1 lệnh auto cho tín hiệu `best` theo NGÂN SÁCH RỦI RO. Trả True nếu đã vào được vị thế.
+    `snapshot` = _account_risk_snapshot (equity, available, rủi ro đang mở, hạn lỗ ngày còn lại)."""
     symbol = best['symbol']
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
 
     # Rào chắn: funding cực đoan theo hướng đám đông → nguy cơ đảo chiều, bỏ qua
     funding_rate = best.get('funding_rate')
@@ -5145,197 +6163,176 @@ async def _auto_place_order(session, best, available):
             )
             return False
 
-    try:
-        max_lev = await get_max_leverage(session, api_key, api_secret, symbol)
-        # KHÔNG set đòn bẩy max: lev cao → khoảng cách thanh lý nhỏ → SL gốc bị clamp sát entry.
-        # Chọn đòn bẩy vừa đủ để SL gốc nằm trong vùng an toàn trước thanh lý.
+    # Không có SL ⇒ không đo được rủi ro ⇒ không vào lệnh
+    if not best.get('sl'):
+        logger.warning(f"[AI-AUTO] {symbol}: tín hiệu thiếu SL — bỏ qua.")
+        return False
+
+    ai_sc = (best.get('ai') or {}).get('long_score' if best['signal'] == 'LONG' else 'short_score')
+    ai_sc_txt = f"{ai_sc:.1f}" if isinstance(ai_sc, (int, float)) else "n/a"
+    signal_desc = (f"{symbol} {best['signal']} ({best['confidence']}, "
+                   f"điểm {best.get('_score', 0):.1f}, AI tự chấm {ai_sc_txt})\n"
+                   f"Entry tín hiệu ~{format_price(best.get('close'))}, "
+                   f"TP {format_price(best.get('tp'))}, SL {format_price(best['sl'])}")
+
+    async with _entry_lock():
         try:
             price_ref = await get_single_price(session, symbol)
         except Exception as e:
             logger.warning(f"[AI-AUTO] Không lấy được giá {symbol}: {e}")
             price_ref = 0
-        if price_ref and price_ref > 0 and best.get('sl'):
-            use_lev = _safe_leverage_for_sl(price_ref, float(best['sl']), max_lev)
-        else:
-            use_lev = max_lev
-        await set_leverage(session, api_key, api_secret, symbol, use_lev)
-        if use_lev < max_lev:
-            logger.info(f"[AI-AUTO] {symbol}: dùng đòn bẩy {use_lev}x (thay vì max {max_lev}x) "
-                        f"để SL gốc {format_price(best['sl'])} không bị kéo sát entry.")
-    except Exception as e:
-        logger.warning(f"[AI-AUTO] Không set được đòn bẩy {symbol}: {e}")
-        return False
+        if not price_ref or price_ref <= 0:
+            logger.warning(f"[AI-AUTO] {symbol}: không có giá tham chiếu — bỏ qua.")
+            return False
 
-    # Rào chắn: giá hiện tại cách close lúc quét quá xa → tín hiệu đã cũ, TP/SL lệch thực tế
-    if price_ref and price_ref > 0 and best.get('close'):
-        slip_pct = abs(price_ref - best['close']) / best['close']
-        if slip_pct > AUTO_MAX_SLIP_PCT:
-            logger.info(f"[AI-AUTO] Bỏ qua {symbol}: giá lệch tín hiệu {slip_pct * 100:.2f}%.")
+        # Rào chắn: giá hiện tại cách close lúc quét quá xa → tín hiệu đã cũ, TP/SL lệch thực tế
+        if best.get('close'):
+            slip_pct = abs(price_ref - best['close']) / best['close']
+            if slip_pct > AUTO_MAX_SLIP_PCT:
+                logger.info(f"[AI-AUTO] Bỏ qua {symbol}: giá lệch tín hiệu {slip_pct * 100:.2f}%.")
+                await _notify_all_chats(
+                    session,
+                    f"🤖🚫 *Bỏ qua {display_symbol(symbol)} {best['signal']}*: giá hiện tại cách tín hiệu "
+                    f"{slip_pct * 100:.2f}% (giới hạn {AUTO_MAX_SLIP_PCT * 100:.2f}%) — tín hiệu đã cũ."
+                )
+                return False
+
+        max_lev, lerr = await _max_leverage_strict(session, symbol)
+        if lerr:
+            logger.warning(f"[AI-AUTO] {lerr} — không vào lệnh (fail closed).")
             await _notify_all_chats(
                 session,
-                f"🤖🚫 *Bỏ qua {display_symbol(symbol)} {best['signal']}*: giá hiện tại cách tín hiệu "
-                f"{slip_pct * 100:.2f}% (giới hạn {AUTO_MAX_SLIP_PCT * 100:.2f}%) — tín hiệu đã cũ."
+                f"⚠️ *Bỏ qua {display_symbol(symbol)}*: {lerr} — không mở lệnh khi chưa đọc được "
+                f"đòn bẩy tối đa (fail closed)."
             )
             return False
-    chosen_notional = None
-    if price_ref and price_ref > 0:
-        sl_dist = abs(price_ref - float(best['sl'])) / price_ref
-        max_loss_per_notional = min(sl_dist, 0.5 / use_lev) if use_lev > 1 else sl_dist
-        risk_cap = (0.20 * available) / max_loss_per_notional if max_loss_per_notional > 0 else None
-        margin_cap = 0.20 * available
-        for notional in (200, 400, 800):
-            if (risk_cap is None or notional <= risk_cap) and notional / use_lev <= margin_cap:
-                chosen_notional = notional
-    ai_sc = (best.get('ai') or {}).get('long_score' if best['signal'] == 'LONG' else 'short_score')
-    signal_desc = (f"{best['symbol']} {best['signal']} ({best['confidence']}, "
-                   f"điểm {best.get('_score', 0):.1f}, AI tự chấm {ai_sc:.1f})\n"
-                   f"Entry ~{format_price(best['close'])}, "
-                   f"TP {format_price(best['tp'])}, SL {format_price(best['sl'])}")
 
-    if chosen_notional is None:
-        logger.info("[AI-AUTO] Không mức volume nào đạt ngưỡng an toàn — thông báo người dùng.")
-        await _notify_all_chats(
-            session,
-            f"🤖⚡ *AI tìm được lệnh ngon* nhưng rủi ro/margin vượt ngưỡng an toàn với số dư "
-            f"({available:,.2f} USDT):\n{signal_desc}\n"
-            f"→ Ngưỡng: lỗ khi SL khớp ≤ 20% và margin ≤ 20% số dư khả dụng. "
-            f"Nạp thêm hoặc đóng bớt vị thế rồi hỏi t đặt lại nhé."
-        )
-        return False
+        qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+        sl_trig = round_price_step(float(best['sl']), tick_size, price_p)
+        if (best['signal'] == 'LONG' and sl_trig >= price_ref) or \
+                (best['signal'] == 'SHORT' and sl_trig <= price_ref):
+            logger.warning(f"[AI-AUTO] {symbol}: SL {format_price(sl_trig)} nằm sai phía entry — bỏ qua.")
+            return False
+        # Đòn bẩy vừa đủ để SL nằm trong vùng an toàn trước thanh lý (KHÔNG kéo SL về gần entry)
+        lev = _safe_leverage_for_sl(price_ref, sl_trig, max_lev)
+        step, min_qty, min_notional = await _symbol_constraints(session, symbol, qty_p)
+        ok_size, quantity, size_msg = _plan_entry_size(
+            price_ref, sl_trig, best['signal'],
+            equity=snapshot['equity'], available=snapshot['available'],
+            open_risk=snapshot['open_risk'], daily_remaining=snapshot['daily_remaining'],
+            leverage=lev, step=step, min_qty=min_qty, min_notional=min_notional)
+        if not ok_size:
+            logger.info(f"[AI-AUTO] {symbol}: {size_msg}")
+            await _notify_all_chats(
+                session,
+                f"🤖⚡ *AI tìm được lệnh ngon* nhưng không vào được theo ngân sách rủi ro:\n{signal_desc}\n"
+                f"→ {size_msg}\n"
+                f"Ngân sách: 0.5% equity/lệnh, tổng rủi ro mở ≤ 1.5% equity (đã trừ rủi ro đang mở), "
+                f"hạn lỗ ngày còn {snapshot['daily_remaining']:,.2f} USDT."
+            )
+            return False
 
-    qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
-    quantity = round_down(chosen_notional / price_ref, qty_p)
-    if quantity <= 0:
-        logger.warning("[AI-AUTO] Quantity tính ra 0 — bỏ qua.")
-        return False
-
-    side = 'BUY' if best['signal'] == 'LONG' else 'SELL'
-    order_params = {
-        'symbol': symbol, 'side': side, 'type': 'MARKET',
-        'quantity': f"{quantity:.{qty_p}f}",
-        'timestamp': int(time.time() * 1000), 'recvWindow': 10000,
-    }
-    if hedge_mode:
-        order_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
-    query = urlencode(order_params)
-    signature = get_binance_signature(query, api_secret)
-    url = f"https://fapi.binance.com/fapi/v1/order?{query}&signature={signature}"
-    headers = {"X-MBX-APIKEY": api_key}
-    async with session.post(yarl.URL(url, encoded=True), headers=headers) as resp:
-        data = await resp.json()
-    if resp.status != 200:
-        err_msg = data.get('msg', f"HTTP {resp.status}")
-        logger.warning(f"[AI-AUTO] Đặt lệnh thất bại: {err_msg}")
-        await _notify_all_chats(
-            session,
-            f"⚠️ AI định tự vào lệnh nhưng THẤT BẠI:\n{signal_desc}\n→ Lỗi từ Binance: `{err_msg}`"
-        )
-        return False
-
-    # 5. Tự đặt TP/SL điều kiện (algo service) — SL theo thanh lý + số dư, TP theo R:R
-    close_side = 'SELL' if side == 'BUY' else 'BUY'
-    is_long_pos = (close_side == 'SELL')
-    # 5a. SL: clamp thanh lý + giới hạn lỗ ≤ ~20% số dư khả dụng
-    sl_trig = round_price_step(float(best['sl']), tick_size, price_p)
-    sl_trig, liq_clamped = _clamp_stop_for_liquidation(is_long_pos, price_ref, sl_trig, use_lev)
-    avail_now = await get_available_balance(session)
-    if avail_now and avail_now > 0 and quantity > 0:
-        max_loss_dist = (0.20 * avail_now) / quantity
-        if is_long_pos and sl_trig < price_ref - max_loss_dist:
-            sl_trig = price_ref - max_loss_dist
-            liq_clamped = True
-        elif not is_long_pos and sl_trig > price_ref + max_loss_dist:
-            sl_trig = price_ref + max_loss_dist
-            liq_clamped = True
-    sl_trig = round_price_step(sl_trig, tick_size, price_p)
-    sl_dist = abs(price_ref - sl_trig)
-    if liq_clamped:
-        logger.warning(f"[AI-AUTO] SL gốc {format_price(best['sl'])} không hợp lý "
-                       f"({max_lev}x/số dư) — điều chỉnh về {format_price(sl_trig)}")
-    # 5b. TP: khoảng cách tối đa 2x khoảng cách SL (R:R hợp lý, không để TP viển vông)
-    tp_trig = float(best['tp'])
-    if tp_trig and tp_trig > 0 and abs(tp_trig - price_ref) > 2 * sl_dist:
-        tp_trig = price_ref + (2 * sl_dist if is_long_pos else -2 * sl_dist)
-        tp_capped = True
-    else:
-        tp_capped = False
-    tp_trig = round_price_step(tp_trig, tick_size, price_p)
-    # Ghi lịch sử tín hiệu với TP/SL THỰC TẾ (đã clamp thanh lý + cap TP) để
-    # win-rate trong stats khớp đúng lệnh auto đã đặt, không phải TP/SL gốc của scan
-    best['tp'] = tp_trig
-    best['sl'] = sl_trig
-    best['close'] = price_ref
-    record_signal(best, best.get('ai'), origin='auto')
-    sl_algo_id = None
-    tp_algo_id = None
-    tpsl_results = []
-    for label, otype, trigger in (
-        ("TP", 'TAKE_PROFIT_MARKET', tp_trig),
-        ("SL", 'STOP_MARKET', sl_trig),
-    ):
+        sl_dist = abs(price_ref - sl_trig)
+        # TP: giữ nguyên hành vi cũ — cap khoảng cách ≤ 2× khoảng cách SL; không có TP thì chỉ đặt SL
+        tp_trig = 0.0
         try:
-            algo_params = {
-                'algoType': 'CONDITIONAL',
-                'symbol': symbol, 'side': close_side, 'type': otype,
-                'triggerPrice': f"{trigger:.{price_p}f}",
-                'quantity': f"{quantity:.{qty_p}f}",
-                'workingType': 'MARK_PRICE',
-            }
-            if hedge_mode:
-                algo_params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
+            tp_raw = float(best.get('tp') or 0)
+        except (TypeError, ValueError):
+            tp_raw = 0.0
+        if tp_raw > 0:
+            if abs(tp_raw - price_ref) > 2 * sl_dist:
+                tp_trig = price_ref + (2 * sl_dist if best['signal'] == 'LONG' else -2 * sl_dist)
             else:
-                algo_params['reduceOnly'] = 'true'
-            adata, aerr = await binance_signed_request(session, 'POST', '/fapi/v1/algoOrder', algo_params)
-            if not aerr:
-                line = (f"✅ {label}: {otype} kích hoạt {format_price(trigger)} "
-                        f"(algoId `{adata.get('algoId')}`)")
-                if label == 'SL':
-                    sl_algo_id = adata.get('algoId')
-                    if liq_clamped:
-                        line += (f"\n⚠️ SL gốc {format_price(best['sl'])} không hợp lý "
-                                 f"(vượt thanh lý/lỗ >20% số dư) — đã điều chỉnh")
-                if label == 'TP':
-                    tp_algo_id = adata.get('algoId')
-                    if tp_capped:
-                        line += "\nℹ️ TP đã hạ về 2x khoảng cách SL cho R:R hợp lý"
-                tpsl_results.append(line)
-            else:
-                tpsl_results.append(f"❌ {label}: {aerr}")
-        except Exception as tpsl_e:
-            tpsl_results.append(f"❌ {label}: {tpsl_e}")
-    tpsl_block = "\n🛡️ *TP/SL tự đặt:*\n" + "\n".join(tpsl_results) if tpsl_results else ""
-    await _notify_all_chats(
-        session,
-        f"🤖⚡ *AI TỰ ĐỘNG VÀO LỆNH*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 {signal_desc}\n"
-        f"💵 Volume: {chosen_notional} USDT (đòn bẩy {use_lev}x)\n"
-        f"📦 Quantity: {quantity:.{qty_p}f}\n"
-        f"OrderId: `{data.get('orderId')}` | Status: {data.get('status')}"
-        f"{tpsl_block}"
-    )
-    logger.info(f"[AI-AUTO] Đã tự vào lệnh {symbol} {best['signal']} "
-                f"{chosen_notional}u, orderId={data.get('orderId')}")
+                tp_trig = tp_raw
+            tp_trig = round_price_step(tp_trig, tick_size, price_p)
 
-    # Đăng ký vị thế để trailing loop quản lý breakeven + trailing stop
-    pos_side = ('LONG' if side == 'BUY' else 'SHORT') if hedge_mode else 'BOTH'
-    auto_managed[f"{symbol}_{pos_side}"] = {
-        'symbol': symbol,
-        'side': best['signal'],
-        'entry': price_ref,
-        'sl_initial': sl_trig,
-        'risk': sl_dist,
-        'atr': float(best.get('atr') or 0) or sl_dist * 1.5,
-        'tp': tp_trig,
-        'qty': quantity,
-        'pos_side': pos_side,
-        'sl_algo_id': sl_algo_id,
-        'tp_algo_id': tp_algo_id,
-        'last_sl': sl_trig,
-        'ts': time.time(),
-    }
-    _save_auto_managed()
-    return True
+        pos_side = ('LONG' if best['signal'] == 'LONG' else 'SHORT') if hedge_mode else 'BOTH'
+        risk_budget = _risk_budget_allowance(snapshot['equity'], snapshot['open_risk'],
+                                             snapshot['daily_remaining'])
+        result = await _execute_protected_entry(
+            session, symbol=symbol, side=best['signal'], quantity=quantity, price=price_ref,
+            sl_price=sl_trig, tp_price=tp_trig, qty_p=qty_p, price_p=price_p, step=step,
+            pos_side=pos_side, max_lev=max_lev, open_symbols=snapshot.get('open_symbols') or (),
+            risk_budget=risk_budget)
+
+        # Lệnh CÓ THỂ đã khớp dù bảo vệ lỗi → ghi signal theo khớp thật để PnL vẫn được đối soát
+        opened_qty = result.get('entry_qty')
+        signal_id = None
+        if opened_qty:
+            execution = _execution_record(order_id=result['order_id'], quantity=opened_qty,
+                                          pos_side=pos_side, side=best['signal'],
+                                          entry_time=result['entry_time'])
+            best['tp'] = tp_trig or None
+            best['sl'] = sl_trig
+            best['close'] = result['entry_price']
+            signal_id = record_signal(best, best.get('ai'), origin='auto', execution=execution)
+
+        if not result['ok']:
+            logger.warning(f"[AI-AUTO] {symbol}: {result['msg']}")
+            await _notify_all_chats(
+                session,
+                f"⚠️ *AI định tự vào {display_symbol(symbol)} nhưng KHÔNG an toàn*:\n{signal_desc}\n"
+                f"→ {result['msg']}"
+            )
+            if result.get('close_pending'):
+                # Khớp rồi mà chưa đóng lại được → để loop trailing thử tiếp, không bỏ mặc vị thế
+                auto_managed[f"{symbol}_{pos_side}"] = {
+                    'symbol': symbol, 'side': best['signal'], 'pos_side': pos_side,
+                    'managed': True, 'close_pending': True,
+                    'entry': result.get('entry_price') or price_ref,
+                    'sl_initial': sl_trig, 'risk': sl_dist,
+                    'qty': result.get('entry_qty') or quantity,
+                    'atr': float(best.get('atr') or 0) or sl_dist * 1.5,
+                    'ts': time.time(), 'signal_id': signal_id,
+                }
+                _save_auto_managed()
+            return False
+
+        filled_qty = result['filled_qty']   # phần CÒN LẠI được bảo vệ (đã trừ size cắt do trượt giá)
+        entry_fill = result['entry_price']
+        logger.info(f"[AI-AUTO] Đã vào {symbol} {best['signal']} khớp {result['entry_qty']:g} "
+                    f"(còn {filled_qty:g}) @ {entry_fill:g} "
+                    f"(lev {result['lev']}x, orderId={result['order_id']}, signal_id={signal_id})")
+
+        # Đăng ký vị thế để trailing loop quản lý breakeven + trailing stop
+        auto_managed[f"{symbol}_{pos_side}"] = {
+            'symbol': symbol,
+            'side': best['signal'],
+            'entry': entry_fill,
+            'sl_initial': sl_trig,
+            'risk': sl_dist,
+            'atr': float(best.get('atr') or 0) or sl_dist * 1.5,
+            'tp': tp_trig or None,
+            'qty': filled_qty,
+            'pos_side': pos_side,
+            'sl_algo_id': result['sl_id'],
+            'tp_algo_id': result['tp_id'],
+            'last_sl': sl_trig,
+            'ts': time.time(),
+            'signal_id': signal_id,
+            'managed': True,
+        }
+        _save_auto_managed()
+
+        tpsl_lines = [f"{'✅ SL' if result['sl_id'] else '❌ SL'} kích hoạt {format_price(sl_trig)} "
+                      f"(algoId `{result['sl_id']}`)"]
+        if tp_trig:
+            tpsl_lines.append(f"{'✅ TP' if result['tp_id'] else '❌ TP'} kích hoạt {format_price(tp_trig)} "
+                              f"(algoId `{result['tp_id']}`)")
+        if result['msg']:
+            tpsl_lines.append(f"⚠️ {result['msg']}")
+        await _notify_all_chats(
+            session,
+            f"🤖⚡ *AI TỰ ĐỘNG VÀO LỆNH*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 {signal_desc}\n"
+            f"📦 Khối lượng: {filled_qty:g} (đòn bẩy {result['lev']}x)\n"
+            f"🎯 Giá khớp thật: {format_price(entry_fill)}\n"
+            f"💵 {size_msg}\n"
+            f"OrderId: `{result['order_id']}`\n"
+            f"🛡️ *Bảo vệ:*\n" + "\n".join(tpsl_lines)
+        )
+        return True
 
 
 async def _cancel_algo_sl(session, api_key, api_secret, symbol, algo_id):
@@ -5358,10 +6355,12 @@ async def _cancel_algo_sl(session, api_key, api_secret, symbol, algo_id):
     return False
 
 
-async def _place_conditional_tpsl(session, symbol, close_side, order_type, trigger_price, quantity, pos_side=None):
+async def _place_conditional_tpsl(session, symbol, close_side, order_type, trigger_price, quantity,
+                                  pos_side=None, client_id=None):
     """Đặt 1 lệnh điều kiện TP/SL qua Algo Service (workingType = MARK_PRICE).
     trigger_price/quantity phải là chuỗi đã làm tròn đúng tick size.
-    Trả về (ok: bool, info: algoId hoặc thông báo lỗi)."""
+    Hedge Mode: dùng positionSide và KHÔNG gửi reduceOnly; One-way: gửi reduceOnly.
+    Trả về (ok: bool, algoId dạng str hoặc thông báo lỗi)."""
     params = {
         'algoType': 'CONDITIONAL',
         'symbol': symbol,
@@ -5370,14 +6369,21 @@ async def _place_conditional_tpsl(session, symbol, close_side, order_type, trigg
         'triggerPrice': trigger_price,
         'quantity': quantity,
         'workingType': 'MARK_PRICE',
-        'reduceOnly': 'true',
     }
     if pos_side and pos_side != 'BOTH':
         params['positionSide'] = pos_side
+    else:
+        params['reduceOnly'] = 'true'
+    if client_id:
+        # Algo Service dùng `clientAlgoId` (KHÔNG phải newClientOrderId): ^[.A-Z:/a-z0-9_-]{1,36}$
+        params['clientAlgoId'] = client_id
     data, err = await binance_signed_request(session, 'POST', '/fapi/v1/algoOrder', params)
     if err:
         return False, err
-    return True, data.get('algoId') or data.get('orderId')
+    algo_id = _normalize_order_id((data or {}).get('algoId') or (data or {}).get('orderId'))
+    if not algo_id:
+        return False, "sàn không trả về algoId — không xác nhận được lệnh bảo vệ."
+    return True, algo_id
 
 
 async def auto_trailing_loop(app):
@@ -5394,40 +6400,62 @@ async def auto_trailing_loop(app):
             api_secret = os.getenv("BINANCE_API_SECRET")
             now = time.time()
             for key, meta in list(auto_managed.items()):
+                # SL cũ chưa hủy được ở vòng trước → dọn (không ảnh hưởng SL mới đang hiệu lực)
+                await _cleanup_stale_sl(session, meta)
+
                 pos = positions.get(key)
-                if not pos or float(pos.get('positionAmt', 0) or 0) == 0:
+                pos_amt = float(pos.get('positionAmt', 0) or 0) if pos else 0.0
+
+                # 0. Đang chờ đóng (không đặt được SL hoặc quá hạn): thử đóng tới khi hết vị thế,
+                #    CHỈ hủy bảo vệ SAU khi vị thế đã phẳng (đọc REST, không tin cache WS).
+                if meta.get('close_pending'):
+                    live, lerr = await _live_position(session, meta['symbol'], meta.get('pos_side'))
+                    if lerr:
+                        logger.warning(f"[AI-TRAIL] Không kiểm tra được vị thế {meta['symbol']}: {lerr}")
+                        continue
+                    if live is None:
+                        for aid in (meta.get('sl_algo_id'), meta.get('tp_algo_id')):
+                            await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], aid)
+                        logger.info(f"[AI-TRAIL] {meta['symbol']}: vị thế đã phẳng, dọn bảo vệ còn lại.")
+                        auto_managed.pop(key, None)
+                        _save_auto_managed()
+                        continue
+                    red_ok, red_msg = await _emergency_reduce_close(
+                        session, meta['symbol'], meta['side'], meta.get('pos_side'))
+                    logger.warning(f"[AI-TRAIL] Đóng lại {meta['symbol']} {meta['side']}: "
+                                   f"{'OK — ' if red_ok else 'CHƯA được — '}{red_msg}")
+                    if red_ok:
+                        await _notify_all_chats(
+                            session,
+                            f"⚠️ *Đã đóng khẩn cấp {display_symbol(meta['symbol'])} {meta['side']}* "
+                            f"(lệnh bảo vệ không đặt được): {red_msg}"
+                        )
+                    continue
+
+                if pos_amt == 0:
                     auto_managed.pop(key, None)  # vị thế đã đóng → dọn dẹp
                     _save_auto_managed()
                     continue
+                if not meta.get('managed', True):
+                    continue  # vị thế do /ai mở: không trailing, chỉ giữ bảo vệ
 
                 # Đóng vị thế quá hạn (khớp expired của backtest = đóng ở ~0R, tránh phí funding)
                 if now - meta.get('ts', 0) > AUTO_MAX_HOLD_HOURS * 3600:
-                    qty_p, price_p, _ = await get_symbol_precisions(session, meta['symbol'])
-                    real_qty = abs(float(pos.get('positionAmt', 0) or 0))
-                    close_side = 'SELL' if meta['side'] == 'LONG' else 'BUY'
-                    params = {
-                        'symbol': meta['symbol'], 'side': close_side, 'type': 'MARKET',
-                        'quantity': f"{real_qty:.{qty_p}f}", 'reduceOnly': 'true',
-                    }
-                    if meta['pos_side'] != 'BOTH':
-                        params['positionSide'] = meta['pos_side']
-                    # Hủy TP/SL algo còn lại trước khi đóng để tránh order mồ côi
-                    for aid in (meta.get('tp_algo_id'), meta.get('sl_algo_id')):
-                        await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], aid)
-                    data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
-                    if not err:
-                        auto_managed.pop(key, None)
+                    # Đóng XONG mới hủy bảo vệ (đóng lỗi ⇒ vẫn còn SL che)
+                    ok_close, close_msg = await _emergency_reduce_close(
+                        session, meta['symbol'], meta['side'], meta.get('pos_side'))
+                    if ok_close:
+                        meta['close_pending'] = True
                         _save_auto_managed()
                         logger.info(f"[AI-TRAIL] Đóng vị thế auto {meta['symbol']} {meta['side']} "
-                                    f"sau {AUTO_MAX_HOLD_HOURS}h (không chạm TP/SL).")
+                                    f"sau {AUTO_MAX_HOLD_HOURS}h: {close_msg}")
                         await _notify_all_chats(
                             session,
                             f"⏰ *Đóng vị thế auto {display_symbol(meta['symbol'])} {meta['side']}* "
-                            f"vì mở quá {AUTO_MAX_HOLD_HOURS}h chưa chạm TP/SL (khớp mô hình backtest, "
-                            f"tránh phí funding)."
+                            f"vì mở quá {AUTO_MAX_HOLD_HOURS}h chưa chạm TP/SL ({close_msg})."
                         )
                     else:
-                        logger.warning(f"[AI-TRAIL] Đóng vị thế quá hạn {meta['symbol']} thất bại: {err}")
+                        logger.warning(f"[AI-TRAIL] Đóng vị thế quá hạn {meta['symbol']} thất bại: {close_msg}")
                     continue
 
                 mark = float(pos.get('markPrice', 0) or 0)
@@ -5440,49 +6468,55 @@ async def auto_trailing_loop(app):
                 is_long = meta['side'] == 'LONG'
                 r = (mark - entry) / risk if is_long else (entry - mark) / risk
 
-                # Khi trailing bắt đầu: hủy TP cố định, để lời chạy (chỉ làm 1 lần)
-                if (AUTO_CANCEL_TP_ON_TRAIL and not meta.get('tp_cancelled')
-                        and r >= AUTO_TRAIL_START_RR):
-                    if await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], meta.get('tp_algo_id')):
-                        meta['tp_cancelled'] = True
-                        _save_auto_managed()
-                        logger.info(f"[AI-TRAIL] {meta['symbol']} {meta['side']} R={r:.2f}: "
-                                    f"hủy TP cố định, để lời chạy theo trailing.")
-
-                # Chốt lời một phần: đạt +PARTIAL_RR → chốt 50%, kéo SL về entry, phần còn lại trailing
+                # Chốt lời một phần: đạt +PARTIAL_RR → chốt 50%; SL về entry chỉ đổi SAU khi đặt được SL mới
                 if (AUTO_PARTIAL_TP_RR > 0 and not meta.get('partial_done')
                         and r >= AUTO_PARTIAL_TP_RR):
                     qty_p, price_p, _ = await get_symbol_precisions(session, meta['symbol'])
-                    real_qty = abs(float(pos.get('positionAmt', 0) or 0))
-                    part_qty = real_qty * AUTO_PARTIAL_TP_PCT
-                    part_qty = max(part_qty, 10 ** -qty_p)  # tránh qty 0 do làm tròn
-                    close_side = 'SELL' if meta['side'] == 'LONG' else 'BUY'
-                    params = {
-                        'symbol': meta['symbol'], 'side': close_side, 'type': 'MARKET',
-                        'quantity': f"{part_qty:.{qty_p}f}", 'reduceOnly': 'true',
-                    }
-                    if meta['pos_side'] != 'BOTH':
-                        params['positionSide'] = meta['pos_side']
-                    data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
-                    if not err:
+                    step, _, _ = await _symbol_constraints(session, meta['symbol'], qty_p)
+                    real_qty = abs(pos_amt)
+                    part_qty = _round_to_step(real_qty * AUTO_PARTIAL_TP_PCT, step)
+                    if part_qty < max(step, _min_step_qty(qty_p)) or (real_qty - part_qty) < max(step, _min_step_qty(qty_p)):
+                        logger.warning(f"[AI-TRAIL] {meta['symbol']}: khối lượng quá nhỏ để chốt một phần "
+                                       "— bỏ qua bước này.")
                         meta['partial_done'] = True
-                        # Cập nhật khối lượng còn lại để SL/trailing sau này dùng đúng qty
-                        meta['qty'] = max(real_qty - part_qty, 10 ** -qty_p)
-                        # Phần còn lại: kéo SL về entry để bảo toàn vốn, vẫn giữ trailing
-                        meta['last_sl'] = entry
                         _save_auto_managed()
-                        logger.info(f"[AI-TRAIL] {meta['symbol']} {meta['side']} R={r:.2f}: "
-                                    f"chốt {AUTO_PARTIAL_TP_PCT * 100:.0f}% lời +{AUTO_PARTIAL_TP_RR:.0f}R.")
-                        await _notify_all_chats(
-                            session,
-                            f"💰 *Chốt lời một phần* {display_symbol(meta['symbol'])} {meta['side']} "
-                            f"(+{AUTO_PARTIAL_TP_RR:.0f}R)\n"
-                            f"Đã chốt {AUTO_PARTIAL_TP_PCT * 100:.0f}% khối lượng, phần còn lại "
-                            f"SL về entry + trailing."
-                        )
                     else:
-                        logger.warning(f"[AI-TRAIL] Chốt một phần {meta['symbol']} thất bại: {err}")
-                    # Tiếp tục xuống phần trailing bên dưới (vẫn siết SL khi đủ điều kiện)
+                        close_side = 'SELL' if is_long else 'BUY'
+                        part_client = _new_client_order_id('pnlbot_part')
+                        params = {
+                            'symbol': meta['symbol'], 'side': close_side, 'type': 'MARKET',
+                            'quantity': f"{part_qty:.{qty_p}f}", 'newOrderRespType': 'RESULT',
+                            'newClientOrderId': part_client,
+                        }
+                        if meta['pos_side'] != 'BOTH':
+                            params['positionSide'] = meta['pos_side']
+                        else:
+                            params['reduceOnly'] = 'true'
+                        data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
+                        fill = _fill_from_order(data) if not err else None
+                        if err and fill is None:
+                            found, qerr = await _query_order(session, meta['symbol'], client_id=part_client)
+                            fill = _fill_from_order(found) if not qerr else None
+                        if fill:
+                            closed_qty = fill[0]
+                            remaining = max(real_qty - closed_qty, 0.0)
+                            meta['partial_done'] = True
+                            meta['qty'] = _round_to_step(remaining, step)
+                            # Mức SL mong muốn cho phần còn lại: siết về entry — chỉ ghi last_sl khi đặt được
+                            meta['be_arm'] = entry
+                            _save_auto_managed()
+                            logger.info(f"[AI-TRAIL] {meta['symbol']} {meta['side']} R={r:.2f}: "
+                                        f"chốt {AUTO_PARTIAL_TP_PCT * 100:.0f}% lời +{AUTO_PARTIAL_TP_RR:.0f}R "
+                                        f"({closed_qty:g}).")
+                            await _notify_all_chats(
+                                session,
+                                f"💰 *Chốt lời một phần* {display_symbol(meta['symbol'])} {meta['side']} "
+                                f"(+{AUTO_PARTIAL_TP_RR:.0f}R)\n"
+                                f"Đã chốt {AUTO_PARTIAL_TP_PCT * 100:.0f}% khối lượng; phần còn lại "
+                                f"đang được siết SL về entry."
+                            )
+                        else:
+                            logger.warning(f"[AI-TRAIL] Chốt một phần {meta['symbol']} thất bại: {err or 'chưa xác nhận khớp'}")
 
                 target_sl = None
                 if r >= AUTO_TRAIL_START_RR:
@@ -5492,46 +6526,61 @@ async def auto_trailing_loop(app):
                         target_sl = mark + meta['atr'] * AUTO_TRAIL_ATR_MULT
                 elif AUTO_BE_RR > 0 and r >= AUTO_BE_RR:
                     target_sl = entry  # breakeven
+                arm = meta.get('be_arm')
+                if arm is not None:
+                    target_sl = arm if target_sl is None else (max(target_sl, arm) if is_long else min(target_sl, arm))
                 if target_sl is None:
                     continue
 
+                last_sl = meta.get('last_sl', meta['sl_initial'])
                 if is_long:
-                    new_sl = max(meta.get('last_sl', meta['sl_initial']), target_sl)
+                    new_sl = max(last_sl, target_sl)
                 else:
-                    new_sl = min(meta.get('last_sl', meta['sl_initial']), target_sl)
+                    new_sl = min(last_sl, target_sl)
                 improvement = ((new_sl - meta['sl_initial']) / risk if is_long
                                else (meta['sl_initial'] - new_sl) / risk)
-                if new_sl == meta.get('last_sl') or improvement < AUTO_TRAIL_MIN_RR:
+                forced = arm is not None and new_sl != last_sl
+                if new_sl == last_sl or (improvement < AUTO_TRAIL_MIN_RR and not forced):
                     continue
 
                 qty_p, price_p, tick_size = await get_symbol_precisions(session, meta['symbol'])
+                step, _, _ = await _symbol_constraints(session, meta['symbol'], qty_p)
                 new_sl = round_price_step(new_sl, tick_size, price_p)
-                if new_sl == meta.get('last_sl'):
+                if new_sl == last_sl:
+                    if arm is not None:
+                        meta.pop('be_arm', None)
+                        _save_auto_managed()
                     continue
 
+                # SL mới dùng ĐÚNG khối lượng vị thế hiện tại (vị thế có thể đã giảm do chốt một phần)
+                close_qty = _round_to_step(abs(pos_amt), step)
+                if close_qty < max(step, _min_step_qty(qty_p)):
+                    continue
                 close_side = 'SELL' if is_long else 'BUY'
                 pos_side = None if meta['pos_side'] == 'BOTH' else meta['pos_side']
-                # Hủy SL cũ (chỉ SL, giữ nguyên TP) rồi đặt SL mới
-                if not await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], meta.get('sl_algo_id')):
-                    await cancel_existing_tpsl(session, api_key, api_secret, meta['symbol'],
-                                               position_side=pos_side, cancel_tp=False, cancel_sl=True)
-                ok, info = await _place_conditional_tpsl(session, meta['symbol'], close_side,
-                                                         'STOP_MARKET',
-                                                         f"{new_sl:.{price_p}f}",
-                                                         f"{meta['qty']:.{qty_p}f}", pos_side)
-                if ok:
-                    meta['sl_algo_id'] = info if isinstance(info, str) and str(info).isdigit() else meta.get('sl_algo_id')
-                    meta['last_sl'] = new_sl
-                    _save_auto_managed()
+                # Đặt SL MỚI trước — chỉ hủy SL cũ sau khi SL mới đã xác nhận
+                new_id = await _replace_protective_sl(session, meta, new_sl, close_qty, close_side,
+                                                      pos_side, price_p, qty_p)
+                if new_id:
+                    if arm is not None:
+                        meta.pop('be_arm', None)
+                        _save_auto_managed()
                     logger.info(f"[AI-TRAIL] {meta['symbol']} {meta['side']} R={r:.2f}: "
-                                f"SL {format_price(meta['sl_initial'])} → {format_price(new_sl)}")
+                                f"SL {format_price(last_sl)} → {format_price(new_sl)}")
                     await _notify_all_chats(
                         session,
                         f"🛡️ *Trailing Stop* {display_symbol(meta['symbol'])} {meta['side']} (+{r:.1f}R)\n"
-                        f"SL: `{format_price(meta['sl_initial'])}` → `{format_price(new_sl)}`"
+                        f"SL: `{format_price(last_sl)}` → `{format_price(new_sl)}`"
                     )
-                else:
-                    logger.warning(f"[AI-TRAIL] Không cập nhật được SL {meta['symbol']}: {info}")
+
+                # Chỉ hủy TP cố định SAU khi đã có SL mới hoạt động (SL không lỗi ⇒ vị thế không trần)
+                if (AUTO_CANCEL_TP_ON_TRAIL and not meta.get('tp_cancelled')
+                        and r >= AUTO_TRAIL_START_RR and meta.get('sl_algo_id')):
+                    if await _cancel_algo_sl(session, api_key, api_secret, meta['symbol'], meta.get('tp_algo_id')):
+                        meta['tp_cancelled'] = True
+                        _save_auto_managed()
+                        logger.info(f"[AI-TRAIL] {meta['symbol']} {meta['side']} R={r:.2f}: "
+                                    f"hủy TP cố định, để lời chạy theo trailing.")
             await asyncio.sleep(AUTO_TRAIL_CHECK_SEC)
         except asyncio.CancelledError:
             break
@@ -5555,7 +6604,8 @@ async def ai_auto_trader_loop(app):
             long_signals, short_signals = await get_scan_signals_fresh(session, max_age=0)
 
             # 2. Lọc tín hiệu "CỰC LỚN": CHỈ 4-5 sao (Mạnh/Rất mạnh) + điểm ≥ ngưỡng + nhóm có win-rate OK.
-            # (Lưu ý: live 4-5⭐: LONG 52%, SHORT 71% decided — số backtest 70%/37.5% cũ trong comment là prior cũ)
+            # Win-rate dùng ở đây giờ chỉ lấy từ LỆNH THẬT đã đối soát (fills + phí + funding),
+            # không còn trộn tín hiệu quét/giả lập như trước.
             quasi = [s for s in (list(long_signals) + list(short_signals))
                      if s.get('confidence') in ('Mạnh', 'Rất mạnh') and band_winrate_ok(s.get('confidence'))]
             def _auto_score(s):
@@ -5571,9 +6621,10 @@ async def ai_auto_trader_loop(app):
                     return None
                 return ai.get('short_score' if s.get('signal') == 'LONG' else 'long_score')
             # Tự vào lệnh chỉ khi: 4-5 sao + rule cao + AI xác nhận cùng chiều + AI chấm cao + cách biệt chiều ngược đủ lớn.
-            # Backtest: band "Mạnh" (5.0-6.0) thắng 55.6%, band "Rất mạnh" (≥6.0) chỉ 45.5% -> KHÔNG ưu tiên điểm cao mù quáng.
+            # Các ngưỡng dưới đây là LEGACY (hiệu chỉnh bằng simulator cũ đã phát hiện thiên lệch),
+            # CHƯA tái kiểm chứng; backtest corrected cho EV âm nên auto đang TẮT mặc định.
             # AI lỗi/không phản hồi (ai=None) → KHÔNG tự vào lệnh (tiền thật, không liều).
-            # SHORT bị siết thêm: điểm hệ thống & AI tự chấm cao hơn hẳn LONG + bộ lọc side (SHORT backtest chỉ 37.5%).
+            # SHORT siết chặt hơn LONG chỉ là rào chắn thận trọng, không phải bằng chứng EV dương.
             candidates = [s for s in quasi
                           if s.get('confidence') in ('Mạnh', 'Rất mạnh')
                           and _auto_score(s) >= (AI_AUTO_SHORT_MIN_SCORE if s.get('signal') == 'SHORT' else AI_AUTO_MIN_SCORE)
@@ -5621,27 +6672,45 @@ async def ai_auto_trader_loop(app):
                 await asyncio.sleep(AI_AUTO_TRADER_INTERVAL)
                 continue
 
-            available = await get_available_balance(session)
-            if available is None:
-                logger.warning("[AI-AUTO] Không lấy được số dư khả dụng — bỏ qua lượt này.")
+            # 4. Mở lần lượt các tín hiệu tốt nhất; mỗi lệnh refresh lại risk/balance (fail closed)
+            #    (khi cổng rollout tắt: chỉ báo tín hiệu, KHÔNG gọi _auto_place_order)
+            if not _auto_trade_enabled():
+                logger.info(f"[AI-AUTO] {AUTO_TRADE_OFF_REASON}")
+                gate_lines = []
+                for s in candidates[:5]:
+                    gate_lines.append(
+                        f"• {s['symbol']} {s['signal']} ({s['confidence']}, điểm {s.get('_score', 0):.1f}"
+                        f", AI tự chấm {_ai_score(s):.1f}) — entry ~{format_price(s['close'])}, "
+                        f"TP {format_price(s['tp'])}, SL {format_price(s['sl'])}"
+                    )
+                await _notify_all_chats(
+                    session,
+                    f"🤖✋ *AI KHÔNG tự vào lệnh* (auto đang tắt để bảo toàn vốn):\n"
+                    + "\n".join(gate_lines)
+                    + f"\n→ {AUTO_TRADE_OFF_REASON}\nMuốn vào lệnh nào thì nhắn t nhé."
+                )
                 await asyncio.sleep(AI_AUTO_TRADER_INTERVAL)
                 continue
-
-            # 4. Mở lần lượt các tín hiệu tốt nhất cho tới khi đủ AUTO_MAX_OPEN_POSITIONS
-            open_now = _count_auto_open_positions()
-            placed = 0
             for best in candidates:
-                if placed + open_now >= AUTO_MAX_OPEN_POSITIONS:
+                if _count_auto_open_positions() >= AUTO_MAX_OPEN_POSITIONS:
                     break
                 if any(p.get('symbol') == best['symbol'] for p in positions.values()):
                     logger.info(f"[AI-AUTO] Đã có vị thế {best['symbol']} — bỏ qua, không chồng lệnh.")
                     continue
+                snapshot, serr = await _account_risk_snapshot(session)
+                if serr:
+                    logger.warning(f"[AI-AUTO] Dừng lượt này: {serr}")
+                    if time.time() - AUTO_STATE.get('last_notify', 0) > 6 * 3600:
+                        AUTO_STATE['last_notify'] = time.time()
+                        await _notify_all_chats(
+                            session,
+                            f"🤖⏸️ *AI tạm dừng tự trade:* không đo được rủi ro tài khoản ({serr})."
+                        )
+                    break
                 logger.info(f"[AI-AUTO] Tín hiệu: {best['symbol']} {best['signal']} "
                             f"({best['confidence']}, điểm {best.get('_score', 0):.1f}, "
                             f"AI tự chấm {_ai_score(best):.1f})")
-                if await _auto_place_order(session, best, available):
-                    placed += 1
-                    open_now += 1
+                await _auto_place_order(session, best, snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -5711,53 +6780,58 @@ def _save_pump_state():
 
 
 def _pump_score(res_15m, res_1h, change24, funding, oi_change, taker_ratio):
-    """Điểm 0-10 đo 'đà tăng còn nguyên hay đã cháy đuồi' cho coin đang bay."""
-    score = 0.0
+    """Điểm 0-10 đo 'đà tăng còn nguyên hay đã cháy đuồi' cho coin đang bay.
+
+    Trần 10 áp cho phần ĐIỂM CỘNG trước rồi mới trừ điểm phạt: nếu clamp sau khi trừ thì
+    coin đã bay quá xa (+150%/24h) hoặc funding quá đông vẫn hiện đúng 10/10 và bị báo
+    'FOMO ngay' — đúng loại rủi ro mà điểm phạt sinh ra để loại."""
+    base = 0.0
+    penalty = 0.0
     reasons = []
     if res_15m.get('close') and res_15m.get('ema9') and res_15m.get('ema21'):
         if res_15m['close'] > res_15m['ema9'] > res_15m['ema21']:
-            score += 2
+            base += 2
             reasons.append("15m EMA stack chuẩn 🟢")
         if res_15m['close'] > (res_15m.get('vwap') or 0):
-            score += 1
+            base += 1
             reasons.append("giá trên VWAP 15m")
     if res_1h.get('close') and res_1h.get('ema9') and res_1h.get('ema21'):
         if res_1h['close'] > res_1h['ema9'] > res_1h['ema21']:
-            score += 2
+            base += 2
             reasons.append("1h uptrend còn nguyên")
     vr = res_15m.get('vol_ratio') or 0
     if vr >= 2.0:
-        score += 2
+        base += 2
         reasons.append(f"volume x{vr:.1f} so với MA20 (tiền đổ vào thật)")
     elif vr >= 1.3:
-        score += 1
+        base += 1
     f = funding if funding is not None else 0.0
     if f <= 0:
-        score += 2
+        base += 2
         reasons.append(f"funding {f * 100:+.3f}% — short bị vắt le, nhiên liệu squeeze")
     elif 0 < f <= 0.0005:
-        score += 1
+        base += 1
     elif f > 0.0015:
-        score -= 2
+        penalty += 2
         reasons.append(f"funding {f * 100:+.3f}% — long đang đông, dễ cháy đuồi ⚠️")
     oi = oi_change if oi_change is not None else 0.0
     if oi > 2:
-        score += 2
+        base += 2
         reasons.append(f"OI +{oi:.1f}% — tiền mới vẫn vào vị thế")
     elif oi < -2:
-        score -= 1
+        penalty += 1
         reasons.append(f"OI {oi:+.1f}% — tiền đang rút ❌")
     if taker_ratio and taker_ratio > 1.02:
-        score += 1
+        base += 1
         reasons.append("taker mua > bán")
     # Quá muộn: đã bay quá xa thì rủi ro đón đầu cao
     if change24 > 120:
-        score -= 2
+        penalty += 2
         reasons.append(f"đã bay +{change24:.0f}%/24h — VERY late ⚠️")
     elif change24 > 60:
-        score -= 1
+        penalty += 1
         reasons.append(f"đã bay +{change24:.0f}%/24h")
-    return max(0.0, min(score, 10.0)), reasons
+    return max(0.0, min(base, 10.0) - penalty), reasons
 
 
 async def detect_pump_candidates(session, limit=6):
@@ -5810,12 +6884,12 @@ async def detect_pump_candidates(session, limit=6):
                 score, reasons = _pump_score(res_15m, res_1h, change, funding, oi, res_1h.get('taker_ratio'))
                 support15 = res_15m.get('support')
                 resistance15 = res_15m.get('resistance')
-                # Kế hoạch FOMO ngay: scalp momentum — SL ≤2.5% dưới entry (không lấy support xa),
+                # Kế hoạch vào lệnh: scalp momentum — SL tối đa 2.5% dưới entry (không lấy support xa),
                 # TP = kháng cự 15m gần nhất (≤6%) hoặc +3%; giữ R:R hợp lý cho đuổi giá.
                 entry_now = res_1h.get('close')
                 if entry_now:
                     fomo_sl = res_15m.get('support')
-                    if not fomo_sl or not (entry_now * 0.94 < fomo_sl < entry_now * 0.995):
+                    if not fomo_sl or not (entry_now * 0.975 <= fomo_sl < entry_now * 0.995):
                         fomo_sl = entry_now * 0.975
                     tp_c = res_15m.get('resistance')
                     if not tp_c or not (entry_now * 1.005 < tp_c < entry_now * 1.06):
@@ -5828,7 +6902,8 @@ async def detect_pump_candidates(session, limit=6):
                         'confidence': res_1h.get('confidence'), 'funding': funding, 'oi_change': oi,
                         'close': res_1h.get('close'), 'tp': res_1h.get('tp'), 'sl': res_1h.get('sl'),
                         'vwap15m': res_15m.get('vwap'), 'support15m': support15,
-                        'resistance15m': resistance15, 'fomo_tp': fomo_tp, 'fomo_sl': fomo_sl}
+                        'resistance15m': resistance15, 'fomo_tp': fomo_tp, 'fomo_sl': fomo_sl,
+                        'ema9_15m': res_15m.get('ema9'), 'ema21_15m': res_15m.get('ema21')}
             except Exception as e:
                 logger.warning(f"[PUMP-RADAR] Lỗi phân tích {sym}: {e}")
                 return None
@@ -5846,45 +6921,69 @@ async def detect_pump_candidates(session, limit=6):
     except Exception as e:
         logger.warning(f"[PUMP-RADAR] Không lấy được giá live: {e}")
     for r in results:
-        entry = live_map.get(r['symbol'])
-        if not entry:
-            continue
-        r['close'] = entry
-        sup, res15 = r.get('support15m'), r.get('resistance15m')
-        fomo_sl = sup if sup and entry * 0.94 < sup < entry * 0.995 else entry * 0.975
-        fomo_tp = res15 if res15 and entry * 1.005 < res15 < entry * 1.06 else entry * 1.03
-        r['fomo_sl'], r['fomo_tp'] = fomo_sl, fomo_tp
+        _apply_live_entry(r, live_map.get(r['symbol']))
     return results
 
 
+def _apply_live_entry(r, entry):
+    """Gắn giá live vào ứng viên pump: tính lại SL/TP scalp và re-check momentum
+    (snapshot nến có thể cũ vài phút — giá gãy dưới EMA9 15m thì tầng 'EMA stack
+    chuẩn' không còn đúng lúc báo, trừ 2 điểm như tầng đó từng cộng)."""
+    if not entry:
+        return
+    r['close'] = entry
+    sup, res15 = r.get('support15m'), r.get('resistance15m')
+    fomo_sl = sup if sup and entry * 0.975 <= sup < entry * 0.995 else entry * 0.975
+    fomo_tp = res15 if res15 and entry * 1.005 < res15 < entry * 1.06 else entry * 1.03
+    r['fomo_sl'], r['fomo_tp'] = fomo_sl, fomo_tp
+    ema9 = r.get('ema9_15m')
+    if ema9 and entry < ema9:
+        r['momentum_broken'] = True
+        r['score'] = max(0.0, r['score'] - 2)
+
+
 def _fmt_pump_message(cands, mode="auto"):
-    """Format tin báo pump radar — kèm KẾ HOẠCH FOMO NGAY (entry/SL/TP cụ thể)."""
+    """Format tin báo pump radar — kèm KẾ HOẠCH vào lệnh với SL/TP và rủi ro tính từ dữ liệu."""
     if not cands:
         return None
     lines = ["🚀 *PUMP RADAR — coin đang bay vút, còn nhiên liệu pump tiếp*"]
     for c in cands[:PUMP_MAX_ITEMS]:
         sym_disp = display_symbol(c['symbol'])
         r_txt = " · ".join(c['reasons'][:3])
-        hot = c['score'] >= 8.0
+        if c.get('momentum_broken'):
+            r_txt += " · ⚠️ giá live vừa gãy dưới EMA9 15m (−2 điểm)"
+        hot = c['score'] >= PUMP_SCORE_MIN
+        head = "🔥🔥 FOMO NGAY ĐƯỢC" if hot else "🔥 chưa đạt ngưỡng"
         lines.append(
-            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {'🔥🔥 FOMO NGAY ĐƯỢC' if hot else '🔥'}\n"
+            f"\n• *{sym_disp}* — điểm {c['score']:.1f}/10 {head}\n"
             f"  Giá {format_price(c['close'])} (+{c['change24']:.1f}%/24h) | 15m {c['signal15m']} / 1h {c['signal1h']} ({c['confidence']})\n"
             f"  {r_txt}\n"
         )
-        if hot:
-            rr = abs((c['fomo_tp'] or 0) - c['close']) / (abs(c['close'] - (c['fomo_sl'] or c['close'])) + 1e-10)
-            lines.append(
-                f"  ⚡ *FOMO ngay* (điểm 10/10, momentum chưa gãy): entry MARKET {format_price(c['close'])}, "
-                f"TP {format_price(c['fomo_tp'])} (R:R 1:{rr:.1f}), SL {format_price(c['fomo_sl'])} (stop scalp -2.5%). "
-                f"Size ≤ 5% vốn, chốt nửa lệnh khi +2%"
-            )
-        else:
-            lines.append(
-                f"  ⏳ *Chờ pullback* về VWAP 15m {format_price(c['vwap15m'])} rồi long — TP {format_price(c['tp'])}, SL {format_price(c['sl'])}"
-            )
+        close = c['close'] or 0
+        sl = c.get('fomo_sl') or close
+        tp = c.get('fomo_tp') or close
+        if close > 0:
+            sl_pct = abs(close - sl) / close * 100
+            tp_pct = abs(tp - close) / close * 100
+            rr = tp_pct / sl_pct if sl_pct > 0 else 0.0
+            risk_pct = AUTO_RISK_PER_TRADE_PCT * 100
+            if hot:
+                lines.append(
+                    f"  ⚡ *Vào được* (điểm {c['score']:.1f} ≥ ngưỡng {PUMP_SCORE_MIN:g}): "
+                    f"entry MARKET {format_price(close)}, TP {format_price(tp)} (+{tp_pct:.1f}%), "
+                    f"SL {format_price(sl)} (−{sl_pct:.1f}%), R:R 1:{rr:.1f}. "
+                    f"Volume tính sao cho lỗ khi SL khớp ≤ {risk_pct:g}% equity, chốt một phần khi +1R."
+                )
+            else:
+                lines.append(
+                    f"  ⏳ *Chờ pullback* về VWAP 15m {format_price(c['vwap15m'])} rồi long — "
+                    f"TP {format_price(c['tp'])}, SL {format_price(c['sl'])}"
+                )
+    downside = "SL cách entry > 2.5% thì coi như bỏ, đừng nới SL cho vừa size."
     lines.append(
-        "\n⚠️ Chỉ báo kèo *điểm 10/10* — mọi tầng momentum còn nguyên + nhiên liệu squeeze. "
-        "Dưới 10 = đuổi giá dễ móm, bỏ qua. Coin bay >60%/24h luôn chia nhỏ vào 2 lần, không all-in."
+        f"\n⚠️ Radar chỉ báo khi điểm ≥ {PUMP_SCORE_MIN:g}/10: mọi tầng momentum còn nguyên + nhiên liệu squeeze, "
+        f"và coin đã bay quá xa/đuồi yếu bị trừ điểm TRƯỚC khi so ngưỡng. Coin bay >60%/24h chia nhỏ vào nhiều lần, "
+        f"không all-in. {downside}"
     )
     return "\n".join(lines)
 
@@ -5945,8 +7044,8 @@ async def handle_fomo_command(session, chat_id, arg=None):
         AUTO_STATE['pump_radar_off'] = False
         _save_auto_state()
         await send_telegram_message(session, chat_id,
-            "🚀 *Đã BẬT auto PUMP RADAR* — quét tự động mỗi 10 phút.\n"
-            "Coin bay vút còn nhiên liệu (điểm 10/10) sẽ báo kèm lệnh FOMO ngay. Tắt: `/fomo off`")
+            f"🚀 *Đã BẬT auto PUMP RADAR* — quét tự động mỗi 10 phút.\n"
+            f"Chỉ báo coin đạt ≥ {PUMP_SCORE_MIN:g}/10 (đã trừ điểm coin bay quá xa) kèm entry/TP/SL. Tắt: `/fomo off`")
         return
     if arg == 'off':
         AUTO_STATE['pump_radar_off'] = True
@@ -5957,8 +7056,22 @@ async def handle_fomo_command(session, chat_id, arg=None):
     await send_telegram_message(session, chat_id, "🚀 Đang quét coin bay vút... (chờ ~1 phút)")
     cands = await detect_pump_candidates(session, limit=8)
     hot = [c for c in cands if c['score'] >= PUMP_SCORE_MIN]
-    msg = _fmt_pump_message(hot) if hot else \
-        "Không có coin nào đạt điểm 10/10 để FOMO — đang quá muộn, bỏ qua các loại khác."
+    if hot:
+        msg = _fmt_pump_message(hot)
+    else:
+        # Không có kèo đạt ngưỡng: vẫn cho xem các coin sát ngưỡng để chờ pullback,
+        # tránh việc /fomo chỉ trả về "không có gì" rồi người dùng tự đoán.
+        near = [c for c in cands if c['score'] >= max(0.0, PUMP_SCORE_MIN - 2)][:PUMP_MAX_ITEMS]
+        msg = _fmt_pump_message(near) if near else \
+            (f"Không có coin nào đạt {PUMP_SCORE_MIN:g}/10 — thị trường đang quá muộn hoặc thiếu nhiên liệu, "
+             f"bỏ qua lượt này.")
+    for c in hot[:PUMP_MAX_ITEMS]:
+        record_signal({
+            'symbol': c['symbol'], 'signal': 'LONG', 'close': c['close'],
+            'tp': c['fomo_tp'], 'sl': c['fomo_sl'],
+            'long_score': c['score'], 'short_score': c['score'],
+            'confidence': c['confidence'],
+        }, origin='pump')
     await send_telegram_message(session, chat_id, msg)
 
 
@@ -6695,15 +7808,50 @@ async def tool_get_pnl_summary(session, chat_id, args):
     )
 
 
-async def _stage_order(session, chat_id, order_type, params, desc):
-    """Soạn lệnh ghi vào hàng chờ xác nhận (hỗ trợ NHIỀU lệnh/cùng coin), không thực thi ngay."""
+async def _position_leverage_actual(session, symbol, pos_side=None):
+    """Đòn bẩy THẬT đang áp cho vị thế (v2 positionRisk có trường leverage). Trả (lev, err).
+    Lỗi đọc ⇒ (None, lý do): nơi gọi fail closed vì không xác nhận được vùng thanh lý."""
+    data, err = await binance_signed_request(session, 'GET', '/fapi/v2/positionRisk', {'symbol': symbol})
+    if err:
+        return None, f"không đọc được positionRisk {symbol}: {err}"
+    if not isinstance(data, list):
+        return None, f"positionRisk {symbol} trả về dữ liệu lạ."
+    fallback = None
+    wanted = (pos_side or '').upper()
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        try:
+            lev = int(float(p.get('leverage') or 0))
+        except (TypeError, ValueError):
+            lev = 0
+        if lev <= 0:
+            continue
+        try:
+            amt = float(p.get('positionAmt') or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        raw_side = (p.get('positionSide') or 'BOTH').upper()
+        if amt != 0 and (not wanted or raw_side in (wanted, 'BOTH')):
+            return lev, None
+        if fallback is None:
+            fallback = lev
+    if fallback:
+        return fallback, None
+    return None, f"positionRisk {symbol} không có trường leverage."
+
+
+async def _stage_order(session, chat_id, order_type, params, desc, origin='ai', is_exit=False):
+    """Soạn lệnh ghi vào hàng chờ xác nhận (hỗ trợ NHIỀU lệnh/cùng coin), không thực thi ngay.
+    `is_exit=True`: lệnh chỉ đóng/chốt vị thế có sẵn (không mở rủi ro mới, không đụng đòn bẩy)."""
     entry = pending_orders.get(chat_id)
     if not entry or time.time() - entry.get('ts', 0) > PENDING_ORDER_TTL:
         entry = {'items': [], 'ts': time.time()}
     if len(entry['items']) >= 8:
         return ("LỖI: đã có 8 lệnh chờ xác nhận — hãy chờ người dùng bấm Xác nhận/Hủy trước "
                 "khi soạn thêm (đừng gộp thêm lệnh vào hàng chờ).")
-    entry['items'].append({'type': order_type, 'params': params, 'desc': desc, 'coin': params.get('symbol', '')})
+    entry['items'].append({'type': order_type, 'params': params, 'desc': desc,
+                           'coin': params.get('symbol', ''), 'origin': origin, 'is_exit': bool(is_exit)})
     entry['ts'] = time.time()
     pending_orders[chat_id] = entry
     return (f"NEEDS_CONFIRMATION: Lệnh đã được soạn (hiện có {len(entry['items'])} lệnh chờ xác nhận):\n" + desc +
@@ -6730,37 +7878,59 @@ def build_pending_keyboard(items):
     return {"inline_keyboard": rows}
 
 
-AI_VOLUME_TIERS = (200, 400, 800)   # Notional USDT cuối cùng (đã tính đòn bẩy) cho lệnh MỞ do AI /ai đặt
-AI_VOLUME_TOL_PCT = 0.02            # Sai số cho phép khi làm tròn quantity so với mức volume
+AI_VOLUME_TIERS = (200, 400, 800)   # TRẦN notional (USDT) cho lệnh MỞ do AI /ai đặt — KHÔNG còn là mức bắt buộc
 AI_TP_SL_MIN_DIST = 0.01            # TP/SL không sát entry quá ~1%
 AI_TP_SL_MAX_DIST = 0.20            # TP/SL không xa entry quá ~20%
+AI_VOLUME_MAX = max(AI_VOLUME_TIERS)
 
 
-async def _ai_validate_open_notional(session, symbol, otype, quantity, limit_price=None):
-    """Lệnh MỞ vị thế mới do AI /ai soạn phải có notional = 1 trong 3 mức 200/400/800 USDT.
-    Trả về (ok: bool, msg: str, tier: int|None)."""
+async def _ai_entry_risk_plan(session, symbol, side, otype, quantity, sl_price, limit_price=None):
+    """Kiểm tra + chốt size lệnh MỞ của AI /ai bằng CÙNG helper ngân sách rủi ro với auto.
+    Trả về (ok: bool, msg: str, quantity: float|None, size_msg: str).
+    - SL là BẮT BUỘC (không có SL ⇒ không đo được rủi ro ⇒ từ chối).
+    - 200/400/800 chỉ còn là TRẦN notional; size thật do ngân sách 0.5%/lệnh + 1.5% danh mục quyết định.
+    - Mọi lỗi đọc tài khoản/rủi ro ⇒ fail closed."""
+    if not sl_price or sl_price <= 0:
+        return False, ("❌ TỪ CHỐI LỆNH MỞ: phải kèm stop_loss — hệ thống không mở vị thế trần "
+                       "(không có SL thì không đo được rủi ro)."), None, ""
     try:
         if otype == 'LIMIT' and limit_price:
             ref_price = float(limit_price)
         else:
             ref_price = await get_single_price(session, symbol)
     except Exception as e:
-        return False, f"LỖI lấy giá {symbol}: {e}", None
+        return False, f"LỖI lấy giá {symbol}: {e}", None, ""
     if not ref_price or ref_price <= 0:
-        return False, f"LỖI: không lấy được giá {symbol} để kiểm tra volume.", None
-    notional = quantity * ref_price
-    tier = None
-    for t in AI_VOLUME_TIERS:
-        if abs(notional - t) / t <= AI_VOLUME_TOL_PCT:
-            tier = t
-            break
-    if tier is None:
-        return False, (
-            f"❌ TỪ CHỐI LỆNH: volume {notional:,.1f} USDT ({quantity:g} {symbol} @ {ref_price:,.8g}) "
-            f"không đúng quy tắc. Lệnh MỞ mới CHỈ được dùng 1 trong 3 mức volume: 200, 400, 800 USDT "
-            f"(đã tính đòn bẩy). Tính lại quantity = mức volume / giá rồi soạn lại lệnh."
-        ), None
-    return True, f"volume {tier} USDT", tier
+        return False, f"LỖI: không lấy được giá {symbol} để kiểm tra rủi ro.", None, ""
+    qty_p, _, _ = await get_symbol_precisions(session, symbol)
+    step, min_qty, min_notional = await _symbol_constraints(session, symbol, qty_p)
+    max_lev, lerr = await _max_leverage_strict(session, symbol)
+    if lerr:
+        return False, f"❌ TỪ CHỐI LỆNH: {lerr} (fail closed).", None, ""
+    snap, serr = await _account_risk_snapshot(session)
+    if serr:
+        return False, f"❌ TỪ CHỐI LỆNH: không đo được rủi ro tài khoản ({serr}).", None, ""
+    if snap['unprotected']:
+        return False, ("❌ TỪ CHỐI LỆNH: đang có vị thế CHƯA đặt SL nên không đo được rủi ro danh mục "
+                       f"({', '.join(snap['unprotected'][:5])}). Đặt SL cho các vị thế đó rồi thử lại."), None, ""
+    lev = _safe_leverage_for_sl(ref_price, float(sl_price), max_lev)
+    ok, allowed, size_msg = _plan_entry_size(
+        ref_price, float(sl_price), side, equity=snap['equity'], available=snap['available'],
+        open_risk=snap['open_risk'], daily_remaining=snap['daily_remaining'], leverage=lev,
+        step=step, min_qty=min_qty, min_notional=min_notional, notional_cap=AI_VOLUME_MAX)
+    if not ok:
+        return False, (f"❌ TỪ CHỐI LỆNH MỞ: {size_msg} "
+                       f"(trần notional {AI_VOLUME_MAX} USDT, equity {snap['equity']:,.2f})."), None, ""
+    final_qty = min(float(quantity or 0), allowed) if quantity else allowed
+    final_qty = _round_to_step(final_qty, step)
+    min_ok = max(step, min_qty)
+    if final_qty < min_ok:
+        return False, (f"❌ TỪ CHỐI LỆNH MỞ: size theo ngân sách rủi ro ({allowed:g}) nhỏ hơn "
+                       f"khối lượng tối thiểu của sàn ({min_ok:g})."), None, ""
+    note = ""
+    if quantity and final_qty < float(quantity):
+        note = f"size giảm {float(quantity):g} → {final_qty:g}: {size_msg}"
+    return True, "OK", final_qty, note or size_msg
 
 
 async def _ai_validate_tpsl_distance(session, symbol, trigger_price):
@@ -6812,31 +7982,26 @@ async def tool_place_order(session, chat_id, args):
         # Conditional orders đã migrated sang Algo Service: /fapi/v1/order trả -4120
         stop_price = round_price_step(float(args['stop_price']), tick_size, price_p)
         if otype == 'STOP_MARKET':
-            # SL không được nằm sau vùng thanh lý (side SELL = bảo vệ vị thế LONG, BUY = SHORT)
+            # KHÔNG kéo SL cho vừa số dư (SL là ý định của người dùng). Chỉ kiểm tra SL còn
+            # kích hoạt được TRƯỚC vùng thanh lý theo đòn bẩy THẬT của vị thế đó; nếu không,
+            # từ chối để không tạo cảm giác "đã được bảo vệ" trong khi thanh lý tới trước.
             try:
                 entry_ref = await get_single_price(session, symbol)
-                lev_now = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
-                                                 os.getenv("BINANCE_API_SECRET"), symbol)
-                # KHÔNG clamp theo đòn bẩy max (lev cao → SL bị kéo sát entry).
-                # Dùng đòn bẩy vừa đủ để SL gốc nằm trong vùng an toàn trước thanh lý.
-                lev_use = _safe_leverage_for_sl(entry_ref, stop_price, lev_now)
-                stop_price, clamped = _clamp_stop_for_liquidation(side == 'SELL', entry_ref, stop_price, lev_use)
-                # SL phải hợp lý theo số dư: lỗ khi SL khớp ≤ ~20% khả dụng
-                avail_now = await get_available_balance(session)
-                if avail_now and avail_now > 0 and quantity > 0:
-                    max_loss_dist = (0.20 * avail_now) / quantity
-                    if side == 'SELL' and stop_price < entry_ref - max_loss_dist:
-                        stop_price = entry_ref - max_loss_dist
-                        clamped = True
-                    elif side == 'BUY' and stop_price > entry_ref + max_loss_dist:
-                        stop_price = entry_ref + max_loss_dist
-                        clamped = True
-                if clamped:
-                    stop_price = round_price_step(stop_price, tick_size, price_p)
-                    logger.warning(f"[AI-TOOL] SL gốc {args['stop_price']} không hợp lý (thanh lý/số dư) — "
-                                   f"clamp về {stop_price} cho {symbol}")
-            except Exception as clamp_e:
-                logger.warning(f"Lỗi clamp SL theo thanh lý/số dư: {clamp_e}")
+                lev_now, lerr = await _position_leverage_actual(session, symbol,
+                                                                args.get('position_side'))
+                if lerr:
+                    return (f"❌ TỪ CHỐI TP/SL: không đọc được đòn bẩy/vị thế của {symbol} "
+                            f"({lerr}) — không xác nhận được vùng thanh lý (fail closed).")
+                if entry_ref and entry_ref > 0 and lev_now > 1 and stop_price > 0:
+                    safe_dist = (0.5 / lev_now) * entry_ref
+                    beyond = (side == 'SELL' and stop_price < entry_ref - safe_dist) or \
+                             (side == 'BUY' and stop_price > entry_ref + safe_dist)
+                    if beyond:
+                        return (f"❌ TỪ CHỐI TP/SL: SL {format_price(stop_price)} nằm quá xa so với đòn bẩy "
+                                f"hiện tại ({lev_now}x) — vị thế sẽ bị thanh lý trước khi SL khớp. "
+                                f"Hãy đặt SL gần hơn hoặc giảm khối lượng vị thế.")
+            except Exception as lev_e:
+                logger.warning(f"Lỗi kiểm tra vùng thanh lý cho SL {symbol}: {lev_e}")
         ok_dist, dist_msg = await _ai_validate_tpsl_distance(session, symbol, stop_price)
         if not ok_dist:
             return dist_msg
@@ -6855,7 +8020,9 @@ async def tool_place_order(session, chat_id, args):
         else:
             algo_params['reduceOnly'] = 'true'
         desc += f" @ {stop_price}"
-        return await _stage_order(session, chat_id, 'place_algo_order', algo_params, desc)
+        # Chỉ sửa bảo vệ cho vị thế đang có ⇒ KHÔNG đụng đòn bẩy (đổi lev sẽ đổi giá thanh lý của vị thế)
+        return await _stage_order(session, chat_id, 'place_algo_order', algo_params, desc,
+                                  origin='ai', is_exit=True)
 
     params = {'symbol': symbol, 'side': side, 'type': otype, 'quantity': f"{quantity:.{qty_p}f}"}
     if otype == 'LIMIT':
@@ -6867,26 +8034,71 @@ async def tool_place_order(session, chat_id, args):
     elif args.get('reduce_only'):
         params['reduceOnly'] = 'true'
         desc += " (RO)"
-    if not args.get('reduce_only'):
-        ok_vol, vol_msg, tier = await _ai_validate_open_notional(
-            session, symbol, otype, quantity,
-            limit_price=(price if otype == 'LIMIT' else None)
-        )
-        if not ok_vol:
-            return vol_msg
-        try:
-            avail = await get_available_balance(session)
-            if avail and avail > 0 and tier:
-                max_lev = await get_max_leverage(session, os.getenv("BINANCE_API_KEY"),
-                                                 os.getenv("BINANCE_API_SECRET"), symbol)
-                est_lev = max(1, min(int(max_lev or 1), 50))
-                margin = tier / est_lev
-                if margin > 0.25 * avail:
-                    return (f"❌ TỪ CHỐI LỆNH: ký quỹ cần ~{margin:,.2f} USDT (volume {tier}u / đòn bẩy {est_lev}x) "
-                            f"vượt ~25% số dư khả dụng ({avail:,.2f} USDT). Hạ mức volume hoặc nạp thêm vốn.")
-        except Exception as e:
-            logger.warning(f"Lỗi kiểm tra margin cho {symbol}: {e}")
-    return await _stage_order(session, chat_id, 'place_order', params, desc)
+    if args.get('reduce_only'):
+        # Đóng/chốt vị thế hiện có: không mở rủi ro mới ⇒ không kiểm tra ngân sách, không đụng đòn bẩy
+        return await _stage_order(session, chat_id, 'place_order', params, desc, origin='ai', is_exit=True)
+
+    # ─── Lệnh MỞ vị thế mới: BẮT BUỘC đi kèm SL ngay trong cùng lượt soạn ───
+    try:
+        sl_price = float(args.get('stop_loss') or 0)
+    except (TypeError, ValueError):
+        return "LỖI: stop_loss không hợp lệ."
+    if sl_price <= 0:
+        return ("❌ TỪ CHỐI LỆNH MỞ: thiếu stop_loss. Mọi lệnh mở vị thế PHẢI kèm SL "
+                "(hệ thống không mở vị thế trần) — soạn lại với tham số stop_loss, "
+                "và take_profit nếu muốn chốt lời.")
+    ok_risk, risk_msg, final_qty, size_note = await _ai_entry_risk_plan(
+        session, symbol, ('LONG' if side == 'BUY' else 'SHORT'), otype, quantity, sl_price,
+        limit_price=(price if otype == 'LIMIT' else None))
+    if not ok_risk:
+        return risk_msg
+    if final_qty < quantity:
+        quantity = final_qty
+        params['quantity'] = f"{quantity:.{qty_p}f}"
+    desc = f"{display_symbol(symbol)} {side} {otype} {quantity}"
+    if otype == 'LIMIT':
+        desc += f" @ {price}"
+    if size_note:
+        desc += f" ({size_note})"
+
+    # 1) Lệnh vào, 2) SL điều kiện, 3) TP điều kiện (nếu có) — thứ tự này được giữ khi thực thi
+    staged = await _stage_order(session, chat_id, 'place_order', params, desc, origin='ai')
+    sl_params = {
+        'algoType': 'CONDITIONAL', 'symbol': symbol,
+        'side': 'SELL' if side == 'BUY' else 'BUY', 'type': 'STOP_MARKET',
+        'triggerPrice': f"{round_price_step(sl_price, tick_size, price_p):.{price_p}f}",
+        'quantity': f"{quantity:.{qty_p}f}", 'workingType': 'MARK_PRICE',
+    }
+    if hedge_mode:
+        sl_params['positionSide'] = str(args.get('position_side') or ('LONG' if side == 'BUY' else 'SHORT')).upper()
+    else:
+        sl_params['reduceOnly'] = 'true'
+    await _stage_order(session, chat_id, 'place_algo_order', sl_params,
+                       f"SL {display_symbol(symbol)} kích hoạt {format_price(float(sl_params['triggerPrice']))}",
+                       origin='ai')
+    try:
+        tp_price = float(args.get('take_profit') or 0)
+    except (TypeError, ValueError):
+        tp_price = 0.0
+    if tp_price > 0:
+        ok_dist, dist_msg = await _ai_validate_tpsl_distance(session, symbol, tp_price)
+        if ok_dist:
+            tp_params = {
+                'algoType': 'CONDITIONAL', 'symbol': symbol,
+                'side': 'SELL' if side == 'BUY' else 'BUY', 'type': 'TAKE_PROFIT_MARKET',
+                'triggerPrice': f"{round_price_step(tp_price, tick_size, price_p):.{price_p}f}",
+                'quantity': f"{quantity:.{qty_p}f}", 'workingType': 'MARK_PRICE',
+            }
+            if hedge_mode:
+                tp_params['positionSide'] = sl_params['positionSide']
+            else:
+                tp_params['reduceOnly'] = 'true'
+            await _stage_order(session, chat_id, 'place_algo_order', tp_params,
+                               f"TP {display_symbol(symbol)} kích hoạt {format_price(float(tp_params['triggerPrice']))}",
+                               origin='ai')
+        else:
+            staged += f"\n⚠️ Bỏ qua TP: {dist_msg}"
+    return staged
 
 
 async def tool_cancel_order(session, chat_id, args):
@@ -6925,7 +8137,7 @@ async def tool_close_position(session, chat_id, args):
             params['reduceOnly'] = 'true'
         desc = f"ĐÓNG {display_symbol(symbol)} {p_side} {round(abs(amount), qty_p)}"
         descs.append(desc)
-        await _stage_order(session, chat_id, 'place_order', params, desc)
+        await _stage_order(session, chat_id, 'place_order', params, desc, origin='ai', is_exit=True)
         pending_orders[chat_id]['items'][-1]['is_close'] = True
     return ("NEEDS_CONFIRMATION: Lệnh đã được soạn:\n" + "\n".join(descs) +
             "\nHãy trình bày lại chi tiết cho người dùng và nhắc họ trả lời 'xác nhận' hoặc 'hủy'. "
@@ -7301,7 +8513,7 @@ ASK_TOOLS = [
     {"type": "function", "function": {"name": "get_order_history", "description": "Lịch sử lệnh của một symbol.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "limit": {"type": "integer"}}}, "required": ["symbol"]}},
     {"type": "function", "function": {"name": "get_income_history", "description": "Lịch sử thu nhập futures (REALIZED_PNL, FUNDING_FEE, COMMISSION...) của một khoảng thời gian. Tham số days (mặc định 7, tối đa 90), income_type (vd REALIZED_PNL/FUNDING_FEE/COMMISSION).", "parameters": {"type": "object", "properties": {"days": {"type": "integer", "description": "Số ngày nhìn lại, mặc định 7"}, "income_type": {"type": "string", "description": "Lọc theo loại: REALIZED_PNL, FUNDING_FEE, COMMISSION..."}}}}},
     {"type": "function", "function": {"name": "get_pnl_summary", "description": "Tổng kết PnL tài khoản futures. mode='summary' (mặc định): tổng Realized/Funding/Phí/NET trong N ngày; mode='by_coin': PnL thực tế từng coin; mode='lifetime': tổng kết PnL TRỌN ĐỜI tối đa ~5 năm (quét nhiều cửa sổ 1 năm, dừng khi hết lịch sử; cache 24h trong file, dùng khi người dùng hỏi 'pnl trọn đời'/'tổng pnl'/'pnl tất cả'). Tham số days cho summary/by_coin (mặc định 30, tối đa 90).", "parameters": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["summary", "by_coin", "lifetime"], "description": "summary | by_coin | lifetime"}, "days": {"type": "integer", "description": "Số ngày nhìn lại cho summary/by_coin, mặc định 30"}}}}},
-    {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế hoặc lệnh điều kiện TP/SL (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. LIMIT bắt buộc có price. STOP_MARKET/TAKE_PROFIT_MARKET bắt buộc có stop_price (giá kích hoạt); dùng reduce_only=true để làm TP/SL cho vị thế hiện có.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "stop_price": {"type": "number", "description": "Giá kích hoạt, bắt buộc với STOP_MARKET/TAKE_PROFIT_MARKET"}, "working_type": {"type": "string", "enum": ["MARK_PRICE", "CONTRACT_PRICE"], "description": "Cơ sở kích hoạt, mặc định MARK_PRICE"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
+    {"type": "function", "function": {"name": "place_order", "description": "Soạn lệnh MỞ/ĐÓNG vị thế hoặc lệnh điều kiện TP/SL cho vị thế CÓ SẴN (người dùng phải 'xác nhận' trước khi thực thi). quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. Lệnh MỞ vị thế mới (không reduce_only) BẮT BUỘC kèm stop_loss — hệ thống sẽ TỪ CHỐI nếu thiếu, và tự soạn kèm TP/SL trong cùng lượt. LIMIT bắt buộc có price. STOP_MARKET/TAKE_PROFIT_MARKET (dùng stop_price, reduce_only/position_side) chỉ để đặt/sửa TP/SL cho vị thế đang có.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string", "enum": ["BUY", "SELL"]}, "type": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]}, "quantity": {"type": "number"}, "price": {"type": "number"}, "stop_loss": {"type": "number", "description": "BẮT BUỘC với lệnh MỞ: giá kích hoạt SL; hệ thống tự tính size theo ngân sách rủi ro (0.5% equity/lệnh)"}, "take_profit": {"type": "number", "description": "Tùy chọn cho lệnh MỞ: giá chốt lời (hệ thống tự soạn lệnh TP điều kiện)"}, "stop_price": {"type": "number", "description": "Giá kích hoạt, bắt buộc với STOP_MARKET/TAKE_PROFIT_MARKET (dùng cho vị thế có sẵn)"}, "working_type": {"type": "string", "enum": ["MARK_PRICE", "CONTRACT_PRICE"], "description": "Cơ sở kích hoạt, mặc định MARK_PRICE"}, "reduce_only": {"type": "boolean", "description": "Chỉ dùng One-way Mode để đóng/chốt"}, "position_side": {"type": "string", "enum": ["LONG", "SHORT"], "description": "Chỉ dùng Hedge Mode khi đóng vị thế"}}, "required": ["symbol", "side", "quantity"]}}},
     {"type": "function", "function": {"name": "cancel_order", "description": "Soạn hủy một lệnh đang chờ (cần xác nhận). Lệnh TP/SL điều kiện (đánh dấu [lệnh TP/SL điều kiện] trong get_open_orders, kể cả lệnh đặt từ app Binance) phải hủy bằng algoId với conditional=true.", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}, "order_id": {"type": "string"}, "conditional": {"type": "boolean", "description": "true nếu là lệnh TP/SL điều kiện (hủy theo algoId qua algo service)"}}, "required": ["symbol", "order_id"]}}},
     {"type": "function", "function": {"name": "close_position", "description": "Soạn đóng TOÀN BỘ vị thế của một symbol bằng lệnh market (cần xác nhận).", "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}}},
 ]
@@ -7377,42 +8589,241 @@ async def get_ai_agent_response(session, messages, tools, max_tokens=6000, timeo
         return None, str(e)
 
 
+def _is_open_order_item(item):
+    """Lệnh MỞ vị thế mới (không phải lệnh đóng/reduce-only)."""
+    if item.get('type') != 'place_order' or item.get('is_close') or item.get('is_exit'):
+        return False
+    params = item.get('params') or {}
+    if str(params.get('reduceOnly', '')).lower() == 'true':
+        return False
+    return (params.get('type') or '').upper() in ('MARKET', 'LIMIT')
+
+
+def _plan_execution_order(items):
+    """Thứ tự thực thi theo từng symbol: đóng/hủy trước, rồi MỞ → SL → TP (SL luôn trước TP)."""
+    def prio(it):
+        if it.get('type') == 'place_algo_order':
+            return 3 if (it.get('params') or {}).get('type') == 'TAKE_PROFIT_MARKET' else 2
+        return 1 if _is_open_order_item(it) else 0
+    indexed = list(enumerate(items))
+    indexed.sort(key=lambda pair: ((pair[1].get('params') or {}).get('symbol') or '', prio(pair[1]), pair[0]))
+    return indexed
+
+
+async def _prepare_open_execution(session, item, symbol, sl_trigger):
+    """Kiểm tra LẠI tài khoản/rủi ro ngay trước khi khớp lệnh MỞ (lệnh chờ có thể đã cũ).
+    Trả (ok, quantity|None, lev, msg, snapshot) — quantity đã GIẢM nếu vượt ngân sách."""
+    params = item.get('params') or {}
+    otype = (params.get('type') or '').upper()
+    try:
+        staged_qty = float(params.get('quantity') or 0)
+    except (TypeError, ValueError):
+        return False, None, None, "quantity không hợp lệ.", None
+    if staged_qty <= 0:
+        return False, None, None, "quantity phải > 0.", None
+    if not sl_trigger:
+        return False, None, None, ("lệnh MỞ thiếu SL đi kèm — hệ thống không mở vị thế trần "
+                                   "(thiếu SL thì không đo được rủi ro)."), None
+    if otype == 'LIMIT' and params.get('price'):
+        try:
+            price = float(params['price'])
+        except (TypeError, ValueError):
+            return False, None, None, "giá LIMIT không hợp lệ.", None
+    else:
+        price = await get_single_price(session, symbol)
+    if not price or price <= 0:
+        return False, None, None, f"không lấy được giá {symbol}.", None
+    side = 'LONG' if (params.get('side') or '').upper() == 'BUY' else 'SHORT'
+    max_lev, lerr = await _max_leverage_strict(session, symbol)
+    if lerr:
+        return False, None, None, f"{lerr} (fail closed).", None
+    snap, serr = await _account_risk_snapshot(session)
+    if serr:
+        return False, None, None, f"không đo được rủi ro tài khoản ({serr}).", None
+    if snap['unprotected']:
+        return False, None, None, ("đang có vị thế chưa đặt SL nên không đo được rủi ro danh mục "
+                                   f"({', '.join(snap['unprotected'][:5])})."), None
+    qty_p, _, _ = await get_symbol_precisions(session, symbol)
+    step, min_qty, min_notional = await _symbol_constraints(session, symbol, qty_p)
+    lev = _safe_leverage_for_sl(price, sl_trigger, max_lev)
+    ok, allowed, size_msg = _plan_entry_size(
+        price, sl_trigger, side, equity=snap['equity'], available=snap['available'],
+        open_risk=snap['open_risk'], daily_remaining=snap['daily_remaining'], leverage=lev,
+        step=step, min_qty=min_qty, min_notional=min_notional, notional_cap=AI_VOLUME_MAX)
+    if not ok:
+        return False, None, None, size_msg, snap
+    final_qty = _round_to_step(min(staged_qty, allowed), step)
+    if final_qty < max(step, min_qty):
+        return False, None, None, "size sau khi áp ngân sách rủi ro nhỏ hơn mức tối thiểu của sàn.", snap
+    note = size_msg
+    if final_qty < staged_qty:
+        note = f"size giảm {staged_qty:g} → {final_qty:g} ({size_msg})"
+    return True, final_qty, lev, note, snap
+
+
 async def _execute_items(session, items):
-    """Thực thi một danh sách lệnh đã soạn. Trả về text kết quả."""
+    """Thực thi danh sách lệnh đã soạn: kiểm tra lại tài khoản/rủi ro ngay lúc khớp, đặt SL trước TP.
+    Lệnh MỞ đi qua _execute_protected_entry (fill thật + bảo vệ); thiếu SL ⇒ TỪ CHỐI."""
     results = []
     ok_count = 0
-    for item in items:
-        if item['type'] in ('place_order', 'place_algo_order'):
-            # Set đòn bẩy phù hợp cho symbol trước khi đặt (tránh lỗi Margin is insufficient
-            # do symbol mới mặc định đòn bẩy thấp). KHÔNG set max: lev cao → khoảng cách thanh lý
-            # nhỏ → SL gốc bị kéo sát entry khi clamp. Nếu có lệnh SL (STOP_MARKET) trong cùng
-            # symbol thì chọn đòn bẩy vừa đủ để SL gốc nằm trong vùng an toàn trước thanh lý.
-            try:
-                sym = item['params'].get('symbol')
-                if sym:
-                    api_key = os.getenv("BINANCE_API_KEY")
-                    api_secret = os.getenv("BINANCE_API_SECRET")
-                    max_lev = await get_max_leverage(session, api_key, api_secret, sym)
-                    lev_use = max_lev
-                    sl_trig = None
-                    for it in items:
-                        if (it.get('type') == 'place_algo_order'
-                                and it.get('params', {}).get('symbol') == sym
-                                and it.get('params', {}).get('type') == 'STOP_MARKET'
-                                and it.get('params', {}).get('triggerPrice')):
-                            sl_trig = float(it['params']['triggerPrice'])
-                            break
-                    if sl_trig:
-                        try:
-                            cur = await get_single_price(session, sym)
-                        except Exception:
-                            cur = 0
-                        if cur and cur > 0:
-                            lev_use = _safe_leverage_for_sl(cur, sl_trig, max_lev)
-                    await set_leverage(session, api_key, api_secret, sym, lev_use)
-            except Exception as e:
-                logger.warning(f"Không set được đòn bẩy cho {item['params'].get('symbol')}: {e}")
+    indexed = _plan_execution_order(items)
+    # SL/TP đi kèm theo từng symbol (dùng để bảo vệ cho lệnh MỞ)
+    plans = {}
+    for _, it in indexed:
+        if it.get('type') != 'place_algo_order':
+            continue
+        params = it.get('params') or {}
+        otype = (params.get('type') or '').upper()
+        try:
+            trig = float(params.get('triggerPrice'))
+        except (TypeError, ValueError):
+            trig = 0.0
+        slot = plans.setdefault(params.get('symbol'), {})
+        if otype == 'STOP_MARKET':
+            slot['sl'] = trig
+            slot['sl_item'] = it
+        elif otype == 'TAKE_PROFIT_MARKET':
+            slot['tp'] = trig
+            slot['tp_item'] = it
+
+    consumed = set()
+    for _, item in indexed:
+        if id(item) in consumed:
+            continue
+        if _is_open_order_item(item):
+            symbol = (item.get('params') or {}).get('symbol')
+            slot = plans.get(symbol) or {}
+            sl_trig, tp_trig = slot.get('sl'), slot.get('tp')
+            ok, quantity, lev, msg, snap = await _prepare_open_execution(session, item, symbol, sl_trig)
+            if not ok:
+                results.append(f"❌ {item['desc']}\n→ TỪ CHỐI: {msg}")
+                for key in ('sl_item', 'tp_item'):
+                    sib = slot.get(key)
+                    if sib is not None and id(sib) not in consumed:
+                        consumed.add(id(sib))   # không để lại SL/TP mồ côi cho vị thế không tồn tại
+                        results.append(f"⏭️ Bỏ qua {sib['desc']}: lệnh vào không được thực thi.")
+                continue
+            qty_p, price_p, tick_size = await get_symbol_precisions(session, symbol)
+            params = item['params']
+            otype = (params.get('type') or '').upper()
+            side = 'LONG' if (params.get('side') or '').upper() == 'BUY' else 'SHORT'
+            # One-way: KHÔNG gửi positionSide (sàn sẽ từ chối); hedge: dùng đúng positionSide của lệnh
+            pos_side = ((params.get('positionSide') or ('LONG' if side == 'LONG' else 'SHORT'))
+                        if hedge_mode else 'BOTH')
+            if otype == 'MARKET':
+                if quantity != float(params.get('quantity') or 0):
+                    results.append(f"ℹ️ {item['desc']}\n→ {msg}")
+                price_ref = await get_single_price(session, symbol)
+                if not price_ref or price_ref <= 0:
+                    results.append(f"❌ {item['desc']}\n→ TỪ CHỐI: không lấy được giá {symbol}.")
+                    continue
+                # ngân sách rủi ro lấy từ chính snapshot đã dùng để chốt size (nhất quán, ít round-trip)
+                risk_budget = _risk_budget_allowance(snap['equity'], snap['open_risk'],
+                                                     snap['daily_remaining'])
+                step, _, _ = await _symbol_constraints(session, symbol, qty_p)
+                res = await _execute_protected_entry(
+                    session, symbol=symbol, side=side, quantity=quantity, price=price_ref,
+                    sl_price=sl_trig, tp_price=tp_trig or 0.0, qty_p=qty_p, price_p=price_p,
+                    step=step, pos_side=pos_side, max_lev=lev,
+                    open_symbols=snap.get('open_symbols') or (), risk_budget=risk_budget)
+                for key in ('sl_item', 'tp_item'):
+                    if slot.get(key) is not None:
+                        consumed.add(id(slot[key]))
+                signal_id = None
+                if res.get('entry_qty'):
+                    execution = _execution_record(
+                        order_id=res['order_id'], quantity=res['entry_qty'], pos_side=pos_side,
+                        side=side, entry_time=res['entry_time'])
+                    signal_id = record_signal(
+                        {'symbol': symbol, 'signal': side, 'close': res['entry_price'],
+                         'tp': tp_trig or None, 'sl': sl_trig, 'confidence': 'AI chat'},
+                        origin='ai', execution=execution)
+                    _register_ai_position_meta(
+                        symbol=symbol, side=side, pos_side=pos_side, entry_price=res['entry_price'],
+                        sl_price=sl_trig, tp_price=tp_trig or None, qty=res['filled_qty'],
+                        sl_id=res.get('sl_id'), tp_id=res.get('tp_id'), signal_id=signal_id)
+                if res['ok']:
+                    ok_count += 1
+                    lines = [f"✅ {item['desc']} → ID: `{res['order_id']}`",
+                             f"🎯 Giá khớp thật: {format_price(res['entry_price'])} "
+                             f"({res['entry_qty']:g} khớp, {res['filled_qty']:g} được bảo vệ, "
+                             f"đòn bẩy {res['lev']}x)",
+                             f"🛡️ SL: {'đã đặt' if res.get('sl_id') else 'CHƯA đặt'} "
+                             f"`{res.get('sl_id')}` | TP: {'đã đặt' if res.get('tp_id') else 'không/không được'}"
+                             f" `{res.get('tp_id')}`"]
+                    if res.get('msg'):
+                        lines.append(f"⚠️ {res['msg']}")
+                    results.append("\n".join(lines))
+                else:
+                    results.append(f"❌ {item['desc']}\n→ {res['msg']}")
+                    for key in ('sl_item', 'tp_item'):
+                        sib = slot.get(key)
+                        if sib is not None and id(sib) not in consumed:
+                            consumed.add(id(sib))  # tránh đặt bảo vệ mồ côi; recovery lo vị thế (nếu có)
+                            results.append(f"⏭️ Bỏ qua {sib['desc']}: lệnh vào không thành công.")
+                    if res.get('close_pending'):
+                        results.append("⚠️ Vị thế có thể còn mở mà chưa đóng lại được — "
+                                       "bot sẽ tiếp tục thử đóng khẩn cấp ở vòng quản lý vị thế (30s).")
+                continue
+            # LIMIT: KHÔNG đặt SL/TP khi chưa có vị thế (sàn từ chối SL reduce-only ⇒ -2022).
+            # Khớp ngay ⇒ bảo vệ ngay; chưa khớp ⇒ theo dõi và gắn bảo vệ khi có khối lượng khớp.
+            api_key = os.getenv("BINANCE_API_KEY")
+            api_secret = os.getenv("BINANCE_API_SECRET")
+            if not await set_leverage(session, api_key, api_secret, symbol, lev):
+                results.append(f"❌ {item['desc']}\n→ TỪ CHỐI: không set được đòn bẩy {lev}x (fail closed).")
+                continue
+            params['quantity'] = f"{quantity:.{qty_p}f}"
+            params['newOrderRespType'] = 'RESULT'
+            client_id = params.get('newClientOrderId') or _new_client_order_id('pnlbot_entry')
+            params['newClientOrderId'] = client_id
+            submit_ts = time.time()
+            data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', params)
+            if err:
+                results.append(f"❌ {item['desc']}\n→ THẤT BẠI: {err}")
+                for key in ('sl_item', 'tp_item'):
+                    sib = slot.get(key)
+                    if sib is not None and id(sib) not in consumed:
+                        consumed.add(id(sib))
+                continue
+            ok_count += 1
+            order_id = _normalize_order_id((data or {}).get('orderId'))
+            fill = _fill_from_order(data)
+            status = str((data or {}).get('status') or '').upper()
+            pend = {
+                'symbol': symbol, 'side': side, 'pos_side': pos_side,
+                'order_id': order_id, 'client_order_id': client_id,
+                'quantity': quantity, 'sl': sl_trig, 'tp': tp_trig or None,
+                'limit_price': float(params.get('price') or 0),
+                'entry_time': submit_ts, 'ts': time.time(), 'signal_id': None,
+                'sl_algo_id': None, 'tp_algo_id': None, 'source': 'ai_chat',
+            }
+            if fill:
+                pending_entries[client_id] = pend
+                save_pending_entries()          # lưu TRƯỚC khi bảo vệ để restart không mất dấu
+                ok_prot, prot_msg = await _protect_entry_fill(session, pend, data)
+                results.append(f"✅ {item['desc']} → ID: `{order_id}` — khớp {fill[0]:g} @ {fill[1]:g}")
+                results.append(("🛡️ " if ok_prot else "❌ ") + prot_msg)
+                if ok_prot and status in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                    _drop_pending_entry(client_id, f"lệnh {status} — bảo vệ đã gắn")
+                elif ok_prot:
+                    results.append("⏳ Lệnh mới khớp MỘT PHẦN — bot tiếp tục theo dõi và sẽ cập nhật "
+                                   "SL theo khối lượng vị thế thật.")
+                else:
+                    results.append("⚠️ Giữ theo dõi và sẽ thử gắn bảo vệ lại ở vòng sau (20s).")
+            else:
+                pending_entries[client_id] = pend
+                save_pending_entries()
+                results.append(
+                    f"⏳ {item['desc']} → ID: `{order_id}` — CHƯA KHỚP: chưa đặt SL/TP (sàn từ chối SL "
+                    "khi chưa có vị thế). Bot tự gắn SL TRƯỚC rồi TP ngay khi có khối lượng khớp."
+                )
+            for key in ('sl_item', 'tp_item'):
+                if slot.get(key) is not None:
+                    consumed.add(id(slot[key]))
+            continue
+        # Các loại khác: lệnh đóng/hủy — KHÔNG đụng đòn bẩy, KHÔNG kiểm tra ngân sách
         if item['type'] == 'place_order':
+            item['params'].setdefault('newOrderRespType', 'RESULT')
             data, err = await binance_signed_request(session, 'POST', '/fapi/v1/order', item['params'])
         elif item['type'] == 'place_algo_order':
             data, err = await binance_signed_request(session, 'POST', '/fapi/v1/algoOrder', item['params'])
@@ -7735,22 +9146,24 @@ async def handle_ai_command(session, chat_id, question=None, reply_to=None, imag
             "Câu hỏi thuần phân tích (xu hướng, nên vào không, vì sao tăng) → KHÔNG soạn lệnh. "
             "Quy trình đặt lệnh: (1) lấy dữ liệu cần thiết bằng công cụ, (2) gọi công cụ soạn lệnh, "
             "(3) trình bày chi tiết lệnh — hệ thống sẽ tự đính kèm nút 'Xác nhận/Hủy' để người dùng bấm, chỉ khi bấm Xác nhận lệnh mới được thực thi. "
-            "Trước khi soạn lệnh MARKET/LIMIT, hãy gọi get_account_summary kiểm tra 'Khả dụng': margin cần ≈ notional / đòn bẩy — "
-            "nếu số dư không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
-            "QUY TẮC VOLUME: khi soạn lệnh MỞ vị thế mới, notional (giá trị vị thế thực, đã tính đòn bẩy) CHỈ được chọn 1 trong 3 mức: 200, 400 hoặc 800 USDT — "
-            "quy tắc BẮT BUỘC, hệ thống sẽ TỪ CHỐI lệnh ngoài 3 mức này. "
-            "Tính rủi ro thật: lỗ khi SL khớp = notional × (khoảng cách SL so với entry) ≤ ~20% số dư khả dụng; "
-            "margin cần = notional / đòn bẩy ≤ ~25% số dư khả dụng (đòn bẩy cao → thanh lý sớm, khoảng cách ≈ 100%/đòn bẩy). "
-            "Chọn mức lớn nhất thỏa CẢ HAI ngưỡng; nếu cả mức 200 cũng vượt thì KHÔNG soạn lệnh, báo rõ lý do. "
-            "Ưu tiên mức nhỏ khi biến động mạnh, đã nhiều vị thế, hoặc SL xa. Ghi rõ phép tính trong câu trả lời. "
-            "QUY TẮC TP/SL: lệnh mở mới PHẢI soạn ĐỦ 3 lệnh: (1) vào vị thế, (2) TP điều kiện TAKE_PROFIT_MARKET reduceOnly, "
-            "(3) SL điều kiện STOP_MARKET reduceOnly. Có dữ liệu analyze_coin/scan_market thì DÙNG TP/SL hệ thống đề xuất. "
-            "Tự tính: SL = dưới support − 0.3×ATR (LONG) / trên resistance + 0.3×ATR (SHORT), không có S/R rõ thì entry ± 1.5×ATR; "
-            "TP = entry ± đúng khoảng cách SL (R:R 1:1 — khớp engine, đã backtest là cấu hình edge dương duy nhất). "
-            "Khoảng cách TP/SL từ entry phải ≥ ~1% và ≤ ~20% (volume 800 → ≤ ~10%, volume 400 → ≤ ~15%); "
-            "hệ thống sẽ TỪ CHỐI TP/SL ngoài khoảng này — đừng soạn lệnh chắc chắn bị từ chối. "
+            "Trước khi soạn lệnh, hãy gọi get_account_summary kiểm tra 'Khả dụng' (margin) và vốn: "
+            "nếu không đủ thì báo người dùng thay vì soạn lệnh chắc chắn lỗi. "
+            "QUY TẮC RỦI RO (BẮT BUỘC): lệnh MỞ vị thế mới PHẢI truyền stop_loss trong CÙNG một lần gọi place_order — "
+            "hệ thống sẽ TỪ CHỐI nếu thiếu, và tự soạn kèm TP/SL điều kiện. "
+            "Hệ thống tự tính khối lượng theo ngân sách rủi ro: rủi ro khi SL khớp ≤ 0.5% equity, "
+            "tổng rủi ro danh mục ≤ 1.5% equity, không vượt hạn lỗ ngày và margin ≤ 25% số dư khả dụng. "
+            "Notional tối đa cho một lệnh là 800 USDT — đây là TRẦN, KHÔNG phải mức bắt buộc: SL gần thì size nhỏ hơn vẫn đúng. "
+            "Nếu ngân sách không đủ cho khối lượng tối thiểu của sàn, hệ thống sẽ từ chối — đừng cố nài. "
+            "quote quantity bạn muốn, hệ thống có thể giảm xuống; KHÔNG tự nới SL để nhồi size. "
+            "Đặt take_profit khi muốn chốt lời (không bắt buộc). "
+            "Lệnh LIMIT chưa khớp sẽ được bot theo dõi và TỰ gắn SL (trước) rồi TP (sau) ngay khi có "
+            "khối lượng khớp — nói rõ điều này khi trình bày lệnh LIMIT cho người dùng. "
+            "QUY TẮC TP/SL: SL nên đặt dưới support − 0.3×ATR (LONG) / trên resistance + 0.3×ATR (SHORT), "
+            "không có S/R rõ thì entry ± 1.5×ATR; TP = entry ± khoảng cách SL (R:R 1:1 — khớp engine). "
+            "Khoảng cách TP/SL từ giá phải ≥ ~1% và ≤ ~20% (hệ thống sẽ TỪ CHỐI ngoài khoảng này). "
+            "Với vị thế ĐANG CÓ, muốn đặt/sửa TP/SL thì dùng STOP_MARKET/TAKE_PROFIT_MARKET + stop_price + reduce_only "
+            "(one-way) hoặc position_side (hedge), quantity bằng đúng size vị thế — hệ thống KHÔNG đổi đòn bẩy khi chỉ sửa TP/SL. "
             "Quantity tính bằng đơn vị coin (0.01 BTC), không phải USDT. "
-            "Riêng TP/SL cho vị thế hiện có thì quantity phải bằng đúng size vị thế đó, không áp quy tắc volume. "
             "Chọn công cụ hợp lý với câu hỏi: hỏi về MỘT coin cụ thể (xu hướng, nên vào lệnh không) -> dùng analyze_coin cho coin đó, "
             "KHÔNG dùng scan_market; tra giá nhanh -> get_price; tìm cơ hội trên toàn thị trường hoặc coin tốt nhất -> scan_market; "
             "hỏi về TIN TỨC/sự kiện/lý do coin tăng giảm/tin cộng đồng -> search_news (kết quả chỉ tham khảo, không phải tín hiệu); "
@@ -9707,6 +11120,7 @@ async def on_startup(app):
     load_scan_history()
     _load_ai_alert_state()
     _load_auto_managed()
+    load_pending_entries()
     _load_llm_usage()
     _load_sent_msg_ids()
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
@@ -9747,6 +11161,10 @@ async def on_startup(app):
     # Trailing stop + breakeven cho vị thế AI tự mở
     app['auto_trailing_task'] = asyncio.create_task(
         auto_trailing_loop(app)
+    )
+    # Lệnh MỞ LIMIT chờ khớp: gắn SL/TP ngay khi có khối lượng khớp (không để vị thế trần)
+    app['pending_entry_task'] = asyncio.create_task(
+        pending_entry_watch_loop(app)
     )
     # AI tự động vào lệnh mỗi 5h khi có tín hiệu 4-5 sao
     app['ai_auto_trader_task'] = asyncio.create_task(
@@ -9792,6 +11210,8 @@ async def on_cleanup(app):
         app['signal_track_task'].cancel()
     if 'auto_trailing_task' in app:
         app['auto_trailing_task'].cancel()
+    if 'pending_entry_task' in app:
+        app['pending_entry_task'].cancel()
     if 'ai_auto_trader_task' in app:
         app['ai_auto_trader_task'].cancel()
     if 'ai_signal_alert_task' in app:
