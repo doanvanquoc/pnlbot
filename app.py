@@ -925,6 +925,8 @@ ODDS_SPORT_KEYS = {
     'Europa League': 'soccer_uefa_europa_league', 'UEFA Europa League': 'soccer_uefa_europa_league',
     'MLS': 'soccer_usa_mls', 'mls': 'soccer_usa_mls',
     'EFL Championship': 'soccer_efl_champ', 'efl-championship': 'soccer_efl_champ',
+    'Nations League': 'soccer_uefa_nations_league', 'UEFA Nations League': 'soccer_uefa_nations_league',
+    'nations-league': 'soccer_uefa_nations_league',
 }
 ODDS_BOARD_CACHE = {}  # sport_key -> (events, ts)
 odds_quota = {'month': '', 'used': 0, 'remaining': None}
@@ -1410,33 +1412,59 @@ def calibrate_probability(raw_prob, league, home, away, market_type):
     factor = _get_calibration_factor(league, home, away)
     for lo, hi, mult in CALIBRATION_BUCKETS:
         if lo <= raw_prob < hi:
-            calibrated = raw_prob * factor * mult
+            learned = bucket_calibration.get(str(int(raw_prob // 5 * 5)), 1.0)
+            calibrated = raw_prob * factor * mult * learned
             return max(1.0, min(99.0, calibrated))
     return max(1.0, min(99.0, raw_prob * factor))
 
+BUCKET_CALIBRATION_FILE = "bucket_calibration.json"
+bucket_calibration = {}  # bucket(5%) -> factor học từ kết quả thật
+
+def _load_bucket_calibration():
+    global bucket_calibration
+    try:
+        if os.path.exists(BUCKET_CALIBRATION_FILE):
+            with open(BUCKET_CALIBRATION_FILE, "r", encoding="utf-8") as f:
+                bucket_calibration = json.load(f) or {}
+    except Exception as e:
+        logger.error(f"Lỗi nạp bucket calibration: {e}")
+
+def _save_bucket_calibration():
+    try:
+        with open(BUCKET_CALIBRATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(bucket_calibration, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Lỗi lưu bucket calibration: {e}")
+
+_load_bucket_calibration()
+
 def update_calibration_from_results():
+    """Học factor theo bucket % từ kết quả thật (≥10 mẫu/bucket) → hiệu chỉnh prob tương lai."""
     if not predictions:
         return
     by_bucket = {}
     for p in predictions.values():
         if p.get('status') not in ('win', 'loss'):
             continue
-        prob = int(p.get('prob', 50))
-        bucket = prob // 5 * 5
+        prob = float(p.get('prob', 50))
+        bucket = int(prob // 5 * 5)
         b = by_bucket.setdefault(bucket, {'win': 0, 'total': 0})
         b['total'] += 1
         if p['status'] == 'win':
             b['win'] += 1
+    changed = False
     for bucket, st in by_bucket.items():
-        if st['total'] >= 10:
-            actual_wr = st['win'] / st['total']
-            expected_wr = (bucket + 2.5) / 100
-            factor = actual_wr / expected_wr if expected_wr > 0 else 1.0
-            factor = max(0.8, min(1.2, factor))
-            for p in predictions.values():
-                if int(p.get('prob', 50)) // 5 * 5 == bucket:
-                    p['calibration_factor'] = factor
-    _save_predictions()
+        if st['total'] < 10:
+            continue
+        actual_wr = st['win'] / st['total']
+        expected_wr = (bucket + 2.5) / 100
+        factor = actual_wr / expected_wr if expected_wr > 0 else 1.0
+        factor = max(0.8, min(1.2, factor))
+        if abs(bucket_calibration.get(str(bucket), 1.0) - factor) >= 0.01:
+            bucket_calibration[str(bucket)] = round(factor, 3)
+            changed = True
+    if changed:
+        _save_bucket_calibration()
 
 async def get_oddsapi_odds(session, fixture):
     home = fixture['teams']['home']['name']
@@ -1621,6 +1649,16 @@ MARKET_DISPLAY_NAME = {
     'cards': 'Thẻ phạt',
 }
 
+# market_type của unified engine → key schema keos (render + save dùng chung)
+MARKET_TYPE_TO_KEY = {
+    'match_result': '1x2',
+    'total_goals': 'tai_xiu',
+    'asian_handicap': 'chau_a',
+    'btts': 'btts',
+    'cards': 'the',
+    'corners': 'goc',
+}
+
 # Semaphore giới hạn concurrent AI calls để tránh rate limit 429
 _AI_CONCURRENCY_LIMIT = 2
 _ai_semaphore = asyncio.Semaphore(_AI_CONCURRENCY_LIMIT)
@@ -1655,14 +1693,8 @@ async def _validate_selection(mtype, selection, est_total=None, home="", away=""
         is_over = any(w in sel_low for w in ('tài', 'over', 'trên'))
         is_under = any(w in sel_low for w in ('xỉu', 'under', 'dưới'))
         if not (is_over or is_under):
-            # AI trả nhầm tên đội → suy từ estimated_total_goals
-            if est_total is not None:
-                line = 2.5 if est_total == 2.5 else (3.0 if est_total >= 2.8 else (2.0 if est_total <= 2.2 else 2.5))
-                pick = 'Tài' if est_total >= 2.8 else 'Xỉu'
-                fixed = f"{pick} {line:g}"
-                logger.warning(f"[unified] total_goals selection sai '{sel}' → tự suy '{fixed}' từ tổng bàn {est_total}")
-                return fixed, None
-            return None, f"Tài xỉu trả sai: '{sel}'; thiếu estimated_total_goals để tự suy"
+            # AI trả sai loại (vd tên đội) → LOẠI market này, không bịa hộ cửa
+            return None, f"Tài xỉu trả sai loại: '{sel}'" + (f" (est tổng bàn {est_total})" if est_total is not None else "")
         line_m = re.search(r'(\d+(?:[.,]\d+)?)', sel)
         # Chuẩn hóa: nếu thiếu line/dị → nối '2.5' mặc định
         if not line_m:
@@ -1691,9 +1723,67 @@ async def _validate_selection(mtype, selection, est_total=None, home="", away=""
     return sel, None
 
 
+# Tên market chuẩn API-Football theo loại kèo (bets endpoint trả tên này)
+_FB_BET_NAMES = {
+    'match_result': ('Match Winner', '1X2', 'Home/Away'),
+    'total_goals': ('Goals Over/Under', 'Goals Over/Under First Half'),
+    'btts': ('Both Teams Score', 'Both Teams To Score'),
+    'asian_handicap': ('Handicap Result', 'Asian Handicap', 'Handicap'),
+    'corners': ('Corners Over/Under', 'Corners 1st Half'),
+    'cards': ('Cards Over/Under', 'Exact Cards', 'Cards 1st Half'),
+}
+
+
+def _fb_odds_for_type(odds, mtype, selection):
+    """Tra odds API-Football theo loại kèo + selection. Trả (price, book_label) hoặc None."""
+    markets = (odds or {}).get('markets') or {}
+    sel_low = (selection or '').lower()
+    for bet_name in _FB_BET_NAMES.get(mtype, ()):
+        vals = markets.get(bet_name)
+        if not vals:
+            continue
+        # khớp trực tiếp
+        for k, v in vals.items():
+            if _normalize_team(k) == _normalize_team(selection):
+                return v, str(odds.get('bookmaker') or '')[:10]
+        # khớp mờ: value chứa selection hoặc ngược lại
+        for k, v in vals.items():
+            kl = k.lower()
+            if mtype in ('corners', 'cards', 'total_goals'):
+                # Tài/Xỉu + line: line phải khớp, phía phải khớp
+                m_line = re.search(r'(\d+(?:\.\d+)?)', sel_low)
+                k_line = re.search(r'(\d+(?:\.\d+)?)', kl)
+                if m_line and k_line and abs(float(m_line.group(1)) - float(k_line.group(1))) < 0.01:
+                    if ('tài' in sel_low or 'over' in sel_low) and 'over' in kl:
+                        return v, str(odds.get('bookmaker') or '')[:10]
+                    if ('xỉu' in sel_low or 'under' in sel_low) and 'under' in kl:
+                        return v, str(odds.get('bookmaker') or '')[:10]
+            elif mtype == 'match_result':
+                if ('home' in kl or 'chủ' in kl) and re.search(r'home|chủ|1(?![0-9])', sel_low):
+                    return v, str(odds.get('bookmaker') or '')[:10]
+                if ('away' in kl or 'khách' in kl) and re.search(r'away|khách|2(?![0-9])', sel_low):
+                    return v, str(odds.get('bookmaker') or '')[:10]
+                if 'draw' in kl or 'hòa' in kl:
+                    if re.search(r'hòa|draw', sel_low):
+                        return v, str(odds.get('bookmaker') or '')[:10]
+            elif mtype == 'btts':
+                if ('yes' in kl) and re.search(r'có|yes', sel_low):
+                    return v, str(odds.get('bookmaker') or '')[:10]
+                if ('no' in kl) and re.search(r'không|no', sel_low):
+                    return v, str(odds.get('bookmaker') or '')[:10]
+            elif mtype == 'asian_handicap':
+                # 'Home -0.5' vs 'Home -0.5' — khớp cả phía + chấp
+                m_line = re.search(r'([+-]\d+(?:\.\d+)?)', sel_low)
+                k_line = re.search(r'([+-]\d+(?:\.\d+)?)', kl)
+                same_side = (('home' in kl or 'chủ' in kl) and re.search(r'home|chủ', sel_low)) or \
+                            (('away' in kl or 'khách' in kl) and re.search(r'away|khách', sel_low))
+                if same_side and m_line and k_line and abs(float(m_line.group(1)) - float(k_line.group(1))) < 0.01:
+                    return v, str(odds.get('bookmaker') or '')[:10]
+    return None
+
+
 async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", oddsapi_ev=None, single_market=None):
-    """
-    Engine phân tích thống nhất cho cả /kèo và ai_agent_loop.
+    """Engine phân tích thống nhất cho cả /kèo và ai_agent_loop.
     Input: fixture (API-Football), sky_data (Sky Sports text), oddsapi_text (The Odds API), single_market (key nếu user hỏi 1 kèo).
     Output: dict {best_pick, all_analyses, fixture_info, scenario, estimated_total_goals}
     """
@@ -1769,8 +1859,8 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         f"Trả về DUY NHẤT JSON schema: {UNIFIED_SCHEMA}"
     )
     
-    # 5. CHỈ 3 kèo chính (tránh 429 rate limit: 6 request → 3 request)
-    market_types = ['match_result', 'total_goals', 'asian_handicap']
+    # 6 kèo chính: 1X2, Tài xỉu, Châu Á, BTTS, Thẻ, Góc (semaphore 2 + stagger chống 429)
+    market_types = ['match_result', 'total_goals', 'asian_handicap', 'btts', 'cards', 'corners']
     
     # Nếu user chỉ hỏi 1 kèo cụ thể, vẫn phân tích đủ để có scenario anchor
     # nhưng chỉ return kèo đó
@@ -1833,18 +1923,9 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
                             _odds_book_label = '1xBet' if _bk == 'onexbet' else 'Pinnacle'
                     except Exception:
                         pass
-            # 2) Fallback API-Football odds — match lỏng theo tên market/selection
-            if not odds_val:
-                vals = odds['markets'].get(market) or next(
-                    (v for k, v in odds['markets'].items() if _normalize_team(k) == _normalize_team(market)), None)
-                if vals:
-                    odds_val = vals.get(selection)
-                    if odds_val is None:
-                        for k, v in vals.items():
-                            if _normalize_team(k) == _normalize_team(selection) or _normalize_team(k) in _normalize_team(selection) or _normalize_team(selection) in _normalize_team(k):
-                                odds_val = v
-                                _odds_book_label = str(odds.get('bookmaker') or '')[:10]
-                                break
+            # 2) Fallback API-Football odds — map theo LOẠI KÈO (tên market API-Football chuẩn),
+            # không match theo tên market AI tự trả (AI hay đặt tên không khớp)
+            odds_val, _odds_book_label = _fb_odds_for_type(odds, mtype, selection) or (None, None)
         
         ev = (prob / 100 * odds_val - 1) if odds_val else None
         
@@ -1877,9 +1958,11 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
         'estimated_total_goals': None
     }
     for a in all_analyses:
-        validation_obj['keos'][a['market_type']] = {
-            'pick': a['selection'], 'pct': int(a['prob'])
-        }
+        _vk = MARKET_TYPE_TO_KEY.get(a['market_type'])
+        if _vk:
+            validation_obj['keos'][_vk] = {
+                'pick': a['selection'], 'pct': int(a['prob'])
+            }
     # Ước lượng scenario từ estimated_total_goals trung bình
     est_totals = [a['estimated_total_goals'] for a in all_analyses if a['estimated_total_goals']]
     if est_totals:
@@ -1896,7 +1979,7 @@ async def analyze_match_unified(session, fixture, sky_data="", oddsapi_text="", 
             "JSON trước có lỗi logic:\n- " + "\n- ".join(errs) +
             "\nSửa lại: giữ KỊCH BẢN TRẬN ĐẤU làm mốc (estimated_total_goals), mọi kèo suy từ kịch bản đó. "
             "Trả lại ĐẦY ĐỦ JSON schema cho TẤT CẢ market:\n" + UNIFIED_SCHEMA +
-            "\n\nPhân tích gốc:\n" + json.dumps(all_analyses, ensure_ascii=False)[:2000]
+            "\n\nPhân tích gốc:\n" + json.dumps(all_analyses, ensure_ascii=False)[:6000]
         )
         fix_text, _ = await get_ai_response(session, [{"role": "user", "content": fix_prompt}], max_tokens=2000)
         if fix_text:
@@ -1978,34 +2061,46 @@ def _grade_prediction(p, fixture):
         else:
             winner = 'draw'
         if winner == 'draw':
-            if any(w in sel for w in ('hòa', 'draw', 'x', '1x', 'x2')):
+            if re.search(r'hòa|hoà|draw|(?<![a-z0-9])x(?![a-z0-9])|1\s*x(?![a-z0-9])|x\s*2(?![a-z0-9])', sel):
                 return 'win', f"hòa {gh}-{ga}"
             return 'loss', f"hòa {gh}-{ga}"
         if winner == 'home':
             hn4 = home_n[:4]
-            if any(w in sel for w in ('home', 'chủ', 'đội nhà', '1x')) or (hn4 and hn4 in sel):
+            if any(w in sel for w in ('home', 'chủ', 'đội nhà')) or re.search(r'(?<![a-z0-9])1\s*x?(?![a-z0-9])', sel) or (hn4 and hn4 in sel):
                 return 'win', f"{p.get('home')} thắng {gh}-{ga}"
             return 'loss', f"{p.get('home')} thắng {gh}-{ga}"
         if winner == 'away':
             an4 = away_n[:4]
-            if any(w in sel for w in ('away', 'khách', 'đội khách', 'x2')) or (an4 and an4 in sel):
+            if any(w in sel for w in ('away', 'khách', 'đội khách')) or re.search(r'(?<![a-z0-9])x?\s*2(?![a-z0-9])', sel) or (an4 and an4 in sel):
                 return 'win', f"{p.get('away')} thắng {gh}-{ga}"
             return 'loss', f"{p.get('away')} thắng {gh}-{ga}"
     # ── Tài xỉu bàn (line nằm ở selection: 'Tài 2.5'; fallback market) ──
     if 'tài xỉu' in market or 'over' in market or 'under' in market or 'total' in market:
-        m = re.search(r'(\d+(?:\.\d+)?)', sel) or re.search(r'(\d+(?:\.\d+)?)', market)
+        sel_n = sel.replace(',', '.')
+        m = re.search(r'(\d+(?:\.\d+)?)', sel_n) or re.search(r'(\d+(?:\.\d+)?)', market.replace(',', '.'))
         line = float(m.group(1)) if m else 2.5
         is_over = any(w in sel for w in ('tài', 'over', 'trên'))
         is_under = any(w in sel for w in ('xỉu', 'under', 'dưới'))
-        if total > line:
-            result_txt = f"tổng {total} (Tài {line:g})"
-            return ('win' if is_over else ('loss' if is_under else None)), result_txt
-        if total < line:
-            result_txt = f"tổng {total} (Xỉu {line:g})"
-            return ('win' if is_under else ('loss' if is_over else None)), result_txt
-        # half-line: no push
-        result_txt = f"tổng {total} (hòa {line:g})"
-        return 'push', result_txt
+        diff = total - line
+        if abs(diff) < 0.01:  # đúng line nguyên (2.0/3.0) → push
+            return 'push', f"tổng {total} (hòa {line:g})"
+        if line % 0.5 == 0:  # line .0/.5: ăn thua trọn
+            if diff > 0:
+                return ('win' if is_over else ('loss' if is_under else None)), f"tổng {total} (Tài {line:g})"
+            return ('win' if is_under else ('loss' if is_over else None)), f"tổng {total} (Xỉu {line:g})"
+        # quarter-line (2.25/2.75...): nửa tiền line dưới, nửa tiền line trên
+        lo = line - 0.25
+        hi = line + 0.25
+        if diff > 0.25:  # tổng > line trên → Tài ăn full, Xỉu thua full
+            return ('win' if is_over else ('loss' if is_under else None)), f"tổng {total} (Tài {line:g})"
+        if diff < -0.25:  # tổng < line dưới → Xỉu ăn full, Tài thua full
+            return ('win' if is_under else ('loss' if is_over else None)), f"tổng {total} (Xỉu {line:g})"
+        # tổng đúng giữa quarter → nửa ăn/nửa hoàn theo phía gần
+        if is_over:
+            return ('win' if diff > 0 else 'loss'), f"tổng {total} (Tài {line:g} nửa kèo)"
+        if is_under:
+            return ('win' if diff < 0 else 'loss'), f"tổng {total} (Xỉu {line:g} nửa kèo)"
+        return None, None
     # ── BTTS ──
     if 'btts' in market or 'both' in market or 'ghi bàn' in market or 'cả 2' in market:
         both_scored = gh > 0 and ga > 0
@@ -2018,8 +2113,17 @@ def _grade_prediction(p, fixture):
         return ('win' if is_no else ('loss' if is_yes else None)), result_txt
     # ── Châu Á ──
     if 'châu á' in market or 'handicap' in market or 'asian' in market or 'chấp' in market:
-        m = re.search(r'([+-]?\s*\d+(?:\.\d+)?)', sel)
-        h_val = float(m.group(1).replace(' ', '')) if m else 0
+        sel_n = sel.replace(',', '.').replace(' ', '')
+        m = re.search(r'([+-]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?)', sel_n)
+        h_val = 0.0
+        if m:
+            raw = m.group(1)
+            if '/' in raw:  # line kép '0.25/0.5' → trung bình
+                parts = [float(x) for x in raw.split('/') if x not in ('+', '-')]
+                sign = -1.0 if raw.startswith('-') else 1.0
+                h_val = sign * (sum(abs(x) for x in parts) / len(parts))
+            else:
+                h_val = float(raw)
         # xác định bên: nếu selection chứa tên đội nhà hoặc 'home' → bên nhà
         home_n = (p.get('home') or '').lower()
         away_n = (p.get('away') or '').lower()
@@ -2029,15 +2133,20 @@ def _grade_prediction(p, fixture):
         if not is_home_side and not is_away_side:
             # mặc định: nếu handicap âm → đội mạnh hơn (thường là đội đầu tiên)
             is_home_side = True
-        if is_home_side:
-            effective = gh + h_val - ga
-        else:
-            effective = ga + h_val - gh
-        if effective > 0:
-            return 'win', f"margin {effective:+.1f}"
-        if effective < 0:
-            return 'loss', f"margin {effective:+.1f}"
-        return 'push', f"margin 0"
+        team_goals = gh if is_home_side else ga
+        opp_goals = ga if is_home_side else gh
+        margin = team_goals - opp_goals + h_val
+        near = abs(margin) < 0.01
+        if abs(h_val % 0.5) < 0.01 or abs(h_val % 1.0) < 0.01:
+            # line nguyên/half: ăn thua trọn (hoàn khi đúng line)
+            if near:
+                return 'push', "margin 0"
+            return ('win' if margin > 0 else 'loss'), f"margin {margin:+.1f}"
+        # quarter-line (±0.25/±0.75): ăn/thua NỬA tiền khi margin lệch đúng nửa line
+        if abs(abs(margin) - 0.25) < 0.01:
+            st = 'win' if margin > 0 else 'loss'
+            return st, f"margin {margin:+.2f} (nửa kèo)"
+        return ('win' if margin > 0 else 'loss'), f"margin {margin:+.1f}"
     return None, None
 
 
@@ -2358,9 +2467,14 @@ async def cmd_kq(session, chat_id, arg=None):
     hit = len(wins) / decided * 100 if decided else 0
     lines = [f"📋 *KẾT QUẢ DỰ ĐOÁN {n_days} NGÀY QUA*"]
     if decided:
+        priced_wins = [p for p in wins if p.get('odds')]
+        profit = sum(p['odds'] - 1 for p in priced_wins) - sum(1 for p in losses)
+        n_priced = len(priced_wins) + len(losses)
         lines.append(f"✅ {len(wins)} thắng | ❌ {len(losses)} thua | 🤝 {len(pushes)} void — hit rate {hit:.0f}%")
-        profit = sum((p.get('odds') or 1) - 1 for p in wins) - sum(1 for p in losses)
-        lines.append(f"💵 Lợi nhuận giả định 1 đơn vị/kèo: {profit:+.1f} đơn vị")
+        if n_priced:
+            lines.append(f"💵 Lợi nhuận giả định 1 đơn vị/kèo (chỉ tính {n_priced} kèo có odds thật): {profit:+.1f} đơn vị")
+        else:
+            lines.append("💵 Không có kèo nào ghi odds thật trong kỳ này — bỏ qua tính lợi nhuận.")
         by_market = {}
         for p in graded:
             by_market.setdefault(p['market'], [0, 0])
@@ -2640,6 +2754,7 @@ async def results_loop(app):
                                 session, cid,
                                 f"📋 KQ {g['home']} vs {g['away']}: {nw} thắng / {nl} thua\n" + "\n".join(blines))
                 _save_predictions()
+                update_calibration_from_results()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3055,7 +3170,7 @@ def _keo_logic_check(obj):
         if _pc >= 100:
             errs.append(f"kèo '{_k}' pct={_pc} — xác suất thật không bao giờ 100%, hạ xuống dưới 90")
         elif _pc > 0 and re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', _pp, re.I):
-            errs.append(f"kèo '{_k}' là placeholder ('{_pp}') với pct={_pp} — phải ra kèo thật có số liệu, hoặc pct=0")
+            errs.append(f"kèo '{_k}' là placeholder ('{_pp}') với pct={_pc} — phải ra kèo thật có số liệu, hoặc pct=0")
     # R-0: kèo 1X2/Tài xỉu PHẢI có odds 1xBet > ODDS_MIN (khi có odds thật để đối chiếu)
     try:
         _lh, _la = _split_vs(header)
@@ -3147,11 +3262,11 @@ def _keo_logic_check(obj):
         if btts_no and both:
             errs.append(f"BTTS Không nhưng kịch bản {ga_}-{gb_} cả hai đều ghi bàn — mâu thuẫn")
         # 1X2 vẫn phải cùng phe đội thắng theo kịch bản (mâu thuẫn cứng)
-        if ga_ > gb_ and (re.search(r'x2', p12) or re.search(r'hòa|h[ôo]a', p12)):
+        if ga_ > gb_ and (re.search(r'(?<![a-z0-9])x\s*2(?![a-z0-9])', p12) or re.search(r'hòa|hoà|h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội nhà thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
-        if ga_ < gb_ and (re.search(r'1x', p12) or re.search(r'hòa|h[ôo]a', p12)):
+        if ga_ < gb_ and (re.search(r'1\s*x(?![a-z0-9])', p12) or re.search(r'hòa|hoà|h[ôo]a', p12)):
             errs.append(f"Kịch bản {ga_}-{gb_} đội khách thắng nhưng 1X2 chọn '{p12}' → phải cùng phe")
-        if ga_ == gb_ and not re.search(r'hòa|h[ôo]a|draw|1x|x2', p12):
+        if ga_ == gb_ and not re.search(r'hòa|hoà|h[ôo]a|draw|(?<![a-z0-9])x(?![a-z0-9])', p12):
             errs.append(f"Kịch bản hòa {ga_}-{gb_} nhưng 1X2 chọn '{p12}' → phải chọn hòa/X")
         # Châu Á chỉ chặn khi THUA SÂU theo kịch bản (margin < -1.25 — gần như không bù được)
         mh = re.search(r'([+-])\s*(\d+(?:[.,]\d+)?(?:[/-]\d+)?)', pa)
@@ -3242,7 +3357,7 @@ def _render_keo_from_json(obj, single_key=None):
             pct = int(pct)
         except Exception:
             pct = None
-        if p and not (pct and re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', p, re.I)):
+        if p and not re.search(r'không đặt|thiếu dữ liệu|không có dữ|không đủ|chưa có dữ|không kèo|no bet', p, re.I) and pct:
             _tag = ''
             if _rev is not None and key in ('1x2', 'tai_xiu'):
                 try:
@@ -3288,10 +3403,14 @@ def _save_keo_batch(chat_id, obj, rendered):
     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', kickoff):
         kickoff = datetime.now(TZ_VN).strftime('%Y-%m-%d')
     match_key = _make_match_key(home, away, kickoff)
-    # tránh lưu trùng: trận này đã pending thì bỏ qua (bỏ qua khi chưa rõ đội)
+    # tránh lưu trùng: trận này đã có kèo (pending hoặc đã chấm trong 12h) thì bỏ qua
     if home != '?' and away != '?':
         for p in predictions.values():
-            if p.get('match_key') == match_key and p.get('status') == 'pending':
+            if p.get('match_key') != match_key:
+                continue
+            if p.get('status') == 'pending':
+                return
+            if p.get('graded') and time.time() - p['graded'] < 12 * 3600:
                 return
     KEYS = (('1x2', '1X2'), ('tai_xiu', 'Tài xỉu'), ('chau_a', 'Châu Á'), ('btts', 'BTTS'), ('the', 'Thẻ'), ('goc', 'Góc'))
     ks = obj.get('keos') or {}
@@ -3313,13 +3432,18 @@ def _save_keo_batch(chat_id, obj, rendered):
         except Exception:
             prob = 50.0
         _price, _ev = None, None
-        if _ev_match is not None and k in ('1x2', 'tai_xiu'):
+        # Ưu tiên odds engine đã tính (đã map đúng loại kèo từ API-Football/Odds API)
+        try:
+            _price = float(v.get('odds')) if v.get('odds') else None
+        except Exception:
+            _price = None
+        if _price is None and _ev_match is not None and k in ('1x2', 'tai_xiu'):
             try:
                 _price = odds_price_for(k, sel, _ev_match)
-                if _price:
-                    _ev = round(prob / 100 * _price - 1, 3)
             except Exception:
-                _price, _ev = None, None
+                _price = None
+        if _price:
+            _ev = round(prob / 100 * _price - 1, 3)
         rec = {
             'match': f"{home} vs {away}", 'datetime': header[:80], 'league': header.split('—')[0].strip()[:40],
             'scores': '', 'score_total': 0,
@@ -3795,6 +3919,7 @@ LEAGUE_SKY_SLUGS = {
     'Scottish Premiership': 'scottish-premier',
     'Champions League': 'champions-league', 'UEFA Champions League': 'champions-league',
     'Europa League': 'europa-league', 'UEFA Europa League': 'europa-league',
+    'Nations League': 'nations-league', 'UEFA Nations League': 'nations-league',
     'V.League 1': 'v-league', 'V-League': 'v-league',
     'MLS': 'mls', 'American MLS League': 'mls',
     'EFL Championship': 'efl-championship', 'Championship': 'efl-championship',
@@ -4248,9 +4373,12 @@ async def _agent_execute(session, chat_id, name, args):
                     'best': f"{unified_result['best_pick']['market']} — {unified_result['best_pick']['selection']} ({unified_result['best_pick']['prob']:.0f}%)"
                 }
                 for a in unified_result['all_analyses']:
-                    obj['keos'][a['market_type']] = {
-                        'pick': a['selection'], 'pct': int(a['prob']), 'why': a.get('why', '')
-                    }
+                    _mk = MARKET_TYPE_TO_KEY.get(a['market_type'])
+                    if _mk:
+                        obj['keos'][_mk] = {
+                            'pick': a['selection'], 'pct': int(a['prob']), 'why': a.get('why', ''),
+                            'odds': a.get('odds'),
+                        }
                 rendered = _render_keo_from_json(obj, single_key)
                 if rendered:
                     _save_keo_batch(chat_id, obj, rendered)
@@ -4489,7 +4617,7 @@ async def ai_agent_loop(session, chat_id, question, reply_to=None):
                     "kèo nào chỉ có cửa ≤1.5 thì đổi line/cửa khác, không đổi được thì ghi 'Thiếu dữ liệu' pct=0. "
                     "Nếu KHÔNG có odds thật thì phân tích bình thường theo framework, "
                     "TUYỆT ĐỐI không được ghi 'Thiếu dữ liệu' chỉ vì thiếu odds.\n"
-                    "\n\nPhân tích gốc:\n" + content[:3000])
+                    "\n\nPhân tích gốc:\n" + content[:9000])
                 jtxt, jerr = await get_ai_response(
                     session, [{"role": "user", "content": json_prompt}], max_tokens=900,
                     response_format={"type": "json_object"})
