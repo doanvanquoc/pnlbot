@@ -23,3 +23,5 @@ jobs:
             sudo chown -R pnlbot:pnlbot /home/ubuntu/pnlbot
             sudo systemctl restart pnlbot
             sudo systemctl status pnlbot --no-pager
+            sudo systemctl restart pnltrading
+            sudo systemctl status pnltrading --no-pager
