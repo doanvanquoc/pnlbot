@@ -44,6 +44,8 @@ auto_chats = set()      # Danh sách chat_id nhận cập nhật tự động m�
 last_auto_messages = {} # Lưu message_id của tin nhắn auto cuối cùng (key: chat_id, value: message_id)
 auto_pnl_chats = set()  # Danh sách chat_id nhận cập nhật TỔNG PNL tự động mỗi phút
 last_auto_pnl_messages = {}  # Lưu message_id tin nhắn TỔNG PNL auto cuối cùng (key: chat_id, value: message_id)
+auto_price_chats = {}  # chat_id -> danh sách symbol được tự động cập nhật giá mỗi phút
+last_auto_price_messages = {}  # Tin nhắn giá tự động cuối cùng theo chat
 has_new_activity = {}   # Đánh dấu có hoạt động mới trong chat (key: chat_id, value: bool)
 hedge_mode = False      # Chế độ Position Mode (True: Hedge Mode, False: One-way Mode)
 symbol_precisions = {}  # Lưu độ chính xác số lượng coin (quantityPrecision) của từng symbol
@@ -83,6 +85,7 @@ CONF_MAP = {'Rất mạnh': '⭐⭐⭐⭐⭐', 'Mạnh': '⭐⭐⭐⭐', 'Trung 
 ACTIVE_CHATS_FILE = "active_chats.json"
 AUTO_CHATS_FILE = "auto_chats_trading.json"
 AUTO_PNL_CHATS_FILE = "auto_pnl_chats_trading.json"
+AUTO_PRICE_MAX_SYMBOLS = 10
 active_chats = set()
 
 def load_active_chats():
@@ -104,21 +107,36 @@ def save_active_chats():
         logger.error(f"Lỗi khi lưu active_chats: {e}")
 
 def load_auto_chats():
-    global auto_chats, last_auto_messages
+    global auto_chats, last_auto_messages, auto_price_chats, last_auto_price_messages
     try:
         if os.path.exists(AUTO_CHATS_FILE):
             with open(AUTO_CHATS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 auto_chats = set(int(cid) for cid in data.get('chats', []))
                 last_auto_messages = {int(cid): mid for cid, mid in data.get('last_messages', {}).items()}
-                logger.info(f"Đã tải {len(auto_chats)} chat tự động cập nhật từ file.")
+                auto_price_chats = {
+                    int(cid): list(symbols)
+                    for cid, symbols in data.get('price_symbols', {}).items()
+                }
+                last_auto_price_messages = {
+                    int(cid): mid for cid, mid in data.get('price_last_messages', {}).items()
+                }
+                logger.info(
+                    f"Đã tải {len(auto_chats)} chat tự động cập nhật vị thế và "
+                    f"{len(auto_price_chats)} chat tự động cập nhật giá."
+                )
     except Exception as e:
         logger.error(f"Lỗi khi tải auto_chats: {e}")
 
 def save_auto_chats():
     try:
         with open(AUTO_CHATS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"chats": list(auto_chats), "last_messages": last_auto_messages}, f)
+            json.dump({
+                "chats": list(auto_chats),
+                "last_messages": last_auto_messages,
+                "price_symbols": auto_price_chats,
+                "price_last_messages": last_auto_price_messages,
+            }, f)
     except Exception as e:
         logger.error(f"Lỗi khi lưu auto_chats: {e}")
 
@@ -2348,51 +2366,123 @@ async def _update_auto_chat_message(session, chat_id, message, last_messages):
 async def auto_pos_sender_loop(app):
     while True:
         try:
-            # Lưu ý: người dùng đang đặt là 30 giây để test nhanh
             await asyncio.sleep(60)
             session = app['session']
 
-            # 1. Cập nhật bảng vị thế cho các chat đã bật /auto
+            # 1. Cập nhật bảng vị thế cho các chat đã bật /auto không tham số
             if auto_chats and positions:
                 message = build_positions_text()
                 await asyncio.gather(*(_update_auto_chat_message(session, cid, message, last_auto_messages)
                                        for cid in list(auto_chats)), return_exceptions=True)
-                save_auto_chats()
 
-            # 2. Cập nhật TỔNG PNL cho các chat đã bật /autopnl
+            # 2. Cập nhật giá cho từng danh sách coin đã bật bằng /auto <coin...>
+            if auto_price_chats:
+                price_targets = list(auto_price_chats.items())
+                price_updates = await asyncio.gather(*(
+                    build_auto_prices_text(session, symbols)
+                    for _, symbols in price_targets
+                ), return_exceptions=True)
+                tasks = []
+                for (cid, _), message in zip(price_targets, price_updates):
+                    if not isinstance(message, Exception):
+                        tasks.append(_update_auto_chat_message(
+                            session, cid, message, last_auto_price_messages
+                        ))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 3. Cập nhật TỔNG PNL cho các chat đã bật /autopnl
             if auto_pnl_chats:
                 pnl_msg = build_pnl_summary_text()
                 await asyncio.gather(*(_update_auto_chat_message(session, cid, pnl_msg, last_auto_pnl_messages)
                                        for cid in list(auto_pnl_chats)), return_exceptions=True)
-                save_auto_pnl_chats()
+            save_auto_chats()
+            save_auto_pnl_chats()
         except asyncio.CancelledError:
-            logger.info("Task tự động gửi vị thế đã bị hủy.")
+            logger.info("Task tự động gửi vị thế/giá đã bị hủy.")
             raise
         except Exception as e:
             logger.error(f"Lỗi trong auto_pos_sender_loop (loop tiếp tục): {e}")
             await asyncio.sleep(5)
 
-# Xử lý lệnh /auto
-async def handle_auto_command(session, chat_id):
+
+async def build_auto_prices_text(session, symbols):
+    results = await get_coin_prices(session, symbols)
+    now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
+    lines = [f"🕒 *GIÁ TỰ ĐỘNG* — `{now_str}`"]
+    for coin_name, info in results:
+        if info is None:
+            lines.append(f"{display_symbol(coin_name)}: Không tìm thấy")
+            continue
+        change = info['change']
+        emoji = "🟢" if change >= 0 else "🔴"
+        lines.append(
+            f"{display_symbol(coin_name)}: *{format_price(info['price'])}* "
+            f"({emoji} {change:+.2f}%){funding_str(info.get('funding_rate', 0.0))}"
+        )
+    return "\n".join(lines)
+
+
+# /auto không tham số theo dõi vị thế; /auto <coin...> theo dõi giá
+async def handle_auto_command(session, chat_id, coin_names=None):
+    coin_names = coin_names or []
+    if coin_names:
+        if len(coin_names) == 1 and coin_names[0].lower() == 'off':
+            if chat_id not in auto_price_chats:
+                await send_telegram_message(session, chat_id, "ℹ️ Theo dõi giá tự động chưa được bật.")
+                return
+            auto_price_chats.pop(chat_id, None)
+            old_msg_id = last_auto_price_messages.pop(chat_id, None)
+            if old_msg_id:
+                await delete_telegram_message(session, chat_id, old_msg_id)
+            save_auto_chats()
+            await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật giá coin.")
+            return
+
+        symbols = []
+        for coin in coin_names[:AUTO_PRICE_MAX_SYMBOLS]:
+            cleaned = coin.strip(',.;:!?()[]').upper()
+            if not re.fullmatch(r'[A-Z0-9]{2,16}', cleaned):
+                await send_telegram_message(session, chat_id, f"❌ Tên coin không hợp lệ: `{coin}`")
+                return
+            symbol = cleaned if cleaned.endswith('USDT') else f"{cleaned}USDT"
+            if symbol not in symbols:
+                symbols.append(symbol)
+        results = await get_coin_prices(session, symbols)
+        missing = [display_symbol(symbol) for symbol, info in results if info is None]
+        if missing:
+            await send_telegram_message(
+                session, chat_id, f"❌ Không tìm thấy trên Binance Futures: `{', '.join(missing)}`"
+            )
+            return
+        auto_price_chats[chat_id] = symbols
+        save_auto_chats()
+        await send_telegram_message(
+            session, chat_id,
+            f"✅ Đã bật tự động cập nhật giá mỗi 1 phút: *{', '.join(map(display_symbol, symbols))}*.\n"
+            "Tắt bằng `/auto off`."
+        )
+        message = await build_auto_prices_text(session, symbols)
+        new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
+        if new_msg_id:
+            last_auto_price_messages[chat_id] = new_msg_id
+            has_new_activity[chat_id] = False
+            save_auto_chats()
+        return
+
     if chat_id in auto_chats:
         auto_chats.remove(chat_id)
-        
-        # Xóa tin nhắn auto cuối cùng nếu có khi tắt chế độ auto
         old_msg_id = last_auto_messages.pop(chat_id, None)
         if old_msg_id:
             await delete_telegram_message(session, chat_id, old_msg_id)
         save_auto_chats()
-            
         await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật vị thế mỗi 1 phút.")
     else:
         auto_chats.add(chat_id)
         save_auto_chats()
         await send_telegram_message(session, chat_id, "✅ Đã bật tự động cập nhật vị thế mỗi 1 phút.")
-        
-        # Gửi luôn vị thế hiện tại ngay lập tức và lưu message_id làm tin nhắn auto đầu tiên
         if positions:
             message = build_positions_text("🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (1P)*\n----------------------------------")
-            
             new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
             if new_msg_id:
                 last_auto_messages[chat_id] = new_msg_id
@@ -10703,7 +10793,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá). TP/SL chỉ đặt khi truyền tp=/sl=.\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
-            "⏱ `/auto` - Bật/Tắt tự động gửi vị thế mỗi 1 phút.\n"
+            "⏱ `/auto` - Bật/Tắt cập nhật vị thế; `/auto zec hype` - tự cập nhật giá coin mỗi phút; `/auto off` - tắt theo dõi giá.\n"
             "🛡️ `/trail <coin>` - Bật trailing stop tự động cho vị thế bạn đặt tay (SL 1.5×ATR, +0.8R trailing, +1.5R chốt 50%). Tắt: `/trail <coin> off`.\n"
             "📊 `/autopnl` - Bật/Tắt tự động gửi TỔNG PNL vị thế hiện tại mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
@@ -10966,7 +11056,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             await handle_dca_command(request.app['session'], chat_id, coin_name, volume_str, diff_str)
             
     elif command_base == '/auto':
-        await handle_auto_command(request.app['session'], chat_id)
+        await handle_auto_command(request.app['session'], chat_id, text.split()[1:])
 
     elif command_base == '/autopnl':
         await handle_auto_pnl_command(request.app['session'], chat_id)

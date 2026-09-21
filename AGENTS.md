@@ -1,17 +1,5 @@
 # PnL Bot
 
-## Quy tắc bắt buộc sau khi sửa code
-
-- Mỗi lần sửa xong code (app.py, app_bybit.py, backtest.py...), **PHẢI restart bot** bằng lệnh:
-  ```
-  sudo systemctl restart pnlbot
-  ```
-- Sau khi restart, kiểm tra bot chạy ổn định:
-  ```
-  systemctl status pnlbot --no-pager
-  ```
-- Không kết thúc task khi chưa restart bot.
-
 ## Quy tắc định hướng giá trị
 
 - Mọi thay đổi code phải hướng tới mục tiêu giúp người dùng **kiếm được tiền** khi trade theo bot.
@@ -25,3 +13,4 @@
   ```
 - Đối chiếu kết quả trước/sau thay đổi: win-rate, **EV/R, profit factor, max drawdown**. Chỉ giữ thay đổi nếu EV/R tăng hoặc drawdown giảm đáng kể, và tuyệt đối không để EV/R âm.
 - Không thay đổi ngưỡng/chiến lược trading theo cảm tính — phải có số liệu backtest hỗ trợ.
+

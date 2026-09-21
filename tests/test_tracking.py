@@ -182,5 +182,48 @@ class TrackingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await bot.get_ai_lessons(None))
 
 
+class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.price_chats = patch.object(bot, 'auto_price_chats', {})
+        self.last_messages = patch.object(bot, 'last_auto_price_messages', {})
+        self.activity = patch.object(bot, 'has_new_activity', {})
+        self.price_chats.start()
+        self.last_messages.start()
+        self.activity.start()
+        self.addCleanup(self.price_chats.stop)
+        self.addCleanup(self.last_messages.stop)
+        self.addCleanup(self.activity.stop)
+
+    async def test_auto_coin_list_is_normalized_and_enabled(self):
+        prices = [('ZECUSDT', {'price': 50., 'change': 2., 'funding_rate': 0.}),
+                  ('HYPEUSDT', {'price': 40., 'change': -1., 'funding_rate': 0.})]
+        with patch.object(bot, 'get_coin_prices', AsyncMock(return_value=prices)), \
+             patch.object(bot, 'send_telegram_message', AsyncMock(side_effect=[1, 2])) as send, \
+             patch.object(bot, 'save_auto_chats'):
+            await bot.handle_auto_command(None, 123, ['zec', 'HYPE'])
+        self.assertEqual(bot.auto_price_chats[123], ['ZECUSDT', 'HYPEUSDT'])
+        self.assertEqual(bot.last_auto_price_messages[123], 2)
+        self.assertIn('ZEC', send.await_args_list[0].args[2])
+
+    async def test_auto_off_only_disables_price_tracking(self):
+        bot.auto_price_chats[123] = ['ZECUSDT']
+        bot.last_auto_price_messages[123] = 9
+        with patch.object(bot, 'delete_telegram_message', AsyncMock()) as delete, \
+             patch.object(bot, 'send_telegram_message', AsyncMock()), \
+             patch.object(bot, 'save_auto_chats'):
+            await bot.handle_auto_command(None, 123, ['off'])
+        self.assertNotIn(123, bot.auto_price_chats)
+        delete.assert_awaited_once_with(None, 123, 9)
+
+    async def test_unknown_coin_does_not_replace_existing_list(self):
+        bot.auto_price_chats[123] = ['ZECUSDT']
+        with patch.object(bot, 'get_coin_prices', AsyncMock(return_value=[('NOPEUSDT', None)])), \
+             patch.object(bot, 'send_telegram_message', AsyncMock()), \
+             patch.object(bot, 'save_auto_chats') as save:
+            await bot.handle_auto_command(None, 123, ['nope'])
+        self.assertEqual(bot.auto_price_chats[123], ['ZECUSDT'])
+        save.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
