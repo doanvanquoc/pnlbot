@@ -224,6 +224,13 @@ class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Process khởi động:', text)
         self.assertIn('GIÁ: ZEC, HYPE', text)
 
+    def test_startup_marker_proves_new_process(self):
+        text = bot.build_startup_marker()
+        self.assertIn('DEPLOY OK', text)
+        self.assertIn(bot.AUTO_BUILD, text)
+        self.assertIn('PID:', text)
+        self.assertIn('/auto status', text)
+
     async def test_auto_coin_switches_off_position_tracking(self):
         bot.auto_chats.add(123)
         bot.last_auto_messages[123] = 8

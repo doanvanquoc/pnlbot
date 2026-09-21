@@ -54,7 +54,7 @@ symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
 ai_active_until = {}    # chat_id -> timestamp: /auto tạm im lặng tới thời điểm này để không chen ngang chat AI
 AI_QUIET_SECONDS = 120  # Thời gian im lặng của /auto sau mỗi lượt tương tác AI
-AUTO_BUILD = "AUTO-COIN-v4"
+AUTO_BUILD = "AUTO-COIN-v5"
 PROCESS_STARTED_AT = time.time()
 
 # Cache cho kết quả quét thị trường của lệnh /analyze
@@ -2433,6 +2433,17 @@ async def build_auto_prices_text(session, symbols):
     return "\n".join(lines)
 
 
+
+def build_startup_marker():
+    started_str = datetime.fromtimestamp(
+        PROCESS_STARTED_AT, timezone(timedelta(hours=7))
+    ).strftime("%d/%m/%Y %H:%M:%S")
+    return (
+        f"🚀 *DEPLOY OK* | `{AUTO_BUILD}`\n"
+        f"PID: `{os.getpid()}`\n"
+        f"Process khởi động: `{started_str}`\n"
+        "Lệnh kiểm tra: `/auto status`"
+    )
 # /auto không tham số theo dõi vị thế; /auto <coin...> theo dõi giá
 async def handle_auto_command(session, chat_id, coin_names=None):
     coin_names = coin_names or []
@@ -11264,6 +11275,13 @@ async def on_startup(app):
     
     # 0. Tự động lấy và log IP của server để cấu hình Binance
     await log_server_ip(app['session'])
+    # Bằng chứng trực tiếp rằng process pnltrading mới đã thực sự khởi động.
+    if active_chats:
+        startup_marker = build_startup_marker()
+        await asyncio.gather(*(
+            send_telegram_message(app['session'], chat_id, startup_marker)
+            for chat_id in list(active_chats)
+        ), return_exceptions=True)
     
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")

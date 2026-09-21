@@ -20,8 +20,10 @@ jobs:
           script: |
             cd /home/ubuntu/pnlbot
             git -c safe.directory=/home/ubuntu/pnlbot pull origin main
+            grep -q 'AUTO_BUILD = "AUTO-COIN-v5"' app_trading.py
             sudo chown -R pnlbot:pnlbot /home/ubuntu/pnlbot
             sudo systemctl restart pnlbot
             sudo systemctl status pnlbot --no-pager
             sudo systemctl restart pnltrading
             sudo systemctl status pnltrading --no-pager
+            sudo systemctl is-active --quiet pnltrading
