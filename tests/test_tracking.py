@@ -210,6 +210,19 @@ class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.auto_price_chats[123], ['ZECUSDT', 'HYPEUSDT'])
         self.assertEqual(bot.last_auto_price_messages[123], 2)
         self.assertIn('ZEC', send.await_args_list[0].args[2])
+        self.assertIn(bot.AUTO_BUILD, send.await_args_list[0].args[2])
+        self.assertIn('AUTO-POS: *ĐÃ TẮT*', send.await_args_list[0].args[2])
+        self.assertIn('AUTO-COIN', send.await_args_list[1].args[2])
+
+    async def test_auto_status_proves_build_process_and_mode(self):
+        bot.auto_price_chats[123] = ['ZECUSDT', 'HYPEUSDT']
+        with patch.object(bot, 'send_telegram_message', AsyncMock()) as send:
+            await bot.handle_auto_command(None, 123, ['status'])
+        text = send.await_args.args[2]
+        self.assertIn(bot.AUTO_BUILD, text)
+        self.assertIn('PID:', text)
+        self.assertIn('Process khởi động:', text)
+        self.assertIn('GIÁ: ZEC, HYPE', text)
 
     async def test_auto_coin_switches_off_position_tracking(self):
         bot.auto_chats.add(123)

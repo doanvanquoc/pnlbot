@@ -54,6 +54,8 @@ symbol_tick_sizes = {}  # Lưu tickSize của từng symbol
 order_realized_pnl = {} # Lưu realized PnL cộng dồn cho từng order_id (tránh lỗi fragmented trades PnL)
 ai_active_until = {}    # chat_id -> timestamp: /auto tạm im lặng tới thời điểm này để không chen ngang chat AI
 AI_QUIET_SECONDS = 120  # Thời gian im lặng của /auto sau mỗi lượt tương tác AI
+AUTO_BUILD = "AUTO-COIN-v4"
+PROCESS_STARTED_AT = time.time()
 
 # Cache cho kết quả quét thị trường của lệnh /analyze
 market_scan_cache = {
@@ -2376,7 +2378,10 @@ async def auto_pos_sender_loop(app):
             # 1. Cập nhật bảng vị thế cho các chat đã bật /auto không tham số
             position_chat_ids = auto_chats.difference(auto_price_chats)
             if position_chat_ids and positions:
-                message = build_positions_text()
+                now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
+                message = build_positions_text(
+                    f"📌 *AUTO-POS* | `{AUTO_BUILD}` | `{now_str}`\n----------------------------------"
+                )
                 await asyncio.gather(*(_update_auto_chat_message(session, cid, message, last_auto_messages)
                                        for cid in list(position_chat_ids)), return_exceptions=True)
 
@@ -2414,7 +2419,7 @@ async def auto_pos_sender_loop(app):
 async def build_auto_prices_text(session, symbols):
     results = await get_coin_prices(session, symbols)
     now_str = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M:%S")
-    lines = [f"🕒 *GIÁ TỰ ĐỘNG* — `{now_str}`"]
+    lines = [f"🪙 *AUTO-COIN* | `{AUTO_BUILD}` | `{now_str}`"]
     for coin_name, info in results:
         if info is None:
             lines.append(f"{display_symbol(coin_name)}: Không tìm thấy")
@@ -2431,6 +2436,26 @@ async def build_auto_prices_text(session, symbols):
 # /auto không tham số theo dõi vị thế; /auto <coin...> theo dõi giá
 async def handle_auto_command(session, chat_id, coin_names=None):
     coin_names = coin_names or []
+    if len(coin_names) == 1 and coin_names[0].lower() == 'status':
+        started_str = datetime.fromtimestamp(
+            PROCESS_STARTED_AT, timezone(timedelta(hours=7))
+        ).strftime("%d/%m/%Y %H:%M:%S")
+        price_symbols = auto_price_chats.get(chat_id, [])
+        if price_symbols:
+            mode = "GIÁ: " + ", ".join(map(display_symbol, price_symbols))
+        elif chat_id in auto_chats:
+            mode = "VỊ THẾ"
+        else:
+            mode = "TẮT"
+        await send_telegram_message(
+            session, chat_id,
+            f"🔎 *AUTO STATUS*\n"
+            f"Build: `{AUTO_BUILD}`\n"
+            f"PID: `{os.getpid()}`\n"
+            f"Process khởi động: `{started_str}`\n"
+            f"Chế độ chat này: *{mode}*"
+        )
+        return
     if coin_names:
         if len(coin_names) == 1 and coin_names[0].lower() == 'off':
             was_enabled = chat_id in auto_price_chats or chat_id in auto_chats
@@ -2473,8 +2498,9 @@ async def handle_auto_command(session, chat_id, coin_names=None):
         save_auto_chats()
         await send_telegram_message(
             session, chat_id,
-            f"✅ Đã bật tự động cập nhật giá mỗi 1 phút: *{', '.join(map(display_symbol, symbols))}*.\n"
-            "Tắt bằng `/auto off`."
+            f"✅ `{AUTO_BUILD}` đã chuyển sang *AUTO-COIN*: "
+            f"*{', '.join(map(display_symbol, symbols))}*.\n"
+            "AUTO-POS: *ĐÃ TẮT*. Kiểm tra bằng `/auto status`; tắt bằng `/auto off`."
         )
         message = await build_auto_prices_text(session, symbols)
         new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
@@ -2500,7 +2526,9 @@ async def handle_auto_command(session, chat_id, coin_names=None):
         save_auto_chats()
         await send_telegram_message(session, chat_id, "✅ Đã bật tự động cập nhật vị thế mỗi 1 phút.")
         if positions:
-            message = build_positions_text("🔍 *TỰ ĐỘNG CẬP NHẬT VỊ THẾ ĐANG MỞ (1P)*\n----------------------------------")
+            message = build_positions_text(
+                f"📌 *AUTO-POS* | `{AUTO_BUILD}`\n----------------------------------"
+            )
             new_msg_id = await send_telegram_message(session, chat_id, message, is_auto=True)
             if new_msg_id:
                 last_auto_messages[chat_id] = new_msg_id
@@ -10811,7 +10839,7 @@ async def process_telegram_message(request, chat_id, text, ai_reply_to=None, rep
             "📉 `/short <coin> <volume> [giá]` (hoặc `/s`) - SHORT (Market nếu không nhập giá, Limit nếu có giá). TP/SL chỉ đặt khi truyền tp=/sl=.\n"
             "📊 `/chart [khung_thời_gian] <coin>` - Xem biểu đồ nến (ví dụ: `/chart 1d btc`, `/chart btc 15m`).\n"
             "⚖️ `/dca <coin> <volume> <khoảng_cách>` - Đặt lệnh Limit DCA vùng lỗ (ví dụ: `/dca btc 200 40u`, `/dca eth 100 2%`).\n"
-            "⏱ `/auto` - Bật/Tắt cập nhật vị thế; `/auto zec hype` - tự cập nhật giá coin mỗi phút; `/auto off` - tắt theo dõi giá.\n"
+            "⏱ `/auto` - Bật/Tắt vị thế; `/auto zec hype` - theo giá; `/auto status` - xem build/process/chế độ; `/auto off` - tắt.\n"
             "🛡️ `/trail <coin>` - Bật trailing stop tự động cho vị thế bạn đặt tay (SL 1.5×ATR, +0.8R trailing, +1.5R chốt 50%). Tắt: `/trail <coin> off`.\n"
             "📊 `/autopnl` - Bật/Tắt tự động gửi TỔNG PNL vị thế hiện tại mỗi 1 phút.\n"
             "📈 `/analyze [coin]` (hoặc `/a`) - Quét cơ hội giao dịch hoặc phân tích kỹ thuật chi tiết của coin (RSI, EMA, Bollinger, MACD). Chỉ hiển thị tín hiệu 4-5 sao đã qua lọc MTF 1h+4h+1d, xu hướng BTC và win-rate thực tế. Có AI đối chiếu realtime nếu cấu hình DASH_TOKEN.\n"
