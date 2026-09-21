@@ -236,6 +236,21 @@ class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(123, bot.auto_chats)
         self.assertEqual(delete.await_count, 2)
 
+    def test_loaded_price_tracking_overrides_stale_position_tracking(self):
+        state = {
+            'chats': [123],
+            'last_messages': {'123': 8},
+            'price_symbols': {'123': ['ZECUSDT', 'HYPEUSDT']},
+            'price_last_messages': {'123': 9},
+        }
+        mocked_file = __import__('unittest.mock').mock.mock_open(read_data=__import__('json').dumps(state))
+        with patch.object(bot.os.path, 'exists', return_value=True), \
+             patch('builtins.open', mocked_file):
+            bot.load_auto_chats()
+        self.assertNotIn(123, bot.auto_chats)
+        self.assertNotIn(123, bot.last_auto_messages)
+        self.assertEqual(bot.auto_price_chats[123], ['ZECUSDT', 'HYPEUSDT'])
+
     async def test_unknown_coin_does_not_replace_existing_list(self):
         bot.auto_price_chats[123] = ['ZECUSDT']
         with patch.object(bot, 'get_coin_prices', AsyncMock(return_value=[('NOPEUSDT', None)])), \

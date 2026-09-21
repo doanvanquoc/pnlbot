@@ -121,6 +121,10 @@ def load_auto_chats():
                 last_auto_price_messages = {
                     int(cid): mid for cid, mid in data.get('price_last_messages', {}).items()
                 }
+                # File runtime cũ có thể lưu đồng thời hai chế độ; ưu tiên theo dõi giá.
+                auto_chats.difference_update(auto_price_chats)
+                for cid in auto_price_chats:
+                    last_auto_messages.pop(cid, None)
                 logger.info(
                     f"Đã tải {len(auto_chats)} chat tự động cập nhật vị thế và "
                     f"{len(auto_price_chats)} chat tự động cập nhật giá."
@@ -2370,10 +2374,11 @@ async def auto_pos_sender_loop(app):
             session = app['session']
 
             # 1. Cập nhật bảng vị thế cho các chat đã bật /auto không tham số
-            if auto_chats and positions:
+            position_chat_ids = auto_chats.difference(auto_price_chats)
+            if position_chat_ids and positions:
                 message = build_positions_text()
                 await asyncio.gather(*(_update_auto_chat_message(session, cid, message, last_auto_messages)
-                                       for cid in list(auto_chats)), return_exceptions=True)
+                                       for cid in list(position_chat_ids)), return_exceptions=True)
 
             # 2. Cập nhật giá cho từng danh sách coin đã bật bằng /auto <coin...>
             if auto_price_chats:
