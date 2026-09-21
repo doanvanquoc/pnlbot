@@ -187,12 +187,18 @@ class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
         self.price_chats = patch.object(bot, 'auto_price_chats', {})
         self.last_messages = patch.object(bot, 'last_auto_price_messages', {})
         self.activity = patch.object(bot, 'has_new_activity', {})
+        self.position_chats = patch.object(bot, 'auto_chats', set())
+        self.position_messages = patch.object(bot, 'last_auto_messages', {})
         self.price_chats.start()
         self.last_messages.start()
         self.activity.start()
+        self.position_chats.start()
+        self.position_messages.start()
         self.addCleanup(self.price_chats.stop)
         self.addCleanup(self.last_messages.stop)
         self.addCleanup(self.activity.stop)
+        self.addCleanup(self.position_chats.stop)
+        self.addCleanup(self.position_messages.stop)
 
     async def test_auto_coin_list_is_normalized_and_enabled(self):
         prices = [('ZECUSDT', {'price': 50., 'change': 2., 'funding_rate': 0.}),
@@ -205,15 +211,30 @@ class AutoPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.last_auto_price_messages[123], 2)
         self.assertIn('ZEC', send.await_args_list[0].args[2])
 
-    async def test_auto_off_only_disables_price_tracking(self):
+    async def test_auto_coin_switches_off_position_tracking(self):
+        bot.auto_chats.add(123)
+        bot.last_auto_messages[123] = 8
+        prices = [('ZECUSDT', {'price': 50., 'change': 2., 'funding_rate': 0.})]
+        with patch.object(bot, 'get_coin_prices', AsyncMock(return_value=prices)), \
+             patch.object(bot, 'delete_telegram_message', AsyncMock()) as delete, \
+             patch.object(bot, 'send_telegram_message', AsyncMock(side_effect=[1, 2])), \
+             patch.object(bot, 'save_auto_chats'):
+            await bot.handle_auto_command(None, 123, ['zec'])
+        self.assertNotIn(123, bot.auto_chats)
+        delete.assert_awaited_once_with(None, 123, 8)
+
+    async def test_auto_off_disables_price_and_position_tracking(self):
         bot.auto_price_chats[123] = ['ZECUSDT']
         bot.last_auto_price_messages[123] = 9
+        bot.auto_chats.add(123)
+        bot.last_auto_messages[123] = 8
         with patch.object(bot, 'delete_telegram_message', AsyncMock()) as delete, \
              patch.object(bot, 'send_telegram_message', AsyncMock()), \
              patch.object(bot, 'save_auto_chats'):
             await bot.handle_auto_command(None, 123, ['off'])
         self.assertNotIn(123, bot.auto_price_chats)
-        delete.assert_awaited_once_with(None, 123, 9)
+        self.assertNotIn(123, bot.auto_chats)
+        self.assertEqual(delete.await_count, 2)
 
     async def test_unknown_coin_does_not_replace_existing_list(self):
         bot.auto_price_chats[123] = ['ZECUSDT']

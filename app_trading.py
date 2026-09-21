@@ -2428,15 +2428,19 @@ async def handle_auto_command(session, chat_id, coin_names=None):
     coin_names = coin_names or []
     if coin_names:
         if len(coin_names) == 1 and coin_names[0].lower() == 'off':
-            if chat_id not in auto_price_chats:
-                await send_telegram_message(session, chat_id, "ℹ️ Theo dõi giá tự động chưa được bật.")
-                return
+            was_enabled = chat_id in auto_price_chats or chat_id in auto_chats
             auto_price_chats.pop(chat_id, None)
-            old_msg_id = last_auto_price_messages.pop(chat_id, None)
-            if old_msg_id:
-                await delete_telegram_message(session, chat_id, old_msg_id)
+            auto_chats.discard(chat_id)
+            old_message_ids = (
+                last_auto_price_messages.pop(chat_id, None),
+                last_auto_messages.pop(chat_id, None),
+            )
+            for old_msg_id in old_message_ids:
+                if old_msg_id:
+                    await delete_telegram_message(session, chat_id, old_msg_id)
             save_auto_chats()
-            await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật giá coin.")
+            message = "❌ Đã tắt mọi cập nhật tự động." if was_enabled else "ℹ️ Tự động cập nhật chưa được bật."
+            await send_telegram_message(session, chat_id, message)
             return
 
         symbols = []
@@ -2455,6 +2459,11 @@ async def handle_auto_command(session, chat_id, coin_names=None):
                 session, chat_id, f"❌ Không tìm thấy trên Binance Futures: `{', '.join(missing)}`"
             )
             return
+        # Theo dõi giá và vị thế là hai chế độ loại trừ nhau.
+        auto_chats.discard(chat_id)
+        old_position_msg_id = last_auto_messages.pop(chat_id, None)
+        if old_position_msg_id:
+            await delete_telegram_message(session, chat_id, old_position_msg_id)
         auto_price_chats[chat_id] = symbols
         save_auto_chats()
         await send_telegram_message(
@@ -2478,6 +2487,10 @@ async def handle_auto_command(session, chat_id, coin_names=None):
         save_auto_chats()
         await send_telegram_message(session, chat_id, "❌ Đã tắt tự động cập nhật vị thế mỗi 1 phút.")
     else:
+        auto_price_chats.pop(chat_id, None)
+        old_price_msg_id = last_auto_price_messages.pop(chat_id, None)
+        if old_price_msg_id:
+            await delete_telegram_message(session, chat_id, old_price_msg_id)
         auto_chats.add(chat_id)
         save_auto_chats()
         await send_telegram_message(session, chat_id, "✅ Đã bật tự động cập nhật vị thế mỗi 1 phút.")
